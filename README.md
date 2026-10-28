@@ -57,5 +57,4 @@ Edit the paths at the top of `build_apk_linux.sh` (JDK 17, Android SDK build-too
 
 - **Original OneLineage project by WeWaffles** — https://github.com/WeWaffles/OneLineage
 - **LineageOS GSI builds by MisterZtr** (SourceForge)
-- **Fork and ongoing work by [crabcakes97](https://github.com/crabcakes97)**
 - LineageOS and Android are trademarks of their respective owners. Not affiliated with Samsung, Google, or LineageOS.
