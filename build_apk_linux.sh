@@ -1,0 +1,89 @@
+#!/bin/bash
+# Linux adaptation of build_apk.sh (macOS original, untouched).
+# Same 7 steps; only paths/toolchain locations changed.
+set -e
+
+# JDK 17: Temurin tarball (apt was too slow on this VM), else apt JDK, else PATH.
+if [ -d "/home/hatch/workspace/onelineage/jdk17" ]; then
+    export JAVA_HOME="/home/hatch/workspace/onelineage/jdk17"
+elif [ -d "/usr/lib/jvm/java-17-openjdk-amd64" ]; then
+    export JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
+elif command -v javac >/dev/null 2>&1; then
+    export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+fi
+export PATH="$JAVA_HOME/bin:$PATH"
+
+PROJECT_DIR="/home/hatch/workspace/onelineage-generic/OneLineage-main"
+SDK_ROOT="/home/hatch/workspace/onelineage/android-sdk"
+BUILD_DIR="$PROJECT_DIR/build"
+SDK_TOOLS="$SDK_ROOT/build-tools/34.0.0"
+PLATFORM_JAR="$SDK_ROOT/platforms/android-34/android.jar"
+OUT_APK="/home/hatch/workspace/onelineage-generic/GSI-Loader-Samsung.apk"
+
+echo "=== 1. Cleaning & preparing build directories ==="
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR/gen" "$BUILD_DIR/classes" "$BUILD_DIR/dex"
+
+cd "$PROJECT_DIR"
+
+echo "=== 2. Compiling resources with aapt2 ==="
+"$SDK_TOOLS/aapt2" compile --dir res -o "$BUILD_DIR/compiled_res.zip"
+
+echo "=== 3. Linking resources with aapt2 ==="
+"$SDK_TOOLS/aapt2" link \
+    -I "$PLATFORM_JAR" \
+    --manifest AndroidManifest.xml \
+    -o "$BUILD_DIR/base.apk" \
+    --java "$BUILD_DIR/gen" \
+    "$BUILD_DIR/compiled_res.zip" \
+    -A assets
+
+echo "=== 4. Compiling Java sources ==="
+# -encoding UTF-8: MainActivity.java contains non-ASCII characters (ellipsis,
+# curly quotes); this VM's default charset is US-ASCII, unlike macOS (UTF-8).
+# Build-plumbing flag only; sources untouched.
+javac -encoding UTF-8 -source 1.8 -target 1.8 \
+    -cp "$PLATFORM_JAR" \
+    -d "$BUILD_DIR/classes" \
+    src/com/cronch/gsiloader/MainActivity.java \
+    "$BUILD_DIR/gen/com/cronch/gsiloader/R.java"
+
+echo "=== 5. Generating Dalvik Executable (classes.dex) with d8 ==="
+"$SDK_TOOLS/d8" \
+    --lib "$PLATFORM_JAR" \
+    --output "$BUILD_DIR/dex" \
+    "$BUILD_DIR/classes/com/cronch/gsiloader"/*.class
+
+echo "=== 6. Packaging classes.dex into APK ==="
+cd "$BUILD_DIR/dex"
+zip -u "$BUILD_DIR/base.apk" classes.dex
+cd "$PROJECT_DIR"
+
+echo "=== 7. Aligning APK with zipalign ==="
+"$SDK_TOOLS/zipalign" -v -p 4 "$BUILD_DIR/base.apk" "$BUILD_DIR/aligned.apk"
+
+KEYSTORE="$PROJECT_DIR/keystore/debug.keystore"
+if [ ! -f "$KEYSTORE" ]; then
+    mkdir -p "$PROJECT_DIR/keystore"
+    keytool -genkey -v \
+        -keystore "$KEYSTORE" \
+        -storepass android \
+        -alias androiddebugkey \
+        -keypass android \
+        -keyalg RSA \
+        -keysize 2048 \
+        -validity 10000 \
+        -dname "CN=GSI Loader Samsung,O=CRONCH,C=US"
+fi
+
+"$SDK_TOOLS/apksigner" sign \
+    --ks "$KEYSTORE" \
+    --ks-pass pass:android \
+    --ks-key-alias androiddebugkey \
+    --key-pass pass:android \
+    --out "$OUT_APK" \
+    "$BUILD_DIR/aligned.apk"
+
+echo "=== BUILD SUCCESSFUL ==="
+echo "Output APK: $OUT_APK"
+ls -la "$OUT_APK"

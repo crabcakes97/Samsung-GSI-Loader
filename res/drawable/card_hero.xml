@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 5.9.6 skin: hero card (Install & Boot). Raised surface with a 2dp
+     primary-color border so the primary flow is unmistakably the first
+     thing on screen, on every theme. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="?attr/themeSurfaceHigh" />
+    <stroke android:width="2dp" android:color="?attr/themePrimary" />
+    <corners android:radius="24dp" />
+</shape>

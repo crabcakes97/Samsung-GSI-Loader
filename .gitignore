@@ -1,0 +1,4 @@
+build/
+keystore/
+backups_*/
+*.idsig

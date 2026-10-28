@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GSI Loader Samsung</string>
+    <string name="title_dashboard">GSI Loader Samsung</string>
+    <string name="desc_dashboard">Alternador de contêiner GSI para celulares Samsung com root</string>
+    <string name="status_root_checking">Verificando permissões de root…</string>
+    <string name="status_root_granted">Root KernelSU ativo</string>
+    <string name="status_root_denied">Acesso root necessário</string>
+    <string name="btn_boot_lineage">Mudar para o GSI</string>
+    <string name="btn_return_oneui">Voltar para a One UI</string>
+    <string name="btn_download_lineage">Baixar e instalar</string>
+    <string name="btn_delete_lineage">Excluir arquivos do GSI</string>
+    <string name="btn_create_slot">Criar slot</string>
+    <string name="btn_delete_slot">Excluir slot</string>
+    <string name="btn_duplicate_slot">Duplicar slot</string>
+    <string name="btn_wipe_slot">Limpar dados do slot</string>
+    <string name="btn_backup_launcher">Fazer backup do layout</string>
+    <string name="btn_restore_launcher">Restaurar layout</string>
+    <string name="btn_boot_slot">Iniciar o slot selecionado agora</string>
+    <string name="btn_preflight">Verificação pré-voo (mic 2s + câmera 0)</string>
+    <string name="btn_snapshot_create">Criar snapshot</string>
+    <string name="btn_snapshot_rollback">Reverter para snapshot</string>
+    <string name="btn_backup_multi">Criar backup multi-geração</string>
+    <string name="btn_verify_backup">Verificar backup</string>
+    <string name="btn_pause_download">Pausar download</string>
+    <string name="btn_resume_download">Retomar download</string>
+    <string name="btn_view_logcat">Salvar e ver logs (log do app + logcat)</string>
+    <string name="label_battery">Bateria</string>
+    <string name="label_boot_menu">Menu de boot (no app)</string>
+    <string name="label_snapshots">Snapshots e backups</string>
+    <string name="label_guest_options">Opções do convidado</string>
+    <string name="label_preflight">Pré-voo e downloads</string>
+</resources>

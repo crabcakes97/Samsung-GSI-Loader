@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- GSI Loader Samsung icon, 5.9.6 skin: a phone hot-switching between
+         two userspaces, on a deep tile with bold strokes. -->
+    <path
+        android:fillColor="#0E1420"
+        android:pathData="M12,0 H96 Q108,0 108,12 V96 Q108,108 96,108 H12 Q0,108 0,96 V12 Q0,0 12,0 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#A8C7FA"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M38,18 H70 Q78,18 78,26 V82 Q78,90 70,90 H38 Q30,90 30,82 V26 Q30,18 38,18 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#78D9EC"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M40,42 H60 M54,34 L64,42 L54,50" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFD54F"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M68,66 H48 M54,58 L44,66 L54,74" />
+</vector>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 5.9.6 skin: primary action button. Rounded rect (not the old full
+     pill) so Install/Boot read as solid action blocks. -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33000000">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="?attr/themePrimary" />
+            <corners android:radius="16dp" />
+        </shape>
+    </item>
+</ripple>

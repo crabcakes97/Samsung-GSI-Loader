@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material You Dark Theme Palette -->
+    <color name="m3_background">#111318</color>
+    <color name="m3_surface">#191B20</color>
+    <color name="m3_surface_container_low">#1D1F24</color>
+    <color name="m3_surface_container">#212329</color>
+    <color name="m3_surface_container_high">#2B2E35</color>
+    <color name="m3_surface_container_highest">#363941</color>
+    
+    <!-- Accent Primary (M3 Soft Blue / Periwinkle) -->
+    <color name="m3_primary">#A8C7FA</color>
+    <color name="m3_on_primary">#062E6F</color>
+    <color name="m3_primary_container">#1A437E</color>
+    <color name="m3_on_primary_container">#D3E3FD</color>
+    
+    <!-- Secondary & Tonal -->
+    <color name="m3_secondary">#BEC6DC</color>
+    <color name="m3_on_secondary">#283141</color>
+    <color name="m3_secondary_container">#3E4758</color>
+    <color name="m3_on_secondary_container">#DAE2F9</color>
+    
+    <!-- Tertiary (Lineage Cyan Accent) -->
+    <color name="m3_tertiary">#78D9EC</color>
+    <color name="m3_on_tertiary">#00363F</color>
+    <color name="m3_tertiary_container">#004F5C</color>
+    <color name="m3_on_tertiary_container">#97F0FF</color>
+    
+    <!-- Error / Danger (Soft Coral) -->
+    <color name="m3_error">#FFB4AB</color>
+    <color name="m3_on_error">#690005</color>
+    <color name="m3_error_container">#411215</color>
+    <color name="m3_on_error_container">#FFDAD6</color>
+    
+    <!-- Success (Soft Mint) -->
+    <color name="m3_success">#A5D6A7</color>
+    <color name="m3_on_success">#0D3812</color>
+    <color name="m3_success_container">#1B3F21</color>
+    
+    <!-- Warning (Soft Amber) -->
+    <color name="m3_warning">#FFD54F</color>
+    <color name="m3_on_warning">#402D00</color>
+    <color name="m3_warning_container">#3C2C00</color>
+    
+    <!-- Text & Outlines -->
+    <color name="m3_text_primary">#E2E2E6</color>
+    <color name="m3_text_secondary">#9DA3AE</color>
+    <color name="m3_text_tertiary">#73777F</color>
+    <color name="m3_outline">#44474F</color>
+    <color name="m3_outline_variant">#2E3138</color>
+    <color name="m3_log_bg">#141519</color>
+    <color name="m3_log_text">#C4C7C5</color>
+
+    <!-- Legacy aliases for compatibility -->
+    <color name="bg_dark">#111318</color>
+    <color name="card_bg">#212329</color>
+    <color name="card_stroke">#2E3138</color>
+    <color name="lineage_teal">#78D9EC</color>
+    <color name="lineage_teal_light">#A8C7FA</color>
+    <color name="text_primary">#E2E2E6</color>
+    <color name="text_secondary">#9DA3AE</color>
+    <color name="color_success">#A5D6A7</color>
+    <color name="color_danger">#FFB4AB</color>
+    <color name="color_warning">#FFD54F</color>
+</resources>

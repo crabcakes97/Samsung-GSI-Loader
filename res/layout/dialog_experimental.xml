@@ -1,0 +1,189 @@
+<!-- 5.9.15: fancy Experimental menu. Same styling language as the
+     log section (card_skin background, btn_skin_tonal buttons,
+     themePrimary text, sans-serif-medium), so it follows the app's
+     current skin/theme automatically. Scrollable: 12 tools. -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/card_skin"
+    android:padding="20dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Experimental 🧪"
+            android:textColor="?attr/themePrimary"
+            android:textSize="16sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="The lab — fancy buttons, real diagnostics."
+            android:textColor="?attr/themeTextSecondary"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/exp_kernel_log"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Kernel log (dmesg snapshot)"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_live_logcat_errors"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Live system log (errors)"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_live_dmesg"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Live kernel log (dmesg -w)"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_diagnostics"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Run boot diagnostics now"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_pstore"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Check panic record now (pstore)"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_guest_processes"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Guest processes"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_rescue_status"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="RescueParty status"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_save_all"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Save all logs (log + system + kernel)"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_takeover_tail"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Takeover log tail"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_live_logcat_full"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Live system log (full)"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_rescue_toggle"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="RescueParty toggle"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_device_info"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Device info dump"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+        <Button
+            android:id="@+id/exp_close"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_skin_tonal"
+            android:text="Close"
+            android:textAllCaps="false"
+            android:textColor="?attr/themePrimary"
+            android:textSize="13sp"
+            android:fontFamily="sans-serif-medium" />
+
+    </LinearLayout>
+</ScrollView>

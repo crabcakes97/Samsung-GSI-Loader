@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+: Material You dynamic colors from the system palette. -->
+    <style name="Theme.GsiLoader.MaterialYou" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">?attr/themeBackground</item>
+        <item name="android:statusBarColor">?attr/themeBackground</item>
+        <item name="android:navigationBarColor">?attr/themeBackground</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:textColorPrimary">?attr/themeTextPrimary</item>
+        <item name="android:textColorSecondary">?attr/themeTextSecondary</item>
+        <item name="android:colorAccent">?attr/themePrimary</item>
+        <item name="themeBackground">@android:color/system_neutral1_900</item>
+        <item name="themeSurface">@android:color/system_neutral1_800</item>
+        <item name="themeSurfaceHigh">@android:color/system_neutral1_700</item>
+        <item name="themeSurfaceLow">@android:color/system_neutral1_900</item>
+        <item name="themeSurfaceHighest">@android:color/system_neutral1_600</item>
+        <item name="themePrimary">@android:color/system_accent1_300</item>
+        <item name="themeOnPrimary">@android:color/system_accent1_900</item>
+        <item name="themeTextPrimary">@android:color/system_neutral1_100</item>
+        <item name="themeTextSecondary">@android:color/system_neutral1_300</item>
+        <item name="themeTextTertiary">@android:color/system_neutral1_400</item>
+        <item name="themeOutlineVariant">@android:color/system_neutral1_700</item>
+        <item name="themeErrorContainer">#411215</item>
+        <item name="themeError">#FFB4AB</item>
+        <item name="themeLogBg">@android:color/system_neutral1_900</item>
+        <item name="themeLogText">@android:color/system_neutral1_200</item>
+    </style>
+    <style name="Theme.GsiLoader.Original" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">?attr/themeBackground</item>
+        <item name="android:statusBarColor">?attr/themeBackground</item>
+        <item name="android:navigationBarColor">?attr/themeBackground</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:textColorPrimary">?attr/themeTextPrimary</item>
+        <item name="android:textColorSecondary">?attr/themeTextSecondary</item>
+        <item name="android:colorAccent">?attr/themePrimary</item>
+        <item name="themeBackground">#111318</item>
+        <item name="themeSurface">#212329</item>
+        <item name="themeSurfaceHigh">#2B2E35</item>
+        <item name="themeSurfaceLow">#1D1F24</item>
+        <item name="themeSurfaceHighest">#363941</item>
+        <item name="themePrimary">#A8C7FA</item>
+        <item name="themeOnPrimary">#062E6F</item>
+        <item name="themeTextPrimary">#E2E2E6</item>
+        <item name="themeTextSecondary">#9DA3AE</item>
+        <item name="themeTextTertiary">#73777F</item>
+        <item name="themeOutlineVariant">#2E3138</item>
+        <item name="themeErrorContainer">#411215</item>
+        <item name="themeError">#FFB4AB</item>
+        <item name="themeLogBg">#141519</item>
+        <item name="themeLogText">#C4C7C5</item>
+    </style>
+    <style name="Theme.GsiLoader.Emerald" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">?attr/themeBackground</item>
+        <item name="android:statusBarColor">?attr/themeBackground</item>
+        <item name="android:navigationBarColor">?attr/themeBackground</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:textColorPrimary">?attr/themeTextPrimary</item>
+        <item name="android:textColorSecondary">?attr/themeTextSecondary</item>
+        <item name="android:colorAccent">?attr/themePrimary</item>
+        <item name="themeBackground">#0B1512</item>
+        <item name="themeSurface">#122019</item>
+        <item name="themeSurfaceHigh">#1B2E25</item>
+        <item name="themeSurfaceLow">#0E1A15</item>
+        <item name="themeSurfaceHighest">#244434</item>
+        <item name="themePrimary">#7DE8B0</item>
+        <item name="themeOnPrimary">#06381F</item>
+        <item name="themeTextPrimary">#E3EDE6</item>
+        <item name="themeTextSecondary">#9DB3A6</item>
+        <item name="themeTextTertiary">#6E857A</item>
+        <item name="themeOutlineVariant">#24382E</item>
+        <item name="themeErrorContainer">#411215</item>
+        <item name="themeError">#FFB4AB</item>
+        <item name="themeLogBg">#0A120E</item>
+        <item name="themeLogText">#C4D6C9</item>
+    </style>
+    <style name="Theme.GsiLoader.Sunset" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">?attr/themeBackground</item>
+        <item name="android:statusBarColor">?attr/themeBackground</item>
+        <item name="android:navigationBarColor">?attr/themeBackground</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:textColorPrimary">?attr/themeTextPrimary</item>
+        <item name="android:textColorSecondary">?attr/themeTextSecondary</item>
+        <item name="android:colorAccent">?attr/themePrimary</item>
+        <item name="themeBackground">#1A1008</item>
+        <item name="themeSurface">#2A1C0E</item>
+        <item name="themeSurfaceHigh">#3A2812</item>
+        <item name="themeSurfaceLow">#221708</item>
+        <item name="themeSurfaceHighest">#4A3418</item>
+        <item name="themePrimary">#FFB86B</item>
+        <item name="themeOnPrimary">#4A1E00</item>
+        <item name="themeTextPrimary">#F5E8DA</item>
+        <item name="themeTextSecondary">#C4A98C</item>
+        <item name="themeTextTertiary">#8C7A63</item>
+        <item name="themeOutlineVariant">#3D2C1A</item>
+        <item name="themeErrorContainer">#411215</item>
+        <item name="themeError">#FFB4AB</item>
+        <item name="themeLogBg">#140D05</item>
+        <item name="themeLogText">#E8D5BE</item>
+    </style>
+    <style name="Theme.GsiLoader.Violet" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">?attr/themeBackground</item>
+        <item name="android:statusBarColor">?attr/themeBackground</item>
+        <item name="android:navigationBarColor">?attr/themeBackground</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:textColorPrimary">?attr/themeTextPrimary</item>
+        <item name="android:textColorSecondary">?attr/themeTextSecondary</item>
+        <item name="android:colorAccent">?attr/themePrimary</item>
+        <item name="themeBackground">#14101F</item>
+        <item name="themeSurface">#1E1830</item>
+        <item name="themeSurfaceHigh">#2B2145</item>
+        <item name="themeSurfaceLow">#181226</item>
+        <item name="themeSurfaceHighest">#3A2C5E</item>
+        <item name="themePrimary">#C9B6FF</item>
+        <item name="themeOnPrimary">#2E1A5E</item>
+        <item name="themeTextPrimary">#EAE6F5</item>
+        <item name="themeTextSecondary">#B0A6C9</item>
+        <item name="themeTextTertiary">#7E7496</item>
+        <item name="themeOutlineVariant">#2E2547</item>
+        <item name="themeErrorContainer">#411215</item>
+        <item name="themeError">#FFB4AB</item>
+        <item name="themeLogBg">#100C1A</item>
+        <item name="themeLogText">#D5CCE8</item>
+    </style>
+</resources>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GSI Loader Samsung</string>
+    <string name="title_dashboard">GSI Loader Samsung</string>
+    <string name="desc_dashboard">GSI container switcher for rooted Samsung phones</string>
+
+    <string name="status_root_checking">Checking root permissions…</string>
+    <string name="status_root_granted">KernelSU Root Active</string>
+    <string name="status_root_denied">Root Access Required</string>
+
+    <string name="btn_boot_lineage">Switch to GSI</string>
+    <string name="btn_return_oneui">Return to One UI</string>
+    <string name="btn_download_lineage">Download &amp; Install</string>
+    <string name="btn_delete_lineage">Delete GSI Files</string>
+    <string name="btn_create_slot">Create slot</string>
+    <string name="btn_delete_slot">Delete slot</string>
+    <string name="btn_duplicate_slot">Duplicate slot</string>
+    <string name="btn_wipe_slot">Wipe slot data</string>
+    <string name="btn_backup_launcher">Backup Layout</string>
+    <string name="btn_restore_launcher">Restore Layout</string>
+    <string name="btn_boot_slot">Boot selected slot now</string>
+    <string name="btn_preflight">Pre-flight check (mic 2s + camera0)</string>
+    <string name="btn_snapshot_create">Create snapshot</string>
+    <string name="btn_snapshot_rollback">Rollback to snapshot</string>
+    <string name="btn_backup_multi">Create multi-gen backup</string>
+    <string name="btn_verify_backup">Verify backup</string>
+    <string name="btn_pause_download">Pause download</string>
+    <string name="btn_resume_download">Resume download</string>
+    <string name="btn_view_logcat">Save and view logs (app log + logcat)</string>
+    <string name="label_battery">Battery</string>
+    <string name="label_boot_menu">Boot menu (in-app)</string>
+    <string name="label_snapshots">Snapshots and backups</string>
+    <string name="label_guest_options">Guest options</string>
+    <string name="label_preflight">Pre-flight and downloads</string>
+</resources>

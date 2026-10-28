@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 5.9.6 skin: selected source card. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="?attr/themeSurfaceHighest" />
+    <stroke android:width="2dp" android:color="?attr/themePrimary" />
+    <corners android:radius="20dp" />
+</shape>

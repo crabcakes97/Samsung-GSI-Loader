@@ -1,0 +1,2401 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GSI Loader Samsung 5.9.6: layout rebuilt from the ground up.
+     Order: what the app is, status, Install &amp; Boot (the primary flow),
+     install options, slots, snapshots &amp; backups, guest options,
+     safety &amp; checks, log, looks, credits. Every button below is wired
+     to a function that does what its label says. -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/themeBackground"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:id="@+id/root_container"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingEnd="20dp"
+        android:paddingTop="36dp"
+        android:paddingBottom="48dp">
+
+        <!-- Header -->
+        <LinearLayout
+            android:id="@+id/section_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="GSI Loader Samsung"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="32sp"
+                android:letterSpacing="0.01"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <View
+                android:layout_width="48dp"
+                android:layout_height="4dp"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/accent_bar" />
+
+            <TextView
+                android:id="@+id/tv_header_subtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="Dual Userspace Switcher • One UI • Poultry Council approved 🐔"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="6dp"
+                    android:background="@drawable/chip_bg"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:text="SAMSUNG"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="11sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="6dp"
+                    android:background="@drawable/chip_bg"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:text="ROOT"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="11sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/chip_bg"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:text="GUEST"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="11sp"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="A second Android system, run as a guest. Nothing is flashed — reboot always brings Samsung back."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- In-development warning: visible on the main screen, not buried. -->
+        <LinearLayout
+            android:id="@+id/section_devwarn"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="⚠ In development — some features may not work yet"
+                android:textColor="?attr/themeError"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Still being built — a feature may fail. Nothing here flashes your phone."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- Status -->
+        <LinearLayout
+            android:id="@+id/section_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Status"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:id="@+id/tv_root_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/status_root_checking"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tv_root_provider"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Root provider: Checking…"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tv_su_binary"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="su binary: —"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tv_os_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Current system: Scanning…"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tv_image_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Guest system: Checking…"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tv_battery_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Battery: unknown"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_recheck_root"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Re-check root and status"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Re-tests root and refreshes status."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- Unrooted-user path: shown only when root is absent. -->
+        <LinearLayout
+            android:id="@+id/section_unrooted"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Root required"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="GSI Loader needs root. Get rooted, then tap Re-check."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_open_rmgn"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Open Root-My-Galaxy-Next on GitHub"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Opens the Root-My-Galaxy-Next page in your browser, where you can get the root app."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- PRIMARY FLOW: Install &amp; Boot -->
+        <LinearLayout
+            android:id="@+id/section_hero"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_hero"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Install &amp; boot a guest system"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Install first, then Boot. Reboot always returns to Samsung."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Step 1 — Choose a system"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_download_desc"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Select a guest system:"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <!-- 5.9.10: filesystem picker. EXT4 shows the 23.2 presets,
+                 5.9.11: EROFS shows the 23.2 EROFS presets too.
+                 Switching keeps the same flavor (no Google apps / + Google apps). -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Filesystem"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <RadioGroup
+                android:id="@+id/rg_filesystem"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/rb_fs_ext4"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="EXT4"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="13sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_fs_erofs"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:text="EROFS"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="13sp" />
+            </RadioGroup>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="EXT4 is the read-write default. EROFS is read-only and faster to read; EROFS presets are the 23.2 release, same as EXT4."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- Flavor Option 1: Vanilla -->
+            <LinearLayout
+                android:id="@+id/card_flavor_vanilla"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/radio_skin_selected"
+                android:orientation="vertical"
+                android:padding="14dp"
+                android:clickable="true"
+                android:focusable="true">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <RadioButton
+                        android:id="@+id/rb_vanilla"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="true"
+                        android:clickable="false"
+                        android:focusable="false" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="LineageOS 23.2 (no Google apps)"
+                            android:textColor="?attr/themeTextPrimary"
+                            android:textSize="14sp"
+                            android:fontFamily="sans-serif-medium"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="The lightweight option. Downloaded from the preset link, then installed."
+                            android:textColor="?attr/themeTextSecondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- Flavor Option 2: MindTheGapps -->
+            <LinearLayout
+                android:id="@+id/card_flavor_gapps"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/radio_skin_unselected"
+                android:orientation="vertical"
+                android:padding="14dp"
+                android:clickable="true"
+                android:focusable="true">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <RadioButton
+                        android:id="@+id/rb_gapps"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="false"
+                        android:clickable="false"
+                        android:focusable="false" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="LineageOS 23.2 + Google apps"
+                            android:textColor="?attr/themeTextPrimary"
+                            android:textSize="14sp"
+                            android:fontFamily="sans-serif-medium"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="With Play Store &amp; Play Services."
+                            android:textColor="?attr/themeTextSecondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 5.9.10: EROFS preset cards. Shown only when EROFS is
+                 picked above; the EXT4 cards hide at the same time.
+                 5.9.11: EROFS builds are the 23.2 release, same as
+                 EXT4 (23.2 EROFS verified on SourceForge). -->
+            <LinearLayout
+                android:id="@+id/card_flavor_erofs_vanilla"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/radio_skin_unselected"
+                android:orientation="vertical"
+                android:padding="14dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:visibility="gone">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <RadioButton
+                        android:id="@+id/rb_erofs_vanilla"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="false"
+                        android:clickable="false"
+                        android:focusable="false" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="LineageOS 23.2 (no Google apps) — EROFS"
+                            android:textColor="?attr/themeTextPrimary"
+                            android:textSize="14sp"
+                            android:fontFamily="sans-serif-medium"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="Read-only, faster reads. 23.2 release — same as EXT4."
+                            android:textColor="?attr/themeTextSecondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/card_flavor_erofs_gapps"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/radio_skin_unselected"
+                android:orientation="vertical"
+                android:padding="14dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:visibility="gone">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <RadioButton
+                        android:id="@+id/rb_erofs_gapps"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="false"
+                        android:clickable="false"
+                        android:focusable="false" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="LineageOS 23.2 + Google apps — EROFS"
+                            android:textColor="?attr/themeTextPrimary"
+                            android:textSize="14sp"
+                            android:fontFamily="sans-serif-medium"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="With Play Store &amp; Play Services. 23.2 release — EROFS."
+                            android:textColor="?attr/themeTextSecondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- Source Option 3: Custom GSI -->
+            <LinearLayout
+                android:id="@+id/card_custom"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/radio_skin_unselected"
+                android:orientation="vertical"
+                android:padding="14dp"
+                android:clickable="true"
+                android:focusable="true">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <RadioButton
+                        android:id="@+id/rb_custom"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="false"
+                        android:clickable="false"
+                        android:focusable="false" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Your own system image"
+                            android:textColor="?attr/themeTextPrimary"
+                            android:textSize="14sp"
+                            android:fontFamily="sans-serif-medium"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="URL or a file already on this phone."
+                            android:textColor="?attr/themeTextSecondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+                </LinearLayout>
+            </LinearLayout>
+
+            <EditText
+                android:id="@+id/et_custom_location"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/field_skin"
+                android:hint="https://example.com/gsi.img  or  /sdcard/Download/gsi.img (no spaces in path)"
+                android:inputType="textUri"
+                android:padding="12dp"
+                android:textColor="?attr/themeTextPrimary"
+                android:textColorHint="?attr/themeTextTertiary"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/btn_browse_gsi"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/field_skin"
+                android:padding="12dp"
+                android:text="Browse for a file on this phone…"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Pick a file, then tap Install."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.10: read-only image report. Shows a picked file's
+                 format and size, or an archive's contents. Changes
+                 nothing; it never installs or boots. -->
+            <Button
+                android:id="@+id/btn_inspect_gsi"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Inspect image…"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Reports a picked file's format and size, or lists an archive's contents. Read-only."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Inspect bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_inspect"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_inspect_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/btn_install_gsi"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:layout_marginTop="16dp"
+                android:background="@drawable/btn_skin_primary"
+                android:text="Install GSI"
+                android:textAllCaps="false"
+                android:textColor="?attr/themeOnPrimary"
+                android:textSize="16sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <!-- 5.9.11: wipe-after-install toggle (user-requested). -->
+            <CheckBox
+                android:id="@+id/cb_wipe_after_install"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Wipe guest userdata after install"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Guest data only — system.raw kept. Next boot starts fresh setup."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Install bar, now colorful (theme's vivid accent,
+                 not the default gray). Install keeps this bar. -->
+            <ProgressBar
+                android:id="@+id/pb_operation"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="14dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_operation_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Downloads a link, or installs a picked file directly."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Download bar, now colorful (theme accent). -->
+            <ProgressBar
+                android:id="@+id/pb_download"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="16dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_download_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_pause_download"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Pause download"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:enabled="false" />
+
+                <Button
+                    android:id="@+id/btn_resume_download"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Resume download"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Pause keeps the partial file. Resume appears only for a real partial download."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/tv_last_install"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="Last install: none yet."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Step 2 — Choose a slot"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Install and Boot act on the slot picked here."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <Spinner
+                android:id="@+id/sp_slot"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp" />
+
+            <TextView
+                android:id="@+id/tv_slot_boot_info"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Slot: Default."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Step 3 — Boot it"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btn_boot_gsi"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_primary"
+                android:text="Boot GSI"
+                android:textAllCaps="false"
+                android:textColor="?attr/themeOnPrimary"
+                android:textSize="16sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Switches the screen to the guest in the picked slot."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Texts keep working in the background; voice calls do not work inside the guest."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Boot bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_boot"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_boot_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_return_oneui"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Return to One UI"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <Button
+                    android:id="@+id/btn_return_reboot"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_danger"
+                    android:text="Return + reboot"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themeError"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Stops the guest and brings Samsung back. + reboot also reboots the phone."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Return + Reboot bars (own colorful bar each). -->
+            <ProgressBar
+                android:id="@+id/pb_return"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_return_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <ProgressBar
+                android:id="@+id/pb_reboot"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_reboot_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <CheckBox
+                android:id="@+id/cb_autoboot"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Ask to boot this slot when the app opens (never boots on its own)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Only ever asks first on launch. Never boots silently."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+            <Button
+                android:id="@+id/btn_more_tools"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="14dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="More tools"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+
+        </LinearLayout>
+
+        <!-- Install options: compatibility patches -->
+        <LinearLayout
+            android:id="@+id/section_patches"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Install options: compatibility patches"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Built for LineageOS 23.2 only. Auto-on for 23.2 EXT4 presets, off for EROFS presets and custom images."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <CheckBox
+                android:id="@+id/cb_patch_framework"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Framework patches (system services, framework files, audio libraries)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <CheckBox
+                android:id="@+id/cb_patch_permission"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Permission controller patch (fixes a Samsung crash on LineageOS)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <CheckBox
+                android:id="@+id/cb_patch_apex_list"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="LineageOS system-component list (otherwise the Samsung list is used)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- Slots -->
+        <LinearLayout
+            android:id="@+id/section_slots"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Slots"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="One installed guest system, with its own image and data."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_create_slot"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Create slot"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <Button
+                    android:id="@+id/btn_delete_slot"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_danger"
+                    android:text="Delete slot"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themeError"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Create: empty slot. Delete: removes slot, image and data, permanently."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_duplicate_slot"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Duplicate slot"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <Button
+                    android:id="@+id/btn_wipe_slot"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_danger"
+                    android:text="Wipe slot data"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themeError"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Duplicate: copies slot under a new name. Wipe: deletes guest data only."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Slot-ops + Wipe bars (own colorful bar each). -->
+            <ProgressBar
+                android:id="@+id/pb_slot"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_slot_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <ProgressBar
+                android:id="@+id/pb_wipe"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_wipe_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <!-- 5.9.11: Clean slate button (user-requested). -->
+            <Button
+                android:id="@+id/btn_clean_slate"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_danger"
+                android:text="Clean slate"
+                android:textAllCaps="false"
+                android:textColor="?attr/themeError"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Removes ALL guest state: every slot's image + data, stage files, cached downloads. The phone itself is untouched."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <ProgressBar
+                android:id="@+id/pb_clean_slate"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_clean_slate_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <!-- Selected-slot details -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:background="@drawable/card_inner"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Picked slot details"
+                    android:textColor="?attr/themePrimary"
+                    android:letterSpacing="0.06"
+                android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tv_info_slot"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="Slot: Default"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_os"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="OS: —"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_size"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Image: —"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_format"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Format: —"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_note"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Note: —"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_boots"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Boots: 0 • Last booted: never"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_sha"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="SHA-256: —"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace" />
+
+                <TextView
+                    android:id="@+id/tv_framework_version"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Framework: unknown (boot the slot to detect)"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_info_storage"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Storage: —"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Details come from the image file; Android version shows only while booted."
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="12sp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <View
+                        android:id="@+id/v_slot_color"
+                        android:layout_width="16dp"
+                        android:layout_height="16dp"
+                        android:background="#888888" />
+
+                    <Button
+                        android:id="@+id/btn_slot_color"
+                        android:layout_width="wrap_content"
+                        android:layout_height="40dp"
+                        android:layout_marginStart="10dp"
+                        android:background="@drawable/btn_skin_tonal"
+                        android:text="Slot color"
+                        android:textAllCaps="false"
+                        android:textColor="?attr/themePrimary"
+                        android:textSize="13sp"
+                        android:fontFamily="sans-serif-medium" />
+                </LinearLayout>
+
+                <Button
+                    android:id="@+id/btn_edit_note"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp"
+                    android:layout_marginTop="10dp"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Edit note"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Color labels slots at a glance. Note: a short reminder."
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Slot image actions -->
+            <Button
+                android:id="@+id/btn_verify_gsi"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="16dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Verify installed system"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Read-only check of the installed image. Changes nothing."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Verify bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_verify"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_verify_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_backup_gsi"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Backup system"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <Button
+                    android:id="@+id/btn_restore_gsi"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Restore backup"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themePrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Copies the installed image to a backup file next to it."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Backup/Restore bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_backup"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_backup_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/btn_delete_lineage"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_danger"
+                android:text="Delete guest files"
+                android:textAllCaps="false"
+                android:textColor="?attr/themeError"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Removes the installed image, backup and guest data for this slot."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- Snapshots &amp; backups -->
+        <LinearLayout
+            android:id="@+id/section_snapshots"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Snapshots &amp; backups"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Saves image + guest data together, so you can roll back."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tv_snapshot_list"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="Snapshots: tap Refresh to list."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_snapshot_refresh"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Refresh snapshot list"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_snapshot_create"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Create snapshot"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_snapshot_rollback"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_danger"
+                android:text="Rollback to snapshot…"
+                android:textAllCaps="false"
+                android:textColor="?attr/themeError"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_backup_multi"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Create multi-gen backup"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_verify_backup"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Verify backup…"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Refresh lists snapshots and backups. Create asks for a name, then saves."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Snapshot bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_snapshot"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_snapshot_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- Guest options -->
+        <LinearLayout
+            android:id="@+id/section_guest"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Guest options"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Applied next boot. Shapes the guest only — never Samsung."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <CheckBox
+                android:id="@+id/cb_guest_root"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="Guest root on/off (this slot)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tv_guest_root_state"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Guest root: unknown"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="When on, the guest boots with root available inside it."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btn_guest_shell"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Run a command inside the guest…"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Runs one shell command inside the running guest."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Guest-shell bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_guest_shell"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_guest_shell_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Display density (per slot, applied at boot)"
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <Spinner
+                android:id="@+id/sp_density"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp" />
+
+            <EditText
+                android:id="@+id/et_density_custom"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/field_skin"
+                android:hint="Custom DPI (e.g. 440) — used when Custom is selected"
+                android:inputType="number"
+                android:padding="12dp"
+                android:textColor="?attr/themeTextPrimary"
+                android:textColorHint="?attr/themeTextTertiary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="How big text and icons look inside the guest."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <CheckBox
+                android:id="@+id/cb_share_folder"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Shared folder between Samsung and guest (/sdcard/GSI_Shared)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tv_guest_fixes_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="Guest options: set above; they are passed to the boot scripts and take effect at the next boot."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="A folder both sides can see: /sdcard/GSI_Shared."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- Safety &amp; checks -->
+        <LinearLayout
+            android:id="@+id/section_safety"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Safety &amp; checks"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Checks Samsung partitions are untouched and read-only."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_preflight"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Pre-flight check (mic 2s + camera0)"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:id="@+id/tv_preflight_result"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Pre-flight: not run yet."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <!-- 5.9.11: Pre-flight bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_preflight"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_preflight_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Confirms Samsung partitions are read-only, then checks the guest setup."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <CheckBox
+                android:id="@+id/cb_battery_guard"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:checked="true"
+                android:text="Battery guard: warn at 20%, block install / backup / boot at 10% (override available)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Samsung home screen layout backup"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Saves Samsung home-screen layout against reboot loss."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_backup_launcher"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Backup Layout"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <Button
+                    android:id="@+id/btn_restore_launcher"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_skin_tonal"
+                    android:text="Restore Layout"
+                    android:textAllCaps="false"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <!-- 5.9.11: Launcher backup/restore bar (own colorful bar). -->
+            <ProgressBar
+                android:id="@+id/pb_launcher"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_launcher_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- Operation Log -->
+        <LinearLayout
+            android:id="@+id/section_log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Activity Log"
+                    android:textColor="?attr/themeTextSecondary"
+                    android:textSize="13sp"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tv_log_status"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Idle"
+                    android:textColor="?attr/themeTextTertiary"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Every action, in plain words. Also saved on the phone."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/tv_console_log"
+                android:layout_width="match_parent"
+                android:layout_height="180dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/log_skin"
+                android:fontFamily="monospace"
+                android:padding="12dp"
+                android:scrollbars="vertical"
+                android:text="GSI Loader Samsung initialized. CRONCH 🐔🌮\n"
+                android:textColor="?attr/themeLogText"
+                android:textSize="11sp" />
+
+            <CheckBox
+                android:id="@+id/cb_log_autoscroll"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:checked="true"
+                android:text="Auto-scroll log to bottom on new entries"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/btn_view_logcat"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Save logs"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_share_log"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Share log"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_experimental"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Experimental 🧪"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Save: writes log + system log to files. Share: sends the shown log. Experimental: kernel log, live streams, diagnostics, takeover log, RescueParty toggle, device info."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <!-- 5.9.11: Log-save bar (own colorful bar per function). -->
+            <ProgressBar
+                android:id="@+id/pb_log"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_marginTop="10dp"
+                android:progressTint="?attr/themePrimary"
+                android:indeterminateTint="?attr/themePrimary"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_log_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- Theme -->
+        <LinearLayout
+            android:id="@+id/section_look"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_skin"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Looks"
+                android:textColor="?attr/themePrimary"
+                android:letterSpacing="0.06"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="App colors only — nothing about the guest changes."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="UI style"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="Layout + look, separate from color. Applies instantly."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="12sp" />
+
+            <RadioGroup
+                android:id="@+id/rg_ui_style"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="vertical">
+
+                <RadioButton
+                    android:id="@+id/rb_style_stage"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Stage — big hero, spacious cards"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_style_compact"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Compact — dense, everything close"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_style_focus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Focus — Install, Boot, Status, Log only"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_style_wide"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Wide — large type, big buttons"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+            </RadioGroup>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Color theme"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
+
+            <RadioGroup
+                android:id="@+id/rg_theme"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="vertical">
+
+                <RadioButton
+                    android:id="@+id/rb_theme_dark"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Dark"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_light"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Light"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_black"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Black (pure black)"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_original"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Original OneLineage look"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_emerald"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Emerald"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_sunset"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Sunset"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_violet"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Violet"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_neon"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Neon Night"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_arctic"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Arctic (light, icy)"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_rose"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Rose"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+
+                <RadioButton
+                    android:id="@+id/rb_theme_materialyou"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Material You (system colors)"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp" />
+            </RadioGroup>
+
+            <Button
+                android:id="@+id/btn_how_to_use"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="16dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="How to use this app"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tv_footer_credits"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:gravity="center"
+            android:text="Original OneLineage by WeWaffles • GSI builds by MisterZtr\nContributors: crabcakes97 • CRONCH 🐔🌮"
+            android:textColor="?attr/themeTextTertiary"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>

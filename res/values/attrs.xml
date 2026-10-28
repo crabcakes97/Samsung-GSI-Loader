@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme attributes: every theme below must define all of these. -->
+    <attr name="themeBackground" format="color" />
+    <attr name="themeSurface" format="color" />
+    <attr name="themeSurfaceHigh" format="color" />
+    <attr name="themeSurfaceLow" format="color" />
+    <attr name="themeSurfaceHighest" format="color" />
+    <attr name="themePrimary" format="color" />
+    <attr name="themeOnPrimary" format="color" />
+    <attr name="themeTextPrimary" format="color" />
+    <attr name="themeTextSecondary" format="color" />
+    <attr name="themeTextTertiary" format="color" />
+    <attr name="themeOutlineVariant" format="color" />
+    <attr name="themeErrorContainer" format="color" />
+    <attr name="themeError" format="color" />
+    <attr name="themeLogBg" format="color" />
+    <attr name="themeLogText" format="color" />
+</resources>

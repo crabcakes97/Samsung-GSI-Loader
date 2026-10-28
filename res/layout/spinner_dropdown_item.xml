@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Slot picker dropdown rows, same readable theme text as the selected item. -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/text1"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:gravity="center_vertical"
+    android:paddingStart="16dp"
+    android:paddingEnd="16dp"
+    android:ellipsize="marquee"
+    android:singleLine="true"
+    android:textColor="?attr/themeTextPrimary"
+    android:textSize="14sp" />
