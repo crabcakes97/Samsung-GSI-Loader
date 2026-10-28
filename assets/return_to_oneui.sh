@@ -79,6 +79,52 @@ pkill -9 -f "ims_watchdog.sh" 2>/dev/null || true
 # 5.9.11: stop the boot watchdog too, so a manual return never leaves
 # a stray watchdog that could later fire a return of its own.
 pkill -9 -f "boot_watchdog.sh" 2>/dev/null || true
+# 5.9.16: stop the watchdog feeder + keepalives (FIXES THE LEAK).
+# The pre-5.9.16 feeder leaked after return because nothing killed it.
+# Kill by EXACT script names, and log each kill so a leaked feeder is
+# visible in the return log instead of silently petting the watchdog
+# in One UI and masking whether host watchdogd is alive.
+# Explicitly NOT killed here: host watchdogd itself. No pkill on
+# "watchdogd", no ctl.stop watchdogd — the keepalive pattern below
+# (host_watchdogd_keepalive.sh) does not match the watchdogd binary,
+# and the feeder patterns do not either. Host protection stays up.
+_FEEDER_PID_BEFORE="$(cat /data/local/tmp/gsi_watchdog_feeder.pid 2>/dev/null || echo none)"
+if pkill -9 -f "gsi_watchdog_supervisor.sh" 2>/dev/null; then
+    echo "WATCHDOG_FEEDER_KILL: supervisor killed (pidfile was $_FEEDER_PID_BEFORE)"
+else
+    echo "WATCHDOG_FEEDER_KILL: supervisor not found (already dead or never started; pidfile was $_FEEDER_PID_BEFORE)"
+fi
+if pkill -9 -f "gsi_watchdog_feeder.sh" 2>/dev/null; then
+    echo "WATCHDOG_FEEDER_KILL: worker killed"
+else
+    echo "WATCHDOG_FEEDER_KILL: worker not found"
+fi
+if pkill -9 -f "host_watchdogd_keepalive.sh" 2>/dev/null; then
+    echo "HOST_WATCHDOGD_KEEPALIVE_KILL: keepalive daemon killed (watchdogd itself NOT stopped)"
+else
+    echo "HOST_WATCHDOGD_KEEPALIVE_KILL: keepalive daemon not found (watchdogd itself untouched)"
+fi
+if pkill -9 -f "gsi_guest_kicker_supervisor.sh" 2>/dev/null; then
+    echo "GUEST_KICKER_KILL: guest kicker supervisor killed"
+else
+    echo "GUEST_KICKER_KILL: guest kicker supervisor not found"
+fi
+if pkill -9 -f "gsi_guest_kicker.sh" 2>/dev/null; then
+    echo "GUEST_KICKER_KILL: guest kicker worker killed"
+else
+    echo "GUEST_KICKER_KILL: guest kicker worker not found"
+fi
+if pkill -9 -f "/dev/watchdog" 2>/dev/null; then
+    echo "WATCHDOG_FEEDER_KILL: legacy pre-5.9.16 feeder (cmdline /dev/watchdog loop) killed"
+else
+    echo "WATCHDOG_FEEDER_KILL: no legacy feeder found"
+fi
+rm -f /data/local/tmp/gsi_watchdog_feeder.pid /data/local/tmp/host_watchdogd_keepalive.pid 2>/dev/null || true
+if ps -ef 2>/dev/null | grep -v grep | grep -q "gsi_watchdog_supervisor.sh"; then
+    echo "WATCHDOG_FEEDER_KILL: WARNING supervisor still listed after kill — check ps"
+else
+    echo "WATCHDOG_FEEDER_KILL: confirmed no supervisor process remains"
+fi
 # 5.9.5-SCRIPTS: guest processes (zygote, system_server, surfaceflinger,
 # vold, wificond, and any process rooted in a guest rootfs) via
 # kill_guest_procs above — gated on a mounted guest rootfs for the
@@ -97,8 +143,23 @@ done
 echo "=== [2/5] Restoring One UI Home Screen Layout & Permissions ==="
 LAUNCHER_PKG="com.sec.android.app.launcher"
 LAUNCHER_DATA="/data/user/0/$LAUNCHER_PKG"
-LAUNCHER_UID=$(stat -c %u "$LAUNCHER_DATA" 2>/dev/null || echo 10160)
-LAUNCHER_GID=$(stat -c %g "$LAUNCHER_DATA" 2>/dev/null || echo 10160)
+# 5.9.16: launcher UID/GID fallback logs LOUDLY. The old code fell
+# back to 10160 silently if stat failed, so a wrong-UID restore could
+# silently corrupt the home layout — the exact thing the launcher
+# backup exists to protect. A fallback line below means: check the
+# home layout after return; the restore may have used the wrong owner.
+if LAUNCHER_UID_TMP="$(stat -c %u "$LAUNCHER_DATA" 2>/dev/null)" && [ -n "$LAUNCHER_UID_TMP" ]; then
+    LAUNCHER_UID="$LAUNCHER_UID_TMP"
+else
+    echo "WARNING: LAUNCHER_UID_FALLBACK: stat failed for $LAUNCHER_DATA — falling back to UID 10160 (restore may use wrong ownership; check home layout after return)"
+    LAUNCHER_UID=10160
+fi
+if LAUNCHER_GID_TMP="$(stat -c %g "$LAUNCHER_DATA" 2>/dev/null)" && [ -n "$LAUNCHER_GID_TMP" ]; then
+    LAUNCHER_GID="$LAUNCHER_GID_TMP"
+else
+    echo "WARNING: LAUNCHER_GID_FALLBACK: stat failed for $LAUNCHER_DATA — falling back to GID 10160 (restore may use wrong ownership; check home layout after return)"
+    LAUNCHER_GID=10160
+fi
 
 if [ -d "$BACKUP_DIR" ] && [ -d "$LAUNCHER_DATA/databases" ]; then
     cp -a "$BACKUP_DIR"/* "$LAUNCHER_DATA/databases/" 2>/dev/null || true
@@ -130,12 +191,22 @@ if [ -x "$BB" ]; then
         $BB losetup -d "$l" 2>/dev/null || true
     done
 fi
+# 5.9.16 per-step reporting: name the unmount result now, not only in
+# the final RETURN_PARTIAL. A non-zero remaining count here is the
+# stuck piece the final verdict will name as "unmount".
+_REMAIN_MPTS="$(mount 2>/dev/null | grep -F 'lineage_stage' | grep -F 'rootfs' | wc -l 2>/dev/null || echo unknown)"
+echo "RETURN_STEP unmounts: passes_used=$n remaining_lineage_rootfs_mounts=$_REMAIN_MPTS (0 = clean)"
 
 echo "=== [4/5] Restoring Storage Mounts ==="
 umount -l /storage/emulated 2>/dev/null || true
 umount -l /mnt/user/0/emulated 2>/dev/null || true
 mkdir -p /storage/emulated/0
-mount --bind /data/media/0 /storage/emulated/0 2>/dev/null || true
+if mount --bind /data/media/0 /storage/emulated/0 2>/dev/null; then
+    echo "RETURN_STEP storage: /storage/emulated/0 bind OK"
+else
+    echo "RETURN_STEP storage: WARNING /storage/emulated/0 bind FAILED (storage may be unavailable in One UI until reboot)"
+    add_failed storage
+fi
 
 echo "=== [5/5] Starting One UI Display & Host Services ==="
 setprop ctl.start surfaceflinger
@@ -150,10 +221,20 @@ for svc in media media.extractor media.metrics wificond; do
 done
 am force-stop com.sec.android.app.launcher 2>/dev/null || true
 am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null || true
+# 5.9.16 per-step reporting: name each restarted service's read-back
+# state, so a PARTIAL return names the service that did not come back.
+if command -v getprop >/dev/null 2>&1; then
+    for _svc in surfaceflinger zygote audioserver cameraserver media media.extractor media.metrics wificond; do
+        echo "RETURN_STEP service: $_svc=$(getprop init.svc.$_svc 2>/dev/null || echo unknown)"
+    done
+else
+    echo "RETURN_STEP service: getprop unavailable — service states unverified"
+fi
 
 # switch_to_gsi.sh drops SELinux to permissive for the takeover; restore it.
 setenforce 1 2>/dev/null || true
 echo "SELinux mode: $(getenforce 2>/dev/null || echo unknown)"
+echo "RETURN_STEP selinux: mode=$(getenforce 2>/dev/null || echo unknown) (expected Enforcing)"
 # 5.9.5-SCRIPTS-START: verify EACH step, clear the guest marker, report.
 # A missing Android tool (setprop/getprop/getenforce on a non-Android
 # host) counts as a failed/unverified step, not a silent pass.
@@ -174,6 +255,9 @@ if command -v getenforce >/dev/null 2>&1; then
 else
     add_failed setenforce
 fi
+# 5.9.16: per-step verify summary — a PARTIAL now names its stuck
+# piece in this line as well as in the FAILED_STEPS list above.
+echo "RETURN_STEP verify: unmount_failed=$(case " $FAILED_STEPS " in *" unmount "*) echo yes;; *) echo no;; esac) zygote_failed=$(case " $FAILED_STEPS " in *" zygote "*) echo yes;; *) echo no;; esac) setenforce_failed=$(case " $FAILED_STEPS " in *" setenforce "*) echo yes;; *) echo no;; esac) storage_failed=$(case " $FAILED_STEPS " in *" storage "*) echo yes;; *) echo no;; esac) failed_steps=[$FAILED_STEPS]"
 if [ -z "$FAILED_STEPS" ]; then
     echo "RETURN_OK"
 else

@@ -55,7 +55,9 @@ import android.widget.ScrollView;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.security.MessageDigest;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -210,7 +212,32 @@ public class MainActivity extends Activity {
     private boolean batteryOverrideSession = false;
     private volatile boolean pickerCopying = false;
     private long lastInstallTapMs = 0;
+    // 5.9.17: one install at a time (see installGsi / installLocalGsi /
+    // startNetworkDownload). Atomic so a task-start check and a UI
+    // check cannot both claim the slot.
+    private final java.util.concurrent.atomic.AtomicBoolean installBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
+    // 5.9.17: ownership transfer for the corrupt-download retry: the
+    // failing task queues its retry without clearing installBusy, and
+    // the retry task consumes this flag instead of fighting the CAS.
+    private volatile boolean installHandoff = false;
+    // 5.9.17: progress-poller generation (see streamInstallProgress).
+    // Bumped at task start, at poller start, and at completion, so a
+    // late poller post can never overwrite the final UI.
+    private final java.util.concurrent.atomic.AtomicInteger installProgressGen = new java.util.concurrent.atomic.AtomicInteger(0);
+    // 5.9.17: true once the user has parked the log above its tail by
+    // hand (see the touch listener in onCreate). Auto-follow pauses
+    // while pinned and resumes the moment they scroll back to the
+    // tail (or re-check the auto-scroll box).
+    private volatile boolean logUserPinned = false;
     private long lastBootTapMs = 0;
+    // 5.9.16: slot whose return is currently being streamed, so
+    // streamReturnProgress can record its last-boot outcome on
+    // RETURN_OK. Set on the main thread at Return tap time (the
+    // selected slot at tap time is the returning slot); read only
+    // from the poller. The Return light path (no guest running)
+    // never sets it — a no-op Return is not a session end and must
+    // not overwrite the last real outcome.
+    private volatile String returningSlot = null;
     private static final String PREF_UI_STYLE = "ui_style";
     private String uiStyle = "stage";
     private boolean moreToolsExpanded = false;
@@ -278,6 +305,33 @@ public class MainActivity extends Activity {
     // 5.9.5-APP-END
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    // 5.9.16: picker copies run here, NOT on the main executor. The main
+    // executor serializes root ops, so a long download/install/boot-progress
+    // task queued ahead of a picker copy used to starve the copy: the copy
+    // never landed, pickerCopying stayed true, and Install stayed disabled
+    // (but looked enabled — btn_skin_primary has no disabled state) for
+    // the whole wait, i.e. "Install does nothing" after picking a file.
+    // A dedicated single thread keeps copies serialized among themselves
+    // while independent of root-op queueing.
+    private final ExecutorService pickerExecutor = Executors.newSingleThreadExecutor();
+    // 5.9.16: log-streaming/polling runs HERE, not on the executor
+    // above. The old design queued streamBootProgress /
+    // streamReturnProgress on the same single thread as every root
+    // mutation, with a comment claiming "no deadlock because
+    // sequential" — an ordering assumption, not a guarantee: a hung
+    // stream (a takeover log that never reaches TAKEOVER LAUNCHED,
+    // a return log that never reaches RETURN_OK) occupied the one
+    // thread for its whole 120–180 s cap, and any install/boot/wipe
+    // queued behind it waited silently; worse, a stream that never
+    // returned at all wedged every later root op. The sequential
+    // ordering was never actually needed: pollers only READ
+    // append-only log files (tail -n +K) and report through
+    // appendLog / showFuncBarPct, both of which post to
+    // mainHandler, so they never mutate slot state and never race a
+    // root mutation — they are safe to run concurrently, and a hung
+    // poller now only costs its own thread. Root mutations stay
+    // serialized on the executor above; pollers stay off it.
+    private final ExecutorService pollExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     // 5.9.11: engine readiness (see extractAssets). Volatile so the
     // Install/Boot gates on the main thread see the background
@@ -347,6 +401,15 @@ public class MainActivity extends Activity {
     private static final String PREF_BOOTS_PREFIX = "slot_boots_";
     private static final String PREF_SHA_PREFIX = "slot_sha_";
     private static final String PREF_LAST_BOOT = "last_booted_slot";
+    // 5.9.16: per-slot last-boot outcome, recorded from the three
+    // signals the app already has — UI Activator log (home reached),
+    // watchdog marker (watchdog timeout), pstore verdict (reboot /
+    // panic) — plus Return completion. Value: "<code>|<epochMs>",
+    // codes: home, timeout, returned, reboot, panic. Shown in the
+    // slot picker (refreshSlots labels) and the slot card
+    // (refreshSlotInfo). This REPLACES displaying PREF_LAST_BOOT
+    // (which stores a slot NAME, not a time) as if it were a date.
+    private static final String PREF_LAST_BOOT_OUTCOME_PREFIX = "slot_last_boot_outcome_";
 
     // Slots (5.9.3, userspace recovery): the "Default" slot IS the original
     // single install (STAGE_DIR/system.raw, unchanged behaviour). Named
@@ -386,6 +449,30 @@ public class MainActivity extends Activity {
         // scrolling did nothing — only the auto-scroll moved it. Give
         // it one, so the log can be read back by hand.
         if (tvConsoleLog != null) tvConsoleLog.setMovementMethod(new ScrollingMovementMethod());
+        // 5.9.17: the log box sits inside the page ScrollView, which
+        // otherwise steals vertical drags — the box could never be
+        // scrolled by hand. Let drags starting on the log stay with
+        // the log, and remember when the user parks it above the tail
+        // (pinned: auto-follow pauses) versus back at the tail
+        // (pinned clears: following resumes). Returns false so the
+        // movement method still handles the drag itself.
+        if (tvConsoleLog != null) tvConsoleLog.setOnTouchListener((v, ev) -> {
+            int a = ev.getAction();
+            if (a == android.view.MotionEvent.ACTION_DOWN) {
+                if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(true);
+            } else if (a == android.view.MotionEvent.ACTION_UP || a == android.view.MotionEvent.ACTION_CANCEL) {
+                try {
+                    boolean atBottom = true;
+                    if (tvConsoleLog.getLayout() != null) {
+                        int contentH = tvConsoleLog.getLayout().getLineTop(tvConsoleLog.getLineCount());
+                        int visibleH = tvConsoleLog.getHeight() - tvConsoleLog.getPaddingTop() - tvConsoleLog.getPaddingBottom();
+                        atBottom = tvConsoleLog.getScrollY() + visibleH >= contentH - 8;
+                    }
+                    logUserPinned = !atBottom;
+                } catch (Exception ignored) {}
+            }
+            return false;
+        });
         tvLogStatus = findViewById(R.id.tv_log_status);
 
         cardFlavorVanilla = findViewById(R.id.card_flavor_vanilla);
@@ -512,6 +599,9 @@ public class MainActivity extends Activity {
         extractAssets();
         checkRootAndSystem();
         refreshSlots();
+        // 5.9.16: launch-time slot reconcile (see reconcileSlots)
+        // — single authority for slot-record vs on-disk drift.
+        reconcileSlots();
 
         btnInstallGsi.setOnClickListener(v -> installGsi());
         if (btnGuestShell != null) btnGuestShell.setOnClickListener(v -> promptGuestShell());
@@ -927,33 +1017,47 @@ public class MainActivity extends Activity {
                         if (cut > 0) ed.delete(0, cut);
                     }
                 } catch (Exception ignored) {}
-                // 5.9.14: smart follow — follow the tail only while
-                // the user is already watching it. If they scrolled up
-                // to read back, new lines must NOT yank them to the
-                // bottom; following resumes the moment they scroll
-                // back to the tail (within ~80px of it).
-                if (logAutoScroll) {
-                    try {
-                        boolean wasAtBottom = true;
-                        if (tvConsoleLog.getLayout() != null) {
-                            int contentH = tvConsoleLog.getLayout().getLineTop(tvConsoleLog.getLineCount());
-                            int visibleH = tvConsoleLog.getHeight() - tvConsoleLog.getPaddingTop() - tvConsoleLog.getPaddingBottom();
-                            wasAtBottom = tvConsoleLog.getScrollY() + visibleH >= contentH - 80;
-                        }
-                        if (wasAtBottom) {
-                            tvConsoleLog.post(() -> {
-                                try {
-                                    if (tvConsoleLog.getLayout() != null) {
-                                        int scrollAmount = tvConsoleLog.getLayout().getLineTop(tvConsoleLog.getLineCount()) - tvConsoleLog.getHeight();
-                                        if (scrollAmount > 0) tvConsoleLog.scrollTo(0, scrollAmount);
-                                    }
-                                } catch (Exception ignored) {}
-                            });
-                        }
-                    } catch (Exception ignored) {}
+                // 5.9.17: follow the tail whenever auto-scroll is on
+                // and the user has NOT pinned the log by scrolling up
+                // (see the touch listener in onCreate). The 5.9.14
+                // gate computed "was at bottom" from the CURRENT
+                // scroll position, but the scroll only advanced when
+                // the gate was true — so the first time content grew
+                // past viewport + 80px slack, the gate closed forever
+                // and the log froze at its first screenful. That is
+                // why taps looked dead: every new line, including
+                // every tap's feedback, appended below the visible
+                // area and the view never moved.
+                if (logAutoScroll && !logUserPinned) {
+                    scrollLogToBottom();
                 }
             }
             // 5.9.5-APP-END
+        });
+    }
+
+    // 5.9.17: scroll the log TextView to its last line. The layout can
+    // lag one frame behind the append, so if it does not yet cover the
+    // new text, retry briefly instead of scrolling to the old bottom.
+    private void scrollLogToBottom() {
+        if (tvConsoleLog == null) return;
+        tvConsoleLog.post(new Runnable() {
+            int attempts = 0;
+            @Override public void run() {
+                try {
+                    if (tvConsoleLog == null || tvConsoleLog.getLayout() == null) return;
+                    android.text.Editable ed = tvConsoleLog.getEditableText();
+                    int edLines = 0;
+                    for (int i = 0; i < ed.length(); i++) if (ed.charAt(i) == '\n') edLines++;
+                    if (tvConsoleLog.getLayout().getLineCount() < edLines && attempts < 3) {
+                        attempts++;
+                        tvConsoleLog.postDelayed(this, 50);
+                        return;
+                    }
+                    int scrollAmount = tvConsoleLog.getLayout().getLineTop(tvConsoleLog.getLineCount()) - tvConsoleLog.getHeight();
+                    if (scrollAmount > 0) tvConsoleLog.scrollTo(0, scrollAmount);
+                } catch (Exception ignored) {}
+            }
         });
     }
 
@@ -1443,6 +1547,166 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
+    // 5.9.16: record a per-slot last-boot outcome (see
+    // PREF_LAST_BOOT_OUTCOME_PREFIX). Safe to call from any thread
+    // (SharedPreferences only); never overwrites the boot count.
+    private void noteLastBootOutcome(String slot, String code) {
+        if (slot == null || slot.isEmpty() || code == null) return;
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(PREF_LAST_BOOT_OUTCOME_PREFIX + slot, code + "|" + System.currentTimeMillis()).apply();
+        } catch (Exception ignored) {}
+    }
+
+    private static String lastBootOutcomeShort(String stored) {
+        if (stored == null || stored.isEmpty()) return null;
+        String code = stored.split("\\|")[0];
+        switch (code) {
+            case "home": return "home ✓";
+            case "timeout": return "watchdog timeout";
+            case "returned": return "returned";
+            case "reboot": return "reboot";
+            case "panic": return "kernel panic";
+            default: return code;
+        }
+    }
+
+    private static String lastBootOutcomeLong(String stored) {
+        if (stored == null || stored.isEmpty()) return "never";
+        String[] parts = stored.split("\\|");
+        String code = parts[0];
+        String when = "";
+        if (parts.length > 1) {
+            try { when = " (" + new java.util.Date(Long.parseLong(parts[1])).toString() + ")"; } catch (Exception ignored) {}
+        }
+        switch (code) {
+            case "home": return "home reached" + when;
+            case "timeout": return "watchdog timeout (no home in 10 min)" + when;
+            case "returned": return "returned to One UI" + when;
+            case "reboot": return "session ended by reboot / force-restart" + when;
+            case "panic": return "kernel panic ended the session" + when;
+            default: return code + when;
+        }
+    }
+
+    // 5.9.16: slot reconcile, run once at launch (onCreate, after
+    // refreshSlots is queued — both run on the executor, so this
+    // runs after the refresh task). The old code had per-path
+    // cleanup scattered across sweepStaleGuestMarkers, Return's
+    // light path, deleteSlot and clean-slate, each with its own
+    // idea of what "stale" means; this single routine is now the
+    // authority for slot-record vs on-disk drift, and it REPLACES
+    // those per-path cleanups where they conflict (they now only
+    // handle their own operation's aftermath). It logs every repair
+    // and repairs only what is provably drift:
+    //  - prefs keyed to a slot whose directory no longer exists
+    //    (note/boots/sha/density/share/guest-root/color/outcome)
+    //    are pruned; a PREF_LAST_BOOT pointing at a gone slot is
+    //    cleared; a selected slot that no longer exists falls back
+    //    to Default (refreshSlots already does this on the UI side,
+    //    this fixes the stored record too).
+    //  - stale install temps (system.raw.new, .converted, .fitcheck
+    //    leftovers) and stale framework_version files for slots
+    //    with no installed image are deleted (temps are never user
+    //    data; a framework_version without an image is a lie).
+    //  - slot directories with invalid names are LOGGED ONLY, never
+    //    deleted (a foreign dir under slots/ is not proven drift).
+    //  - a mounted rootfs with NO guest processes and NO takeover
+    //    script for that stage is a leftover mount, not a live
+    //    guest: it is lazily unmounted via containerUnmountCmd and
+    //    its marker cleared. A mount WITH processes or a running
+    //    takeover script is left strictly alone — unmounting a live
+    //    guest's rootfs would kill the session.
+    // Nothing here runs while a guest is running for that slot
+    // (the mount repair requires the process + script checks to
+    // both come back empty first).
+    private void reconcileSlots() {
+        if (!isRootGranted) return;
+        executor.execute(() -> {
+            try {
+                List<String> dirs = allStageDirs();
+                java.util.Set<String> onDisk = new java.util.HashSet<>();
+                onDisk.add(DEFAULT_SLOT);
+                List<String> names = new ArrayList<>();
+                runRootCmdCaptured("ls -d " + STAGE_DIR + "/slots/*/ 2>/dev/null", names);
+                for (String ln : names) {
+                    String t = ln.trim();
+                    if (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+                    int slash = t.lastIndexOf('/');
+                    String n = slash >= 0 ? t.substring(slash + 1) : t;
+                    if (isValidSlotName(n)) onDisk.add(n);
+                    else if (!n.isEmpty()) appendLog("Slot reconcile: directory under slots/ has an invalid name and is left alone (not a slot record): " + t);
+                }
+                android.content.SharedPreferences pr = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                android.content.SharedPreferences.Editor e = pr.edit();
+                boolean changed = false;
+                // Prune per-slot prefs for slots that no longer exist
+                // on disk. Slot names are [A-Za-z0-9_-], so a prefs
+                // key scan by prefix is safe.
+                java.util.Map<String, ?> all = pr.getAll();
+                String[] prefixes = {PREF_NOTE_PREFIX, PREF_BOOTS_PREFIX, PREF_SHA_PREFIX,
+                    PREF_DENSITY_PREFIX, PREF_SHARE_PREFIX, PREF_GUEST_ROOT_PREFIX,
+                    PREF_COLOR_PREFIX, PREF_LAST_BOOT_OUTCOME_PREFIX};
+                for (String key : all.keySet()) {
+                    for (String pfx : prefixes) {
+                        if (key.startsWith(pfx)) {
+                            String slot = key.substring(pfx.length());
+                            if (!onDisk.contains(slot)) {
+                                e.remove(key);
+                                changed = true;
+                                appendLog("Slot reconcile: pruned stale record '" + key + "' (slot '" + slot + "' no longer exists on disk).");
+                            }
+                            break;
+                        }
+                    }
+                }
+                String last = pr.getString(PREF_LAST_BOOT, null);
+                if (last != null && !onDisk.contains(last)) { e.remove(PREF_LAST_BOOT); changed = true; appendLog("Slot reconcile: cleared last-booted slot '" + last + "' (slot no longer exists)."); }
+                if (changed) e.apply();
+                // Per-slot disk drift: stale temps, stale
+                // framework_version, leftover mounts.
+                for (String d : dirs) {
+                    String slot = slotDisplayName(d);
+                    List<String> hasRaw = new ArrayList<>();
+                    runRootCmdCaptured("[ -f " + d + "/system.raw ] && echo YES || echo NO", hasRaw);
+                    boolean hasImage = false;
+                    for (String h : hasRaw) if ("YES".equals(h.trim())) { hasImage = true; break; }
+                    List<String> temps = new ArrayList<>();
+                    runRootCmdCaptured("for t in " + d + "/system.raw.new " + d + "/system.raw.converted " + d + "/.fitcheck_mnt" + (hasImage ? "" : " " + d + "/framework_version") + "; do [ -e \"$t\" ] && echo STALE; done", temps);
+                    if (!temps.isEmpty()) {
+                        runRootCmdDrained("rm -f " + d + "/system.raw.new " + d + "/system.raw.converted " + (hasImage ? "" : d + "/framework_version ") + "2>/dev/null; rm -rf " + d + "/.fitcheck_mnt 2>/dev/null");
+                        appendLog("Slot reconcile: removed " + temps.size() + " stale temp file(s) for slot '" + slot + "'" + (hasImage ? "." : " (slot has no installed image, so its stale framework_version went too)."));
+                    }
+                    List<String> mounted = new ArrayList<>();
+                    runRootCmdCaptured("mount | grep -q '" + d + "/rootfs ' && echo MOUNTED || echo NOMOUNT", mounted);
+                    boolean isMounted = false;
+                    for (String m : mounted) if ("MOUNTED".equals(m.trim())) { isMounted = true; break; }
+                    if (!isMounted) continue;
+                    // Mounted: live guest, or leftover? Live needs
+                    // guest processes or a takeover script for this
+                    // stage; neither present means leftover. Guest
+                    // processes are identified by their /proc root
+                    // pointing at this slot's rootfs — a NAME check
+                    // (ps | grep system_server) would be wrong here,
+                    // because the HOST's own system_server runs under
+                    // that name whenever the phone is in One UI, and
+                    // it would veto every legitimate leftover repair.
+                    List<String> procs = new ArrayList<>();
+                    runRootCmdCaptured("for p in /proc/[0-9]*; do [ \"$(readlink \"$p/root\" 2>/dev/null)\" = \"" + d + "/rootfs\" ] && echo GUESTPROC && break; done", procs);
+                    List<String> takeover = new ArrayList<>();
+                    runRootCmdCaptured("ps -ef 2>/dev/null | grep -a -F '" + d + "' | grep -a -E 'switch_to_gsi|master_prepare|master_inner' | grep -a -v grep | head -5", takeover);
+                    if (!procs.isEmpty() || !takeover.isEmpty()) continue;
+                    appendLog("Slot reconcile: slot '" + slot + "' has a mounted rootfs but no guest processes and no takeover script — treating it as a leftover mount and unmounting it.");
+                    runRootCmdDrained(containerUnmountCmd(d));
+                    runRootCmdDrained("rm -f " + d + "/.guest_running 2>/dev/null");
+                    appendLog("Slot reconcile: leftover rootfs mount for slot '" + slot + "' unmounted; marker cleared.");
+                }
+            } catch (Exception ex) {
+                appendLog("Slot reconcile failed (no repairs applied beyond those already logged): " + ex.getMessage());
+            }
+        });
+    }
+
     private void triggerChecksum(final String slot, final String raw, final String cacheKey) {
         // Called from inside a refreshSlotInfo executor task; the compute
         // itself is queued on the same single-thread executor, so it runs
@@ -1572,13 +1836,19 @@ public class MainActivity extends Activity {
             String note = slotNote(slot);
             final String fNote = (note == null || note.isEmpty()) ? "Note: \u2014" : "Note: " + note;
             int boots = 0;
-            String lastBooted = null;
+            String lastOutcome = null;
             try {
                 android.content.SharedPreferences pr = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
                 boots = pr.getInt(PREF_BOOTS_PREFIX + slot, 0);
-                lastBooted = pr.getString(PREF_LAST_BOOT, null);
+                // 5.9.16: per-slot last-boot OUTCOME (home / watchdog
+                // timeout / returned / reboot / panic), not
+                // PREF_LAST_BOOT — that pref stores a slot NAME, and
+                // the old code displayed that name as if it were a
+                // date ("Last booted: Default"), which was wrong for
+                // every slot. Never-booted slots show "never".
+                lastOutcome = pr.getString(PREF_LAST_BOOT_OUTCOME_PREFIX + slot, null);
             } catch (Exception ignored) {}
-            final String fBoots = "Boots: " + boots + " \u2022 Last booted: " + ((lastBooted == null || lastBooted.isEmpty()) ? "never" : lastBooted);
+            final String fBoots = "Boots: " + boots + " \u2022 Last boot: " + lastBootOutcomeLong(lastOutcome);
             // Checksum: cached by size:mtime so a multi-GB rehash only
             // happens when the image actually changed. Missing file -> dash.
             final String fSha;
@@ -1664,6 +1934,31 @@ public class MainActivity extends Activity {
         });
     }
 
+    // 5.9.16: SHA-256 helpers for the asset/engine hash checks.
+    // Streaming (32 KB buffer) so multi-MB jars never load fully
+    // into memory; returns null on any error (caller treats null
+    // as "no usable hash" and re-extracts / re-copies, never as a
+    // match).
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) sb.append(String.format("%02x", b & 0xFF));
+        return sb.toString();
+    }
+
+    private static String sha256HexFile(File f) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = new FileInputStream(f)) {
+                byte[] buf = new byte[32768];
+                int n;
+                while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
+            }
+            return bytesToHex(md.digest());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private void extractAssets() {
         // 5.9.11: incremental + guarded. Previously this re-extracted
         // every non-jar asset on EVERY launch (and twice per launch:
@@ -1729,31 +2024,48 @@ public class MainActivity extends Activity {
             int copied = 0, skipped = 0;
             for (String asset : assets) {
                 File target = new File(filesDir, asset);
-                // 5.9.11: incremental skip. Jars keep their older
-                // exists-and-nonempty rule; other assets skip when the
-                // on-disk length matches the length recorded at their
-                // last successful unpack. A version change (forceAll)
-                // still re-extracts everything.
+                // 5.9.16: SHA-256 skip, NOT length-only. The old
+                // rules (jars: exists-and-nonempty; others: length
+                // matches the recorded length) skipped a same-length
+                // stale/corrupt asset forever. Now the versioned
+                // hash record "asset_sha_<asset>" =
+                // "<appVersion>:<sha256>" is the skip test: the
+                // on-disk file is hashed and must equal the recorded
+                // hash for THIS app version, or it is re-extracted.
+                // A version change (forceAll) still re-extracts
+                // everything and records fresh hashes. No usable
+                // record (pre-5.9.16 install) also re-extracts once
+                // and records a hash, so the next launch is covered.
+                // Cost: hashing ~60 MB of jars per launch on the
+                // background executor — seconds, and the price of
+                // never booting from a corrupt patched jar again.
                 if (!fForceAll && target.exists() && target.length() > 0) {
-                    if (asset.endsWith(".jar")) { skipped++; continue; }
-                    String recorded = prefs.getString("asset_len_" + asset, null);
-                    if (recorded != null) {
-                        try {
-                            if (target.length() == Long.parseLong(recorded)) { skipped++; continue; }
-                        } catch (Exception ignored) {}
+                    String recorded = prefs.getString("asset_sha_" + asset, null);
+                    if (recorded != null && fBundleVersion != null
+                            && recorded.startsWith(fBundleVersion + ":")) {
+                        String wantHex = recorded.substring(fBundleVersion.length() + 1);
+                        String gotHex = sha256HexFile(target);
+                        if (wantHex.equals(gotHex)) { skipped++; continue; }
+                        appendLog("Asset hash mismatch for " + asset + " — re-extracting (length alone would have skipped it).");
                     }
                 }
                 try (InputStream in = getAssets().open(asset);
                      OutputStream out = new FileOutputStream(target)) {
+                    MessageDigest md = MessageDigest.getInstance("SHA-256");
                     byte[] buffer = new byte[32768];
                     int read; long written = 0;
                     while ((read = in.read(buffer)) != -1) {
                         out.write(buffer, 0, read);
+                        md.update(buffer, 0, read);
                         written += read;
                     }
                     target.setExecutable(true, false);
                     target.setReadable(true, false);
-                    try { prefs.edit().putString("asset_len_" + asset, Long.toString(written)).apply(); } catch (Exception ignored) {}
+                    String hex = bytesToHex(md.digest());
+                    try {
+                        prefs.edit().putString("asset_len_" + asset, Long.toString(written))
+                            .putString("asset_sha_" + asset, (fBundleVersion != null ? fBundleVersion : "") + ":" + hex).apply();
+                    } catch (Exception ignored) {}
                     copied++;
                 } catch (Exception e) {
                     appendLog("Error unpacking " + asset + ": " + e.getMessage());
@@ -1947,7 +2259,9 @@ public class MainActivity extends Activity {
     // variant the phone reboots mid-poll and the task simply dies
     // with the app — that is the expected end, not an error.
     private void streamReturnProgress(final String logPath, final ProgressBar bar, final TextView label, final boolean isReboot) {
-        executor.execute(() -> {
+        // 5.9.16: pollExecutor (see streamBootProgress): a hung
+        // return stream must never wedge the root-op queue.
+        pollExecutor.execute(() -> {
             try {
                 int total = 0;
                 int stage = 0;
@@ -1960,6 +2274,22 @@ public class MainActivity extends Activity {
                         if (line.contains("RETURN_OK")) {
                             showFuncBarPct(bar, label, 100, isReboot ? "Return complete — rebooting now…" : "One UI restored.");
                             appendLog(isReboot ? "Return complete — the phone reboots now." : "One UI restore verified (RETURN_OK).");
+                            // 5.9.16: record the returning slot's
+                            // outcome. If the Activator log says the
+                            // guest reached home before this return,
+                            // the outcome is home (the return just
+                            // ended a good session); otherwise it is
+                            // a plain return. RETURN_PARTIAL records
+                            // nothing — a partial restore is not a
+                            // clean session end.
+                            if (returningSlot != null) {
+                                List<String> hc = new ArrayList<>();
+                                runRootCmdCaptured("grep -q 'Home activated!' /data/local/tmp/ui_activator.log 2>/dev/null && echo HOME || echo NOHOME", hc);
+                                boolean home = false;
+                                for (String h : hc) if ("HOME".equals(h.trim())) { home = true; break; }
+                                noteLastBootOutcome(returningSlot, home ? "home" : "returned");
+                                returningSlot = null;
+                            }
                             hideFuncBar(bar, label);
                             return;
                         } else if (line.contains("RETURN_PARTIAL")) {
@@ -1989,9 +2319,72 @@ public class MainActivity extends Activity {
         });
     }
 
+    // 5.9.16: install-progress poller — the same pattern as
+    // streamBootProgress, for install_image.sh's INSTALL_PROGRESS
+    // markers in <slotDir>/install_progress.log (7zz extraction and
+    // simg2img conversion ticks, every 5 s). Runs on pollExecutor
+    // so a long install poll never wedges the root-op queue; it
+    // only reads the append-only progress file and updates the
+    // Download bar/text via mainHandler-posted helpers, so it is
+    // safe against concurrent appends. Stops at the script's
+    // "done"/"failed" marker, or after 30 min. WIRING NOTE for the
+    // coordinator merge: the Install-path owner owns the call site
+    // — call streamInstallProgress(slotDir) immediately before the
+    // installImageCmd run in the download/install flow, and let
+    // this poller stop itself on the done/failed marker. The
+    // script side (markers + progress file) is already live, so a
+    // local-file install only needs that one call added.
+    private void streamInstallProgress(final String slotDir) {
+        // 5.9.17: every poller run owns a generation. Completion
+        // (success/failure) bumps the generation, so a late poller
+        // post can never overwrite the final UI with a stale
+        // "Installing: ..." line — the reported "installing vs
+        // done" contradiction.
+        final int myGen = installProgressGen.incrementAndGet();
+        pollExecutor.execute(() -> {
+            try {
+                String logPath = slotDir + "/install_progress.log";
+                int total = 0;
+                for (int poll = 0; poll < 600; poll++) { // 600 x 3s = 30 min cap
+                    Thread.sleep(3000);
+                    List<String> fresh = new ArrayList<>();
+                    runRootCmdCaptured("tail -n +" + (total + 1) + " " + logPath + " 2>/dev/null", fresh);
+                    for (String line : fresh) {
+                        if (line.contains("INSTALL_PROGRESS:")) {
+                            final String msg = line.substring(line.indexOf("INSTALL_PROGRESS:") + "INSTALL_PROGRESS:".length()).trim();
+                            mainHandler.post(() -> {
+                                if (installProgressGen.get() != myGen) return;
+                                if (tvDownloadProgress != null) tvDownloadProgress.setText("Installing: " + msg);
+                                if (tvOperationProgress != null) tvOperationProgress.setText("Installing: " + msg);
+                            });
+                            // Exact terminal markers only: intermediate
+                            // lines like "extraction done" must NOT stop
+                            // the poller mid-install.
+                            if (line.contains("INSTALL_PROGRESS: done") || line.contains("INSTALL_PROGRESS: failed")) return;
+                        }
+                    }
+                    total += fresh.size();
+                }
+                if (installProgressGen.get() == myGen) appendLog("Install progress polling stopped after 30 minutes (the install script may still be running — check the log).");
+            } catch (Exception e) {
+                if (installProgressGen.get() == myGen) appendLog("Install progress streaming stopped: " + e.getMessage());
+            }
+        });
+    }
+
     private void refreshInstallEnabled() {
         mainHandler.post(() -> {
-            if (btnInstallGsi != null) btnInstallGsi.setEnabled(!downloading && !pickerCopying);
+            if (btnInstallGsi != null) {
+                // 5.9.16: btn_skin_primary has NO disabled state in its
+                // drawable, so a disabled Install used to look exactly
+                // like an enabled one — a tap on it silently did nothing
+                // and the user had no way to tell. Dim it like the Boot
+                // button (alpha 0.5 when disabled) so "disabled" is
+                // visible, not just behavioral.
+                boolean enabled = !downloading && !pickerCopying;
+                btnInstallGsi.setEnabled(enabled);
+                btnInstallGsi.setAlpha(enabled ? 1.0f : 0.5f);
+            }
         });
     }
 
@@ -2072,6 +2465,27 @@ public class MainActivity extends Activity {
         v.findViewById(R.id.exp_live_logcat_full).setOnClickListener(b -> { dlg.dismiss(); liveLogcatFull(); });
         v.findViewById(R.id.exp_rescue_toggle).setOnClickListener(b -> { dlg.dismiss(); rescuePartyToggle(); });
         v.findViewById(R.id.exp_device_info).setOnClickListener(b -> { dlg.dismiss(); deviceInfoDump(); });
+        // 5.9.16: diagnostics-bundle export button, added in code
+        // rather than in dialog_experimental.xml (that layout file
+        // is outside this workstream's ownership). The inflated
+        // root is a ScrollView holding one vertical LinearLayout;
+        // the button is appended there, after the existing tools.
+        try {
+            android.widget.LinearLayout group = (android.widget.LinearLayout) ((android.widget.ScrollView) v).getChildAt(0);
+            Button btnExport = new Button(this);
+            btnExport.setText("Export diagnostics bundle");
+            // Coordinator fix: setTextAllCaps() does not resolve against
+            // this build's android.jar stub (verified via javap on both
+            // android-34 and android-37.0 stubs), so use the equivalent
+            // transformation removal directly — API-1 safe, same result.
+            btnExport.setTransformationMethod(null);
+            android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, dp597(40));
+            lp.topMargin = dp597(10);
+            btnExport.setLayoutParams(lp);
+            btnExport.setOnClickListener(b -> { dlg.dismiss(); exportDiagnosticsBundle(); });
+            group.addView(btnExport);
+        } catch (Exception ignored) {}
         v.findViewById(R.id.exp_close).setOnClickListener(b -> dlg.dismiss());
         dlg.show();
     }
@@ -2271,6 +2685,88 @@ public class MainActivity extends Activity {
         });
     }
 
+    // 5.9.16: one-tap diagnostics bundle export (Experimental
+    // menu). A single file holding: the app operation log, the
+    // takeover log (slot + stage), the inner takeover log, the
+    // boot_diagnostics bundle, a pstore excerpt, and device info.
+    // Root-only sections are included only when temp root is
+    // active; without root the bundle still exports the app log +
+    // device info and says which sections were skipped. NOTE: the
+    // pstore excerpt is read DIRECTLY from /sys/fs/pstore (head
+    // -100 per file) and deliberately does NOT run pstore_check.sh
+    // — that script is report-once, and exporting must never
+    // consume the one verdict the launch sweep would surface.
+    private void exportDiagnosticsBundle() {
+        executor.execute(() -> {
+            try {
+                StringBuilder sb = new StringBuilder();
+                sb.append("GSI Loader Samsung diagnostics bundle\n");
+                sb.append("Exported: ").append(new java.util.Date().toString()).append("\n");
+                sb.append("Model: ").append(android.os.Build.MODEL).append("\n");
+                sb.append("Build id: ").append(android.os.Build.ID).append("\n");
+                sb.append("Android: ").append(android.os.Build.VERSION.RELEASE)
+                    .append(" (SDK ").append(android.os.Build.VERSION.SDK_INT).append(")\n");
+                sb.append("Current slot: ").append(selectedSlot).append("\n");
+                sb.append("Root status: ").append(isRootGranted ? "temp root active" : "no root right now").append("\n");
+                try {
+                    Process p = new ProcessBuilder("sh", "-c", "uname -r").start();
+                    BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                    String line = r.readLine();
+                    if (line != null && !line.trim().isEmpty()) sb.append("Kernel: ").append(line.trim()).append("\n");
+                    p.waitFor();
+                } catch (Exception ignored) {}
+                sb.append("\n===== app operation log (operation_log.txt) =====\n");
+                try {
+                    File opLog = new File(getFilesDir(), "operation_log.txt");
+                    if (opLog.exists()) {
+                        try (java.io.FileInputStream in = new java.io.FileInputStream(opLog)) {
+                            byte[] buf = new byte[32768];
+                            int n;
+                            while ((n = in.read(buf)) != -1) sb.append(new String(buf, 0, n, "UTF-8"));
+                        }
+                    } else sb.append("(no operation log yet)\n");
+                } catch (Exception e) {
+                    sb.append("(app log read failed: ").append(e.getMessage()).append(")\n");
+                }
+                if (isRootGranted) {
+                    String dir = currentSlotDir();
+                    String[][] sections = {
+                        {"takeover log (slot takeover_app.log, last 300 lines)", "tail -300 \"" + dir + "/takeover_app.log\" 2>/dev/null"},
+                        {"takeover log (stage takeover_app.log, last 300 lines)", "tail -300 \"" + STAGE_DIR + "/takeover_app.log\" 2>/dev/null"},
+                        {"inner takeover log (data/takeover.log, last 300 lines)", "tail -300 \"" + dir + "/data/takeover.log\" 2>/dev/null"},
+                        {"boot diagnostics bundle", "cat \"" + dir + "/boot_diagnostics.log\" 2>/dev/null; cat \"" + STAGE_DIR + "/boot_diagnostics.log\" 2>/dev/null"},
+                        {"pstore excerpt (console/dmesg ramoops, head 100 lines each — direct read, NOT pstore_check.sh)", "for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do [ -f \"$f\" ] && { echo \"== $f\"; head -100 \"$f\" 2>/dev/null; }; done"},
+                    };
+                    for (String[] sec : sections) {
+                        sb.append("\n===== ").append(sec[0]).append(" =====\n");
+                        List<String> lines = new ArrayList<>();
+                        runRootCmdCaptured(sec[1], lines);
+                        if (lines.isEmpty()) sb.append("(empty / not present)\n");
+                        else for (String l : lines) sb.append(l).append("\n");
+                    }
+                } else {
+                    sb.append("\n===== root sections skipped (no temp root) =====\n");
+                    sb.append("Takeover log, inner log, boot diagnostics and pstore excerpt need temp root — re-apply temp root and export again for the full bundle.\n");
+                }
+                File logDir = new File(getExternalFilesDir(null), "logs");
+                if (!logDir.exists()) logDir.mkdirs();
+                File out = new File(logDir, "diagnostics_bundle_" + System.currentTimeMillis() + ".txt");
+                try (OutputStream o = new FileOutputStream(out)) {
+                    o.write(sb.toString().getBytes("UTF-8"));
+                }
+                final String path = out.getAbsolutePath();
+                final int bytes = sb.length();
+                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + pstore excerpt + device info). Share this file when reporting a failed boot.");
+                mainHandler.post(() -> new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Diagnostics bundle exported")
+                        .setMessage("Saved to:\n" + path + "\n\nIt holds the app log, takeover log, inner log, boot diagnostics, pstore excerpt and device info in one file — share it when reporting a failed boot.")
+                        .setPositiveButton("OK", null).show());
+            } catch (Exception e) {
+                appendLog("Diagnostics bundle export failed: " + e.getMessage());
+            }
+        });
+    }
+
     private void showGuideDialog() {
         String g = "HOW TO USE GSI LOADER SAMSUNG\n\n"
             + "WHAT THIS APP DOES\n"
@@ -2284,7 +2780,7 @@ public class MainActivity extends Activity {
             + "SLOTS\n"
             + "A slot is a separate installed guest system, with its own system image and its own guest data. You can keep several — for example one that works and one you are testing — and switch between them with the slot picker. The Default slot is the original single install. Create slot makes an empty slot you can install into. Delete slot removes the picked slot, its system image and its guest data, permanently. The Default slot cannot be deleted — use Delete guest files for it. Duplicate slot copies the picked slot under a new name. Wipe slot data deletes only the guest's data (apps, accounts, files inside the guest); the system image stays, so the next boot starts fresh setup. Clean slate removes ALL guest state at once — every slot's image and data, stage files, cached downloads, and slot records — so the app starts fresh; it refuses while a guest is running, and after a successful wipe it offers to uninstall the app itself. Your Samsung system is never touched. Nothing here runs while that slot's guest is running. A guest counts as running only when its system is actually mounted or its processes are actually alive — a leftover 'guest running' note from a force-restart does not count: the app clears such stale notes on launch, and Return while already in One UI is a no-op that just clears them. If a guest boot runs for minutes then the phone itself restarts, the app checks the previous boot's kernel log on next launch and reports whether it was a kernel panic (and whether the EROFS driver was involved) or a userspace reboot — paste that verdict back if it happens.\n\n"
             + "COMPATIBILITY PATCHES\n"
-            + "These patches were built for LineageOS 23.2's system files. Putting them on a different guest system can break its boot, so they turn on by themselves only for the 23.2 presets (EXT4 and EROFS), stay off for your own images, and are never applied silently. If the booted guest turns out not to be LineageOS 23.2, the app switches these off and the guest boots with its own files untouched.\n\n"
+            + "These patches were built for LineageOS 23.2's system files. Putting them on a different guest system can break its boot, so they are never applied silently — and they do NOT gate on which preset you picked. They gate on the DETECTED version: the app reads the guest's own build.prop (ro.lineage.version / ro.build.version.release) and only then decides. A 23.2 preset image that was renamed or repacked still counts as 23.2 if its build.prop says so, and a non-23.2 image picked from the 23.2 preset slot does NOT get the patches just because of where it came from — preset origin and detected version usually agree, but they are different mechanisms and can disagree, and detection wins. If the booted guest turns out not to be LineageOS 23.2, the app switches these off and the guest boots with its own files untouched.\n\n"
             + "SNAPSHOTS & BACKUPS\n"
             + "A snapshot saves the picked slot's system image and guest data together, so you can roll back to exactly that state. Refresh lists the picked slot's snapshots and backups. Create snapshot asks for a name, then saves that state. Backup system copies the picked slot's installed image to a single backup file next to it; if a backup already exists you are asked before it is overwritten. Restore backup puts that file back as the installed image.\n\n"
             + "GUEST OPTIONS\n"
@@ -2294,7 +2790,7 @@ public class MainActivity extends Activity {
             + "ONE UI HOME SCREEN SAFETY\n"
             + "Saves a copy of Samsung's home screen layout (icons and widgets) so a guest session or a reboot cannot lose it. Restore puts that copy back. Backup markers show when the last backup was taken.\n\n"
             + "LOG\n"
-            + "Every action the app takes is written to the Activity Log in plain words, and the same log is saved on the phone. Save logs writes this log plus the phone's system log to the app's files folder and shows you the exact file paths. Share log sends the log shown above to another app. Note: this shows the Samsung-side log, not a log from inside the guest. Experimental (its own button under the log) holds the fun buttons: kernel log from dmesg, live error log and live kernel log streams, boot diagnostics on demand, panic-record check, guest processes, and RescueParty status. In 5.9.15 it is a themed panel of its own with twelve tools, adding a takeover-log tail, a full chatty live system log, a RescueParty on/off toggle, and a device info dump that works without root. The log follows new lines only while you are already watching the tail — scroll up to read back and it stays put until you scroll back down.\n\n"
+            + "Every action the app takes is written to the Activity Log in plain words, and the same log is saved on the phone. Save logs writes this log plus the phone's system log to the app's files folder and shows you the exact file paths. Share log sends the log shown above to another app. Note: this shows the Samsung-side log, not a log from inside the guest. Experimental (its own button under the log) holds the fun buttons: kernel log from dmesg, live error log and live kernel log streams, boot diagnostics on demand, panic-record check, guest processes, and RescueParty status. In 5.9.16 it is a themed panel of its own with thirteen tools, adding a takeover-log tail, a full chatty live system log, a RescueParty on/off toggle, a device info dump that works without root, and a one-tap diagnostics bundle export (app log + takeover log + inner log + boot diagnostics + pstore excerpt + device info in a single file). The log follows new lines only while you are already watching the tail — scroll up to read back and it stays put until you scroll back down.\n\n"
             + "WIPE AFTER INSTALL\n"
             + "Ticking 'Wipe guest userdata after install' deletes the slot's guest data right after a good install, so the next boot starts fresh setup. The system image is kept. Installs already wipe before installing (except when resuming a download), so the box mainly guarantees a clean first boot in the resume case. 'Wipe slot data' does the same wipe on demand, per slot.\n\n"
             + "PROGRESS BARS\n"
@@ -2354,7 +2850,14 @@ public class MainActivity extends Activity {
     private void installGsi() {
         corruptDownloadRetried = false;
         long nowTap = System.currentTimeMillis();
-        if (nowTap - lastInstallTapMs < 500) return;
+        // 5.9.16: the debounce used to swallow taps SILENTLY — including
+        // the battery-guard Override retry when the user tapped Override
+        // within 500 ms of the Install tap (dialog gone, override saved,
+        // install never run, no log line). A swallowed tap now logs.
+        if (nowTap - lastInstallTapMs < 500) {
+            appendLog("Install tap ignored (double-tap guard) — tap Install again.");
+            return;
+        }
         lastInstallTapMs = nowTap;
         if (pickerCopying) {
             appendLog("Still copying the picked file — Install unlocks the moment the copy lands.");
@@ -2362,6 +2865,15 @@ public class MainActivity extends Activity {
         }
         if (!isRootGranted) {
             appendLog("ERROR: Root privilege required to install a GSI!");
+            return;
+        }
+        // 5.9.17: one install at a time, checked here for instant
+        // feedback and again at task start (see installLocalGsi /
+        // startNetworkDownload) for the queued-task race. Without
+        // this, taps during a running install queued duplicate
+        // wipe + install jobs and gave no visible feedback.
+        if (installBusy.get()) {
+            appendLog("Install already running — wait for it to finish (see the progress text). Tapping again will not queue another install.");
             return;
         }
         // 5.9.5-APP-START
@@ -2372,6 +2884,11 @@ public class MainActivity extends Activity {
         // behind any running executor task.
         if (!assetsReady) {
             appendLog("Engine still unpacking — tap Install again in a second.");
+            // 5.9.16: extractAssets() no-ops while an unpack is already
+            // running, so if this line repeats, the unpack task itself is
+            // still queued/running on the executor — say so instead of
+            // implying one more tap will fix it.
+            if (assetsExtracting) appendLog("Engine unpack task is still queued/running (a background task ahead of it may be holding the queue).");
             extractAssets();
             return;
         }
@@ -2384,6 +2901,20 @@ public class MainActivity extends Activity {
                 return;
             }
             if (!loc.startsWith("http://") && !loc.startsWith("https://")) {
+                // 5.9.17: the picked cache file used to be deleted
+                // after a good install while this field still pointed
+                // at it, so every later tap failed instantly with
+                // LOCAL_FILE_MISSING — invisible in the frozen log.
+                // Refuse loudly here instead of queueing a ghost
+                // task, and clear the stale path so the UI stops
+                // pointing at a deleted file.
+                if (!new File(loc).exists()) {
+                    appendLog("ERROR: That GSI file is gone — it was deleted or the cache was cleared (" + loc + "). Pick the file again, then tap Install.");
+                    if (etCustomLocation != null) etCustomLocation.setText("");
+                    customLocation = "";
+                    saveGsiPrefs();
+                    return;
+                }
                 installLocalGsi(loc);
                 return;
             }
@@ -2433,7 +2964,75 @@ public class MainActivity extends Activity {
             int rc = runRootCmdStreamed("sh " + STAGE_DIR + "/inspect_image.sh \"" + fTarget + "\" " + STAGE_DIR + "/7zz", out, true);
             if (rc != 0) appendLog("Inspect finished with code " + rc + " (see the lines above).");
             else appendLog("Inspect done.");
+            // 5.9.16: pre-install fit report for this candidate
+            // (see detectCandidateFit). Archives cannot be version
+            // -read before extraction — for those, the install
+            // script's own FIT_WARNING covers the same check during
+            // install, before install completes.
+            detectCandidateFit(fTarget);
         });
+    }
+
+    // 5.9.16: pre-install "will it fit + will it boot" report for
+    // an install candidate (extends detectFrameworkVersion to the
+    // candidate). Called from Inspect (a pre-install check, not
+    // the install path itself). The candidate image is loop-mounted
+    // read-only to a temp mount under the current slot dir, its
+    // build.prop SDK/release read with keyed greps, then unmounted
+    // in the same command — the mount is always released, even when
+    // the greps find nothing, because umount runs before the shell
+    // returns. A guest SDK older than the host vendor SDK (this
+    // phone's Build.VERSION.SDK_INT) logs the plain warning "this
+    // guest is older than your vendor; expect HAL trouble" BEFORE
+    // any install or boot is waited through. Archives and sparse
+    // images cannot be mounted directly, so they report
+    // FIT_CHECK_SKIPPED honestly: for archives the install script
+    // runs the same comparison after extraction (FIT_WARNING,
+    // before install completes), and sparse images are converted
+    // first by that same script. Free space is NOT re-checked here
+    // — install_image.sh already checks candidate + 10% headroom,
+    // and duplicating that check would only drift from it.
+    // Runs synchronously on the caller's executor task (Inspect's
+    // bar task); it never touches the install flow itself.
+    private void detectCandidateFit(String target) {
+        if (target == null || target.isEmpty()) return;
+        String lower = target.toLowerCase();
+        if (lower.endsWith(".7z") || lower.endsWith(".zip") || lower.endsWith(".xz")
+                || lower.endsWith(".gz") || lower.endsWith(".tgz") || lower.endsWith(".tar")
+                || lower.endsWith(".zst") || lower.endsWith(".zstd") || lower.endsWith(".lz4")
+                || lower.endsWith(".br")) {
+            appendLog("Fit check skipped: an archive's version cannot be read before extraction — the install script will print FIT_WARNING during install if this guest is older than your vendor.");
+            return;
+        }
+        List<String> out = new ArrayList<>();
+        runRootCmdCaptured("MNT=" + currentSlotDir() + "/.fitcheck_mnt; mkdir -p \"$MNT\" 2>/dev/null; "
+                + "if mount -o ro,loop \"" + target + "\" \"$MNT\" 2>/dev/null || mount -t ext4 -o ro,loop \"" + target + "\" \"$MNT\" 2>/dev/null || mount -t erofs -o ro,loop \"" + target + "\" \"$MNT\" 2>/dev/null; then "
+                + "SDK=$(grep -m1 '^ro.build.version.sdk=' \"$MNT/system/build.prop\" 2>/dev/null | cut -d= -f2-); echo \"FIT_SDK:$SDK\"; "
+                + "REL=$(grep -m1 '^ro.build.version.release=' \"$MNT/system/build.prop\" 2>/dev/null | cut -d= -f2-); echo \"FIT_REL:$REL\"; "
+                + "umount \"$MNT\" 2>/dev/null; else echo \"FIT_NOMOUNT\"; fi; rmdir \"$MNT\" 2>/dev/null; true", out);
+        String sdk = null, rel = null;
+        boolean noMount = false;
+        for (String line : out) {
+            String t = line.trim();
+            if (t.startsWith("FIT_SDK:")) sdk = t.substring(8);
+            else if (t.startsWith("FIT_REL:")) rel = t.substring(8);
+            else if ("FIT_NOMOUNT".equals(t)) noMount = true;
+        }
+        if (noMount || sdk == null || sdk.isEmpty()) {
+            appendLog("Fit check skipped: candidate image could not be loop-mounted read-only for a build.prop read (sparse images are converted during install, where the install script runs this same check — see FIT_WARNING there).");
+            return;
+        }
+        try {
+            int guestSdk = Integer.parseInt(sdk.trim());
+            int hostSdk = android.os.Build.VERSION.SDK_INT;
+            if (guestSdk < hostSdk) {
+                appendLog("⚠ Fit warning: this guest is older than your vendor (guest Android " + (rel != null ? rel : "?") + " SDK " + guestSdk + " vs host SDK " + hostSdk + ") — expect HAL trouble. Install it anyway only if you accept broken radio/camera/audio risk.");
+            } else {
+                appendLog("Fit OK: guest SDK " + guestSdk + " vs host SDK " + hostSdk + " (guest is not older than your vendor).");
+            }
+        } catch (Exception ignored) {
+            appendLog("Fit check skipped: guest SDK value '" + sdk + "' is not a number.");
+        }
     }
 
     // Opens the system file picker so the user can SELECT a GSI file
@@ -2455,13 +3054,28 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        // 5.9.16: a picker return that is NOT RESULT_OK with data used to
+        // fall through with no log at all — the user had picked nothing
+        // (or the provider returned nothing) and Install still pointed
+        // at the previous source, which reads as "Install does nothing".
+        if (requestCode == REQ_PICK_GSI && !(resultCode == RESULT_OK && data != null && data.getData() != null)) {
+            appendLog("File picker closed without a file — nothing changed. Pick a file, then tap Install.");
+            return;
+        }
         if (requestCode == REQ_PICK_GSI && resultCode == RESULT_OK && data != null && data.getData() != null) {
             final Uri uri = data.getData();
             // 5.9.7: Install is disabled until the copy post completes, so
             // a tap during the copy can never run against the stale source.
             pickerCopying = true;
-            mainHandler.post(() -> { if (btnInstallGsi != null) btnInstallGsi.setEnabled(false); });
-            executor.execute(() -> {
+            refreshInstallEnabled();
+            // 5.9.16: a multi-GB copy used to run with zero feedback —
+            // no log, no bar — while Install sat disabled-but-identical.
+            // Log the copy start so the wait is visible, not dead.
+            appendLog("Copying picked file… (Install unlocks when the copy lands.)");
+            // 5.9.16: runs on pickerExecutor, not the root-op executor
+            // (see its declaration) — a queued download/install can no
+            // longer starve this copy and strand Install disabled.
+            pickerExecutor.execute(() -> {
                 try {
                     String name = queryDisplayName(uri);
                     if (name == null || name.isEmpty()) name = "picked_gsi";
@@ -2475,7 +3089,19 @@ public class MainActivity extends Activity {
                         if (in == null) throw new Exception("Could not open picked file.");
                         byte[] buf = new byte[65536];
                         int n;
-                        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                        // 5.9.16: progress for slow providers (cloud
+                        // pickers stream over the network): a line every
+                        // 512 MB so a long copy never looks like a hang.
+                        long copied = 0, nextMark = 512L * 1048576L;
+                        while ((n = in.read(buf)) != -1) {
+                            out.write(buf, 0, n);
+                            copied += n;
+                            if (copied >= nextMark) {
+                                final long mb = copied / 1048576L;
+                                appendLog("Copying picked file… " + mb + " MB so far.");
+                                nextMark += 512L * 1048576L;
+                            }
+                        }
                     }
                     final String path = dest.getAbsolutePath();
                     mainHandler.post(() -> {
@@ -2519,8 +3145,25 @@ public class MainActivity extends Activity {
     // ext4/EROFS detection, free-space check, atomic rename. moveInput=true
     // (downloads) may consume the input when it IS the image; false (user
     // local files) never deletes the user's file.
+    // 5.9.16: single-quote a path for a `su -c` command line (embedded
+    // quotes escaped the POSIX way). The local path used to be spliced
+    // in UNQUOTED, so a picked/typed filename with shell metacharacters
+    // — e.g. a re-download named `gsi (1).img` (the picker strips spaces
+    // but not parens) — made the whole root command fail to parse and
+    // the install died before install_image.sh ever ran. Quoting here
+    // covers every installImageCmd caller; install_image.sh itself
+    // already quotes its $1..$4 internally.
+    private String shQuote(String p) {
+        if (p == null) return "''";
+        return "'" + p.replace("'", "'\\''") + "'";
+    }
+
     private String installImageCmd(String inputPath, boolean moveInput) {
-        return currentSlotDir() + "/install_image.sh " + inputPath + " " + (moveInput ? "1" : "0") + " " + currentSlotDir() + " " + currentSystemRaw();
+        return installImageCmd(inputPath, moveInput, currentSlotDir(), currentSystemRaw());
+    }
+
+    private String installImageCmd(String inputPath, boolean moveInput, String slotDir, String systemRaw) {
+        return shQuote(slotDir + "/install_image.sh") + " " + shQuote(inputPath) + " " + (moveInput ? "1" : "0") + " " + shQuote(slotDir) + " " + shQuote(systemRaw);
     }
 
     // Read-only check of the installed system.raw: reports its size and
@@ -2680,8 +3323,18 @@ public class MainActivity extends Activity {
                 List<String> labels = new ArrayList<>();
                 for (String n : slotNames) {
                     String base = n.equals(DEFAULT_SLOT) ? "Default (original install)" : n;
-                    if (isRootGranted) labels.add(installed.contains(n) ? base + " ✓ installed" : base + " (empty)");
-                    else labels.add(base);
+                    // 5.9.16: per-slot last-boot outcome in the picker
+                    // label itself (short form), so a slot that last
+                    // watchdog-timed-out or panicked is visible before
+                    // it is picked, not only on its detail card.
+                    String outcomeSuffix = "";
+                    try {
+                        String stored = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_LAST_BOOT_OUTCOME_PREFIX + n, null);
+                        String shortOutcome = lastBootOutcomeShort(stored);
+                        if (shortOutcome != null) outcomeSuffix = " • last: " + shortOutcome;
+                    } catch (Exception ignored) {}
+                    if (isRootGranted) labels.add((installed.contains(n) ? base + " ✓ installed" : base + " (empty)") + outcomeSuffix);
+                    else labels.add(base + outcomeSuffix);
                 }
                 ArrayAdapter<String> ad = new ArrayAdapter<>(MainActivity.this,
                         R.layout.spinner_item, labels);
@@ -2800,7 +3453,12 @@ public class MainActivity extends Activity {
                             android.content.SharedPreferences.Editor e = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                                 .remove(PREF_NOTE_PREFIX + slot).remove(PREF_BOOTS_PREFIX + slot).remove(PREF_SHA_PREFIX + slot)
                                 .remove(PREF_DENSITY_PREFIX + slot).remove(PREF_SHARE_PREFIX + slot)
-                                .remove(PREF_GUEST_ROOT_PREFIX + slot).remove(PREF_COLOR_PREFIX + slot);
+                                .remove(PREF_GUEST_ROOT_PREFIX + slot).remove(PREF_COLOR_PREFIX + slot)
+                                // 5.9.16: the deleted slot's last-boot
+                                // outcome goes with it (a duplicated
+                                // slot likewise never inherits one —
+                                // it has never booted).
+                                .remove(PREF_LAST_BOOT_OUTCOME_PREFIX + slot);
                             String last = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_LAST_BOOT, null);
                             if (slot.equals(last)) e.remove(PREF_LAST_BOOT);
                             e.apply();
@@ -2940,7 +3598,20 @@ public class MainActivity extends Activity {
             while ((l2 = r2.readLine()) != null) { if (l2.contains("GUARD_RUNNING")) run2 = true; }
             q.waitFor();
             return run2;
-        } catch (Exception e) { return false; }
+        } catch (Exception e) {
+            // 5.9.16: FAIL-CLOSED. The old code returned false here,
+            // so a guard check that itself threw (su died, script
+            // unreadable, process spawn failed) let the guarded
+            // operation PROCEED against an unknown guest state — a
+            // fail-open guard hole. Now a throwing guard REFUSES
+            // loudly: the app log + status say so, and every caller
+            // treats "true" as "guest running" and refuses its
+            // operation. A false refusal costs one retry; a false
+            // pass can wipe a running guest's data.
+            appendLog("Guard check FAILED for '" + dir + "' (" + e.getMessage() + ") — refusing the operation rather than proceeding blind. Re-apply temp root and retry.");
+            setLogStatus("Error");
+            return true;
+        }
     }
     // 5.9.5-INT-END
 
@@ -3024,15 +3695,29 @@ public class MainActivity extends Activity {
             String ver = "";
             try { ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) {}
             String files = getFilesDir().getAbsolutePath();
+            // 5.9.16: SHA-256 sync, not size-only. The old skip
+            // (same version + same size) kept a same-length stale
+            // binary. Now a big binary is skipped only when its
+            // live SHA-256 equals the source's; with no hasher on
+            // the phone the hash is empty and the file is copied
+            // (safe fallback: copy, never skip blind). Scripts are
+            // still always copied (good behaviour, kept). After the
+            // loop a versioned hash file .engine_hashes ("# version
+            // <ver>" + "<sha> <base>" lines) is written so
+            // install_image.sh can hash-check 7zz/simg2img before
+            // it trusts them.
             String cmd = "VER=" + ver + "; SLOTVER=$(cat " + STAGE_DIR + "/.sync_version 2>/dev/null); "
+                    + "hashf() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; elif command -v busybox >/dev/null 2>&1; then busybox sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; fi; }; "
                     + "mkdir -p " + STAGE_DIR + "; "
                     + "for f in " + files + "/*; do base=$(basename \"$f\"); "
                     + "case \"$base\" in *.jar|*.apk|7zz|simg2img|zygote_exec) "
-                    + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(stat -c %s \"$f\" 2>/dev/null || echo -1); d=$(stat -c %s \"" + STAGE_DIR + "/$base\" 2>/dev/null || echo -2); [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
+                    + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(hashf \"$f\"); d=$(hashf \"" + STAGE_DIR + "/$base\"); [ -n \"$s\" ] && [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
                     + "cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; done; "
                     + "echo \"$VER\" > " + STAGE_DIR + "/.sync_version 2>/dev/null; "
                     + "cp -f " + files + "/7zz /data/local/tmp/7zz 2>/dev/null; "
-                    + "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz " + STAGE_DIR + "/simg2img /data/local/tmp/7zz 2>/dev/null; true";
+                    + "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz " + STAGE_DIR + "/simg2img /data/local/tmp/7zz 2>/dev/null; "
+                    + "echo \"# version $VER\" > " + STAGE_DIR + "/.engine_hashes 2>/dev/null; "
+                    + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec; do [ -f \"" + STAGE_DIR + "/$b\" ] && h=$(hashf \"" + STAGE_DIR + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + STAGE_DIR + "/.engine_hashes 2>/dev/null; done; true";
             Runtime.getRuntime().exec(new String[]{suBinary, "-c", cmd}).waitFor();
         } catch (Exception ignored) {}
     }
@@ -3229,26 +3914,52 @@ public class MainActivity extends Activity {
     }
 
     private void installLocalGsi(final String localPath) {
+        // 5.9.16: capture the slot NOW (main thread, tap time). The task
+        // below used to read selectedSlot/currentSlotDir/currentSystemRaw
+        // when it RAN, so a slot switch while the install was queued
+        // behind another executor task silently installed into the NEW
+        // slot instead of the tapped one.
+        final String tapSlot = selectedSlot;
+        final String tapSlotDir = currentSlotDir();
+        final String tapSystemRaw = currentSystemRaw();
         executor.execute(() -> {
+            // 5.9.17: task-start half of the one-install guard (the
+            // UI half is in installGsi). A tap queued while another
+            // install runs refuses here instead of wiping +
+            // reinstalling behind the running job.
+            if (!installBusy.compareAndSet(false, true)) {
+                appendLog("Install already running — this tap was not queued.");
+                return;
+            }
+            // 5.9.17: invalidate any zombie progress poller from an
+            // earlier run before this run starts posting.
+            installProgressGen.incrementAndGet();
             setLogStatus("Preparing…");
-            appendLog("\n[SETUP] Initializing slot '" + selectedSlot + "' at: " + currentSlotDir());
+            appendLog("\n[SETUP] Initializing slot '" + tapSlot + "' at: " + tapSlotDir);
             try {
-                runRootCmdDrained("mkdir -p " + currentSlotDir() + " && chmod 777 " + currentSlotDir());
-                if (!isDefaultSlot()) {
-                    runRootCmdDrained(installSlotScriptsCmd(currentSlotDir()));
+                runRootCmdDrained("mkdir -p " + tapSlotDir + " && chmod 777 " + tapSlotDir);
+                if (!tapSlotDir.equals(STAGE_DIR)) {
+                    runRootCmdDrained(installSlotScriptsCmd(tapSlotDir));
                 }
                 appendLog("[SETUP] Wiping existing guest data for a fresh first setup...");
-                runRootCmdDrained(wipeUserDataCmd(currentSlotDir()));
+                runRootCmdDrained(wipeUserDataCmd(tapSlotDir));
 
                 appendLog("[LOCAL INSTALL] Using local file: " + localPath);
                 logSparsePrecheck(localPath);
                 setLogStatus("Installing…");
                 setOperationProgress(-1, "Installing image…", true);
+                // 5.9.17: reset the progress file in Java, not just in
+                // the script — a pre-script failure (e.g. a missing
+                // local file) never runs the script, so the next
+                // poller would otherwise replay the previous run's
+                // lines, including its "done", over this run's UI.
+                runRootCmdDrained("rm -f " + tapSlotDir + "/install_progress.log");
+                streamInstallProgress(tapSlotDir);
                 List<String> installOut = new ArrayList<>();
                 int ret = runRootCmdStreamed(
-                        "if [ ! -f " + localPath + " ]; then echo 'LOCAL_FILE_MISSING'; exit 1; fi; "
-                        + installImageCmd(localPath, false), installOut, true);
-                if (ret != 0 || !new File(currentSystemRaw()).exists()) {
+                        "if [ ! -f " + shQuote(localPath) + " ]; then echo 'LOCAL_FILE_MISSING'; exit 1; fi; "
+                        + installImageCmd(localPath, false, tapSlotDir, tapSystemRaw), installOut, true);
+                if (ret != 0 || !new File(tapSystemRaw).exists()) {
                     // 5.9.6: surface the script's real reason (e.g. its
                     // INSTALL_ERROR line) instead of a bare exit code. The
                     // old message also wrongly claimed sparse images are
@@ -3264,22 +3975,30 @@ public class MainActivity extends Activity {
                             + ". Nothing was booted; fix the cause above and tap Install again.");
                 }
                 setOperationProgress(100, "Installed — ready to boot.", true);
-                appendLog("✓ Local GSI installed into slot '" + selectedSlot + "' -> system.raw ready! CRONCH 🐔🌮");
-                // Picker cache copies are transient: system.raw is a separate copy,
-                // so delete the picked cache file after a good install.
-                try {
-                    File cacheDir = getCacheDir();
-                    if (cacheDir != null && localPath.startsWith(cacheDir.getAbsolutePath())) new File(localPath).delete();
-                } catch (Exception ignored) {}
+                appendLog("✓ Local GSI installed into slot '" + tapSlot + "' -> system.raw ready! CRONCH 🐔🌮");
+                // 5.9.17: the picked cache file is KEPT after a good
+                // install. Deleting it used to break every later tap:
+                // the UI still pointed at the deleted path, so the
+                // next install failed instantly with
+                // LOCAL_FILE_MISSING while the frozen log hid the
+                // reason. system.raw is already a separate copy, so
+                // keeping the picked file costs one cache file and
+                // keeps "Reinstall GSI" working.
                 // 5.9.11: wipe-after-install toggle (user-requested).
                 wipeAfterInstallIfEnabled();
                 setLogStatus("Ready");
-                setLastInstall("Last install: slot '" + selectedSlot + "' — local file installed, ready to boot.");
+                setLastInstall("Last install: slot '" + tapSlot + "' — local file installed, ready to boot.");
                 mainHandler.post(() -> {
                     pbDownload.setVisibility(View.GONE);
                     tvDownloadProgress.setText("Custom GSI installed successfully!");
                 });
+                // 5.9.17: bump the progress generation so a late
+                // poller post can never overwrite the final UI with
+                // a stale "Installing: ..." line, then release the
+                // one-install guard.
+                installProgressGen.incrementAndGet();
                 checkImageStatus();
+                installBusy.set(false);
             } catch (Exception e) {
                 setOperationProgress(0, null, false);
                 appendLog("Local install failed: " + e.getMessage());
@@ -3291,7 +4010,9 @@ public class MainActivity extends Activity {
                 // 5.9.6: a failed install must leave Boot honestly gated —
                 // refresh the image state so Boot cannot run on a stale
                 // assumption (see also the bootGsi system.raw guard).
+                installProgressGen.incrementAndGet();
                 checkImageStatus();
+                installBusy.set(false);
             }
         });
     }
@@ -3309,7 +4030,36 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) { resumeOffset = 0; }
         if (resumeOffset > 0) appendLog("Resuming download at " + (resumeOffset / 1048576) + " MB (HTTP Range).");
-        return downloadFileWithRedirectsFrom(initialUrl, targetFile, expectedBytes, resumeOffset);
+        try {
+            return downloadFileWithRedirectsFrom(initialUrl, targetFile, expectedBytes, resumeOffset);
+        } catch (Exception primary) {
+            // 5.9.16: SourceForge mirror fallback. Preset URLs use
+            // downloads.sourceforge.net with use_mirror=autoselect;
+            // a flaky mirror used to look exactly like a corrupt
+            // download. On a mirror failure, retry ONCE against the
+            // direct download URL (same path, no autoselect query —
+            // SourceForge then serves it directly instead of via
+            // the failed mirror pick), from the beginning: a resume
+            // across mirrors is exactly how the study's
+            // resumed-across-redirect corruption happened, so the
+            // partial file and the resume state are dropped first.
+            // A pause (method returns false) is NOT an exception
+            // and never triggers this fallback. Custom URLs and
+            // non-SourceForge failures rethrow untouched.
+            boolean isSfMirror = initialUrl != null && initialUrl.contains("sourceforge.net")
+                    && initialUrl.contains("use_mirror=autoselect");
+            if (!isSfMirror) throw primary;
+            String fallbackUrl = initialUrl;
+            int q = fallbackUrl.indexOf('?');
+            if (q >= 0) fallbackUrl = fallbackUrl.substring(0, q);
+            appendLog("SourceForge mirror failed (" + primary.getMessage() + ") — falling back to the direct download URL: " + fallbackUrl);
+            try { new File(getCacheDir(), "gsi_dl.state").delete(); } catch (Exception ignored) {}
+            try {
+                return downloadFileWithRedirectsFrom(fallbackUrl, targetFile, expectedBytes, 0);
+            } catch (Exception fallbackEx) {
+                throw new Exception("Preset download failed on both the SourceForge mirror and the direct URL (mirror: " + primary.getMessage() + "; direct: " + fallbackEx.getMessage() + ")");
+            }
+        }
     }
 
     private boolean downloadFileWithRedirectsFrom(String initialUrl, File targetFile, long expectedBytes, long resumeOffset) throws Exception {
@@ -3367,6 +4117,11 @@ public class MainActivity extends Activity {
         if (redirectCount >= MAX_REDIRECTS || conn == null) {
             throw new Exception("Too many redirects: " + redirectCount);
         }
+        // 5.9.16: record which mirror actually served the file
+        // (currentUrl is the final redirect target, i.e. the mirror
+        // URL for SourceForge presets) so a bad mirror is visible
+        // in the log instead of looking like a corrupt download.
+        appendLog("Download served from: " + currentUrl);
 
         long contentLength = -1;
         try {
@@ -3438,6 +4193,17 @@ public class MainActivity extends Activity {
     // 5.9.5-APP-START
     private void startNetworkDownload(final String downloadUrl, final long expectedBytes, final String label, final boolean isResume) {
         executor.execute(() -> {
+            // 5.9.17: same one-install-at-a-time guard as the local
+            // path, plus ownership transfer for the corrupt-download
+            // retry below: the retry task inherits the flag instead
+            // of fighting the CAS.
+            if (installHandoff) {
+                installHandoff = false;
+            } else if (!installBusy.compareAndSet(false, true)) {
+                appendLog("Install already running — this tap was not queued.");
+                return;
+            }
+            installProgressGen.incrementAndGet();
             setLogStatus("Preparing…");
             downloading = true;
             updateDownloadButtons();
@@ -3448,7 +4214,7 @@ public class MainActivity extends Activity {
                 tvDownloadProgress.setVisibility(View.VISIBLE);
                 tvDownloadProgress.setText("Connecting to download source…");
                 setOperationProgress(0, "Connecting…", true);
-                btnInstallGsi.setEnabled(false);
+                refreshInstallEnabled();
             });
 
             appendLog("\n[SETUP] Initializing slot '" + selectedSlot + "' at: " + currentSlotDir());
@@ -3519,6 +4285,7 @@ public class MainActivity extends Activity {
                     appendLog("Download PAUSED at " + (targetArchive.length() / 1048576) + " MB — tap Resume download to continue (partial file kept).");
                     setLogStatus("Paused");
                     downloading = false;
+                    installBusy.set(false);
                     updateDownloadButtons();
                     mainHandler.post(() -> {
                         pbDownload.setVisibility(View.VISIBLE);
@@ -3540,9 +4307,14 @@ public class MainActivity extends Activity {
                 });
 
                 appendLog("Installing " + targetArchive.getAbsolutePath() + " via native 7zz...");
+                // 5.9.17: same Java-side progress-file reset as the
+                // local path, so a poller can never replay a previous
+                // run's lines over this run's UI.
+                runRootCmdDrained("rm -f " + currentSlotDir() + "/install_progress.log");
+                streamInstallProgress(currentSlotDir());
                 List<String> installOut = new ArrayList<>();
                 int extRet = runRootCmdStreamed(installImageCmd(targetArchive.getAbsolutePath(), true)
-                        + "; rm -f " + targetArchive.getAbsolutePath(), installOut, true);
+                        + "; rm -f " + shQuote(targetArchive.getAbsolutePath()), installOut, true);
                 if (extRet != 0 || !new File(currentSystemRaw()).exists()) {
                     // 5.9.6: report the script's real reason, not a bare
                     // exit code (and never the stale "sparse images are not
@@ -3567,6 +4339,10 @@ public class MainActivity extends Activity {
                         try { targetArchive.delete(); } catch (Exception ignored) {}
                         try { new File(getCacheDir(), "gsi_dl.state").delete(); } catch (Exception ignored) {}
                         appendLog("Corrupt download detected — deleting it and fetching a fresh copy automatically (no resume)…");
+                        // 5.9.17: hand the busy flag to the retry task
+                        // instead of clearing it — a tap landing in
+                        // between must still see "already running".
+                        installHandoff = true;
                         startNetworkDownload(downloadUrl, expectedBytes, label, false);
                         return;
                     }
@@ -3594,7 +4370,11 @@ public class MainActivity extends Activity {
                     refreshInstallEnabled();
                 });
                 setLogStatus("Ready");
+                // 5.9.17: same progress-generation bump + guard
+                // release as the local path (see there).
+                installProgressGen.incrementAndGet();
                 checkImageStatus();
+                installBusy.set(false);
 
             } catch (Exception e) {
                 appendLog("Download / setup failed: " + e.getMessage());
@@ -3609,7 +4389,9 @@ public class MainActivity extends Activity {
                 });
                 // 5.9.6: refresh the image state so Boot stays honestly
                 // gated after a failed install (see bootGsi's guard).
+                installProgressGen.incrementAndGet();
                 checkImageStatus();
+                installBusy.set(false);
             }
         });
     }
@@ -3770,20 +4552,23 @@ public class MainActivity extends Activity {
                 writeGsiFlagsFileSync();
                 File filesDir = getFilesDir();
                 String slotDir = currentSlotDir();
-                // 5.9.11: size-checked boot sync (same scheme as
-                // syncEngineToStageSync): big binaries are skipped when
-                // already identical in the slot dir (same app version +
-                // same size); scripts and flags are always copied so
-                // toggles propagate. This removes the re-copy of tens
-                // of MB of jars on EVERY boot tap — the largest single
-                // waste on the boot path.
+                // 5.9.16: SHA-256 boot sync (same scheme as
+                // syncEngineToStageSync, 5.9.16): big binaries are
+                // skipped only when their live SHA-256 matches, not
+                // on version + size; scripts and flags are always
+                // copied so toggles propagate, and patched files are
+                // still removed when their toggles are off (good
+                // behaviours, kept). The versioned .engine_hashes
+                // file is written AFTER the toggle removals below,
+                // so it never lists a file the sync just removed.
                 String bootVer = "";
                 try { bootVer = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) {}
                 String syncCmd = "VER=" + bootVer + "; SLOTVER=$(cat " + slotDir + "/.sync_version 2>/dev/null); "
+                        + "hashf() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; elif command -v busybox >/dev/null 2>&1; then busybox sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; fi; }; "
                         + "mkdir -p " + slotDir + "; for f in " + filesDir.getAbsolutePath() + "/*; do "
                         + "base=$(basename \"$f\"); "
                         + "case \"$base\" in *.jar|*.apk|7zz|simg2img|zygote_exec) "
-                        + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(stat -c %s \"$f\" 2>/dev/null || echo -1); d=$(stat -c %s \"" + slotDir + "/$base\" 2>/dev/null || echo -2); [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
+                        + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(hashf \"$f\"); d=$(hashf \"" + slotDir + "/$base\"); [ -n \"$s\" ] && [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
                         + "cp -f \"$f\" \"" + slotDir + "/$base\"; done; "
                         + "echo \"$VER\" > " + slotDir + "/.sync_version 2>/dev/null; "
                         + "chmod 755 " + slotDir + "/*.sh " + slotDir + "/zygote_exec " + slotDir + "/7zz " + slotDir + "/simg2img";
@@ -3797,6 +4582,8 @@ public class MainActivity extends Activity {
                 if (!patchPermissionController) {
                     syncCmd += " ; rm -f " + slotDir + "/PermissionController_patched.apk";
                 }
+                syncCmd += " ; echo \"# version $VER\" > " + slotDir + "/.engine_hashes 2>/dev/null; "
+                        + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec; do [ -f \"" + slotDir + "/$b\" ] && h=$(hashf \"" + slotDir + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + slotDir + "/.engine_hashes 2>/dev/null; done; true";
                 Runtime.getRuntime().exec(new String[]{suBinary, "-c", syncCmd}).waitFor();
                 // 5.9.5-INT-START: persist detected framework version for scripts.
                 if (detectedFrameworkVersion != null && !detectedFrameworkVersion.isEmpty() && !detectedFrameworkVersion.equals("unknown")) {
@@ -3858,10 +4645,14 @@ public class MainActivity extends Activity {
     // tail -n +K so each poll reads only NEW lines (the log is
     // append-only during one boot). Stops at TAKEOVER LAUNCHED or
     // after 180s; the takeover itself is unaffected by this stopping.
-    // Runs on the executor (single thread): it is submitted from
-    // bootGsi's task and runs after that task returns, so no deadlock.
+    // 5.9.16: runs on pollExecutor, NOT the root-mutation executor:
+    // a hung stream must never wedge install/boot/wipe. Log-file
+    // reads tolerate concurrent appends (tail -n +K re-reads the
+    // file each poll; a truncated/rotated log just restarts the
+    // count at the new tail, it never crashes the poller), and all
+    // UI updates go through mainHandler-posted helpers.
     private void streamBootProgress(final String slotDir, final String bootSlot) {
-        executor.execute(() -> {
+        pollExecutor.execute(() -> {
             try {
                 String logPath = slotDir + "/takeover_app.log";
                 int total = 0;
@@ -3996,6 +4787,24 @@ public class MainActivity extends Activity {
                 List<String> verdict = new ArrayList<>();
                 runRootCmdCaptured("sh \"" + pstoreScript + "\" 2>/dev/null", verdict);
                 for (String v : verdict) appendLog(v);
+                // 5.9.16: record the per-slot outcome of that ended
+                // session. Precedence: a pstore panic verdict beats
+                // everything (it is how the session ended); else a
+                // "Home activated!" line in the Activator log means
+                // the guest DID reach home before the reboot, so the
+                // outcome is home, not a failed boot; otherwise the
+                // session ended by reboot / force-restart with no
+                // home signal. The Activator log is truncated fresh
+                // at every takeover, so a match belongs to the last
+                // session, not an older one.
+                boolean panic = false;
+                for (String v : verdict) if (v.contains("PSTORE_PANIC")) { panic = true; break; }
+                List<String> homeCheck = new ArrayList<>();
+                runRootCmdCaptured("grep -q 'Home activated!' /data/local/tmp/ui_activator.log 2>/dev/null && echo HOME || echo NOHOME", homeCheck);
+                boolean reachedHome = false;
+                for (String h : homeCheck) if ("HOME".equals(h.trim())) { reachedHome = true; break; }
+                String outcome = panic ? "panic" : (reachedHome ? "home" : "reboot");
+                for (String d : stale) noteLastBootOutcome(slotDisplayName(d), outcome);
             } catch (Exception ignored) {}
         });
     }
@@ -4011,6 +4820,13 @@ public class MainActivity extends Activity {
                 runRootCmdCaptured("ls " + STAGE_DIR + "/boot_watchdog_timeout " + STAGE_DIR + "/slots/*/boot_watchdog_timeout 2>/dev/null", hits);
                 if (hits.isEmpty()) return;
                 appendLog("Last guest boot did not reach the home screen within 10 minutes — the watchdog returned the phone to One UI automatically. Check the takeover log for where it stalled; the guest itself was kept, so you can try booting again.");
+                // 5.9.16: record the watchdog-timeout outcome per
+                // slot (marker path -> slot) before the markers are
+                // deleted below, so the slot picker/card show it.
+                for (String hit : hits) {
+                    String h = hit.trim();
+                    if (!h.isEmpty()) noteLastBootOutcome(slotDisplayName(dirOf(h)), "timeout");
+                }
                 // 5.9.13: surface the watchdog-timeout diagnostics the
                 // watchdog captured before returning (bounded: first
                 // 200 lines per slot — the bundle's section headers
@@ -4085,6 +4901,9 @@ public class MainActivity extends Activity {
                 appendLog("One UI restore triggered successfully.");
                 // 5.9.11: stream the return log until RETURN_OK (or a
                 // 120s cap) instead of leaving the user guessing.
+                // 5.9.16: returningSlot (see its declaration) lets
+                // the poller record this slot's outcome on RETURN_OK.
+                returningSlot = selectedSlot;
                 streamReturnProgress(STAGE_DIR + "/restore_app.log", pbReturn, tvReturnProgress, false);
             } catch (Exception e) {
                 appendLog("Restore error: " + e.getMessage());
@@ -4237,6 +5056,10 @@ public class MainActivity extends Activity {
             cbLogAutoscroll.setChecked(logAutoScroll);
             cbLogAutoscroll.setOnCheckedChangeListener((v, c) -> {
                 logAutoScroll = c;
+                // 5.9.17: re-enabling auto-scroll unpins the log, so
+                // following resumes immediately instead of staying
+                // parked above the tail from an earlier read-back.
+                if (c) logUserPinned = false;
                 try { getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_LOG_AUTOSCROLL, c).apply(); } catch (Exception ignored) {}
             });
         }
@@ -4426,6 +5249,13 @@ public class MainActivity extends Activity {
                 return true;
             }
             if (batteryOverrideSession) { appendLog("Battery guard overridden for this session for " + op + " at " + batteryPct + "%."); return true; }
+            // 5.9.16: the Install tap that produced this dialog already
+            // stamped lastInstallTapMs, so the Override retry (retry.run()
+            // below) would be swallowed by installGsi's 500 ms debounce
+            // whenever the user tapped Override quickly — dialog gone,
+            // override saved, install never run. Clear the stamp so the
+            // retry is a real tap, not a debounced-away one.
+            if ("install".equals(op)) lastInstallTapMs = 0;
             new AlertDialog.Builder(this)
                 .setTitle("Battery too low for " + op)
                 .setMessage("Battery is " + batteryPct + "% and not charging. Install / backup / slot-switch / snapshot is blocked at 10% or below to avoid corrupting the image if the phone dies. Plug in, or tap Override for this session to proceed for the rest of this session.")
@@ -4522,6 +5352,12 @@ public class MainActivity extends Activity {
                         appendLog("One UI restore + reboot triggered (return_to_oneui.sh --reboot).");
                         // 5.9.11: stream the return steps until the
                         // reboot kills the app (expected end).
+                        // 5.9.16: returningSlot set as in Return; in
+                        // practice the reboot usually kills the poll
+                        // before RETURN_OK is observed, so this
+                        // variant's outcome is often simply the
+                        // previous recorded one — stated, not hidden.
+                        returningSlot = selectedSlot;
                         streamReturnProgress(STAGE_DIR + "/restore_app.log", pbReboot, tvRebootProgress, true);
                     } catch (Exception e) {
                         appendLog("Reboot restore error: " + e.getMessage());
@@ -4664,9 +5500,18 @@ public class MainActivity extends Activity {
             // 5.9.11: own colorful bar (snapshot ops share one bar).
             runBarTask(pbSnapshot, tvSnapshotProgress, "Verifying backup…", () -> {
                 List<String> out = runScriptLines("verify_backup.sh", dirArg);
-                String first = out.isEmpty() ? "" : out.get(0);
-                if (first.startsWith("VERIFY_OK")) appendLog("Backup verify OK: " + dirArg);
-                else if (first.startsWith("VERIFY_FAIL")) appendLog("Backup verify FAILED: " + first);
+                // 5.9.16: VERIFY_STRUCTURAL is a distinct verdict,
+                // never OK — the script prints it when sha/size/
+                // manifest + magic pass but no mount check ever ran.
+                // Scan all lines, not just the first: the script's
+                // verdict is its last verdict line.
+                String verdict = "";
+                for (String l : out) {
+                    if (l.startsWith("VERIFY_OK") || l.startsWith("VERIFY_FAIL") || l.startsWith("VERIFY_STRUCTURAL")) verdict = l;
+                }
+                if (verdict.startsWith("VERIFY_OK")) appendLog("Backup verify OK (mount-checked): " + dirArg);
+                else if (verdict.startsWith("VERIFY_STRUCTURAL")) appendLog("Backup verify STRUCTURAL ONLY (not a full OK): " + verdict + " — for " + dirArg + ". The backup's hashes and filesystem magic check out, but it was never loop-mounted and verified, so do not treat this as a proven-good restore source.");
+                else if (verdict.startsWith("VERIFY_FAIL")) appendLog("Backup verify FAILED: " + verdict);
                 else appendLog("Backup verify result unknown (verify_backup.sh output: " + android.text.TextUtils.join(" | ", out) + ").");
             });
         });
@@ -4722,6 +5567,7 @@ public class MainActivity extends Activity {
     }
 
     private String lastGatedFramework = null;
+    private String lastFitWarnedFor = null;
     private void detectFrameworkVersion() {
         if (!isRootGranted) {
             mainHandler.post(() -> { if (tvFrameworkVersion != null) tvFrameworkVersion.setText("Framework: unknown (root required to read guest build.prop)"); });
@@ -4731,19 +5577,34 @@ public class MainActivity extends Activity {
         executor.execute(() -> {
             String sdk = null, rel = null, lineage = null;
             try {
+                // 5.9.16: KEYED grep, not positional. The old code
+                // ran three greps and assigned their outputs by line
+                // index (sdk/rel/lineage) — but a grep that matches
+                // nothing prints nothing, so one missing key shifted
+                // every later field into the wrong slot (a guest with
+                // no ro.lineage.version read its release as its
+                // lineage version). Now the shell emits a TAGGED
+                // line for every key even when the value is empty
+                // (SDK:/REL:/LIN:), and Java assigns by tag, so a
+                // missing key can never shift another field. Total
+                // failure (no build.prop at all) still yields three
+                // empty tags, which fall through to "unknown" below
+                // exactly as before. Equivalents: release falls back
+                // to release_or_codename, lineage to
+                // ro.lineage.build.version, only when the primary
+                // key is empty.
                 Process p = Runtime.getRuntime().exec(new String[]{suBinary, "-c",
-                    "grep -m1 '^ro.build.version.sdk=' \"" + rootfs + "/system/build.prop\" 2>/dev/null | cut -d= -f2-; "
-                    + "grep -m1 '^ro.build.version.release=' \"" + rootfs + "/system/build.prop\" 2>/dev/null | cut -d= -f2-; "
-                    + "grep -m1 '^ro.lineage.version=' \"" + rootfs + "/system/build.prop\" 2>/dev/null | cut -d= -f2-"});
+                    "BP=\"" + rootfs + "/system/build.prop\"; "
+                    + "SDK=$(grep -m1 '^ro.build.version.sdk=' \"$BP\" 2>/dev/null | cut -d= -f2-); echo \"SDK:$SDK\"; "
+                    + "REL=$(grep -m1 '^ro.build.version.release=' \"$BP\" 2>/dev/null | cut -d= -f2-); [ -z \"$REL\" ] && REL=$(grep -m1 '^ro.build.version.release_or_codename=' \"$BP\" 2>/dev/null | cut -d= -f2-); echo \"REL:$REL\"; "
+                    + "LIN=$(grep -m1 '^ro.lineage.version=' \"$BP\" 2>/dev/null | cut -d= -f2-); [ -z \"$LIN\" ] && LIN=$(grep -m1 '^ro.lineage.build.version=' \"$BP\" 2>/dev/null | cut -d= -f2-); echo \"LIN:$LIN\""});
                 BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
                 String line;
-                int idx = 0;
                 while ((line = r.readLine()) != null) {
                     line = line.trim();
-                    if (idx == 0) sdk = line;
-                    else if (idx == 1) rel = line;
-                    else if (idx == 2) lineage = line;
-                    idx++;
+                    if (line.startsWith("SDK:")) sdk = line.substring(4);
+                    else if (line.startsWith("REL:")) rel = line.substring(4);
+                    else if (line.startsWith("LIN:")) lineage = line.substring(4);
                 }
                 p.waitFor();
             } catch (Exception ignored) {}
@@ -4761,6 +5622,25 @@ public class MainActivity extends Activity {
                 label = "Framework: unknown (boot the slot to read its build.prop)";
             }
             detectedFrameworkLabel = label;
+            // 5.9.16: pre-boot fit warning for a mounted guest whose
+            // SDK is older than the host vendor SDK (the same
+            // comparison install_image.sh prints as FIT_WARNING for
+            // an install candidate). Logged once per detected
+            // version so refreshSlotInfo's repeated detections do
+            // not spam the log. A guest NEWER than the vendor gets
+            // no warning (Treble rule: GSI >= vendor is the safe
+            // direction).
+            if (known && fSdk != null && !fSdk.isEmpty()) {
+                try {
+                    int guestSdk = Integer.parseInt(fSdk.trim());
+                    int hostSdk = android.os.Build.VERSION.SDK_INT;
+                    String fitKey = fSdk + "/" + hostSdk;
+                    if (guestSdk < hostSdk && !fitKey.equals(lastFitWarnedFor)) {
+                        lastFitWarnedFor = fitKey;
+                        appendLog("⚠ Fit warning: this guest is older than your vendor (guest SDK " + guestSdk + (fRel != null && !fRel.isEmpty() ? " / Android " + fRel : "") + " vs host SDK " + hostSdk + ") — expect HAL trouble. This is the same skew the install fit check flags before install completes.");
+                    }
+                } catch (Exception ignored) {}
+            }
             mainHandler.post(() -> {
                 if (tvFrameworkVersion != null) tvFrameworkVersion.setText(label);
                 if (known && !patched) {

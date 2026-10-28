@@ -38,7 +38,11 @@
 # activated!" to /data/local/tmp/ui_activator.log once it has
 # dismissed the boot animation and fired the HOME intent. That log
 # is truncated fresh at every takeover launch, so a match found
-# here belongs to THIS boot, not a previous one.
+# here belongs to THIS boot, not a previous one. 5.9.16 fallback:
+# if the string never arrives, home is also accepted when a guest
+# system_server rooted under this slot's rootfs reports mStatusBar
+# via nsenter dumpsys window (see home_reached_fallback below) —
+# so a dead Activator cannot false-time-out a healthy guest.
 #
 # Usage: boot_watchdog.sh <slotDir>
 # Test overrides (VM harness only; never set on the phone):
@@ -57,6 +61,44 @@ ACTIVATOR_LOG="${BOOT_WATCHDOG_LOG:-/data/local/tmp/ui_activator.log}"
 WATCH_LOG="${BOOT_WATCHDOG_TMPLOG:-/data/local/tmp/boot_watchdog.log}"
 MARKER="$SLOT_DIR/boot_watchdog_timeout"
 RETURN_SCRIPT="${BOOT_WATCHDOG_RETURN:-}"
+
+# 5.9.16: fallback home detection. The primary signal stays the
+# UI Activator's "Home activated!" string (see below), but if the
+# Activator dies, its log path changes, or the guest reaches home by
+# another path, the string never arrives and the watchdog would
+# false-time-out a healthy guest at 10 min. The fallback is the same
+# evidence the UI Activator itself uses, checked inside this script
+# (switch_to_gsi.sh is owned by another workstream and is not
+# touched): a guest system_server process rooted under this slot's
+# rootfs, AND a guest WindowManager state showing mStatusBar via
+# dumpsys window run inside that process's mount namespace with
+# nsenter (a host-namespace dumpsys would query the host window
+# manager, not the guest's, so it is never used here). Both halves
+# must hold; either half failing means "not proven home".
+BB="$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)"
+[ -x "$BB" ] || BB=""
+guest_system_server_pid() {
+    for _p in /proc/[0-9]*; do
+        [ -d "$_p" ] || continue
+        _root="$(readlink "$_p/root" 2>/dev/null)"
+        if [ "$_root" = "$SLOT_DIR/rootfs" ]; then
+            if tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | grep -q "system_server"; then
+                basename "$_p"; return 0
+            fi
+        fi
+    done
+    return 1
+}
+home_reached_fallback() {
+    _pid="$(guest_system_server_pid)" || return 1
+    if command -v nsenter >/dev/null 2>&1; then
+        nsenter -t "$_pid" -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'
+    elif [ -n "$BB" ]; then
+        "$BB" nsenter -t "$_pid" -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'
+    else
+        return 1
+    fi
+}
 
 echo "BOOT_WATCHDOG_ARMED: slot=$SLOT_DIR window=$((INTERVAL * ROUNDS))s" >> "$WATCH_LOG" 2>/dev/null
 echo "BOOT_WATCHDOG_ARMED: slot=$SLOT_DIR window=$((INTERVAL * ROUNDS))s" >> "$SLOT_DIR/boot_watchdog.log" 2>/dev/null
@@ -85,7 +127,26 @@ while [ "$i" -lt "$ROUNDS" ]; do
         echo "BOOT_WATCHDOG_DONE: guest rootfs unmounted (returned already)" >> "$WATCH_LOG" 2>/dev/null
         exit 0
     fi
+    # 5.9.16 fallback: string absent, but guest system_server is up
+    # and its WindowManager shows mStatusBar — that IS home, even
+    # if the UI Activator never wrote its line. Logged distinctly
+    # (BOOT_WATCHDOG_OK_FALLBACK) so on-device runs can tell which
+    # signal fired; the string path above stays primary and first.
+    if home_reached_fallback; then
+        echo "BOOT_WATCHDOG_OK_FALLBACK: guest reached home (system_server + mStatusBar; UI Activator string absent)" >> "$WATCH_LOG" 2>/dev/null
+        echo "BOOT_WATCHDOG_OK_FALLBACK: guest reached home (system_server + mStatusBar; UI Activator string absent)" >> "$SLOT_DIR/boot_watchdog.log" 2>/dev/null
+        exit 0
+    fi
 done
+
+# One last fallback check before declaring a timeout: the final
+# round's fallback ran up to INTERVAL seconds ago, and a guest that
+# reached home in that gap must not be returned.
+if home_reached_fallback; then
+    echo "BOOT_WATCHDOG_OK_FALLBACK: guest reached home (system_server + mStatusBar; UI Activator string absent)" >> "$WATCH_LOG" 2>/dev/null
+    echo "BOOT_WATCHDOG_OK_FALLBACK: guest reached home (system_server + mStatusBar; UI Activator string absent)" >> "$SLOT_DIR/boot_watchdog.log" 2>/dev/null
+    exit 0
+fi
 
 # Timeout: still mounted, home never activated.
 echo "BOOT_WATCHDOG_TIMEOUT: guest did not reach home within $((INTERVAL * ROUNDS))s — returning to One UI" >> "$WATCH_LOG" 2>/dev/null

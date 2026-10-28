@@ -345,6 +345,213 @@ else
     fi
 fi
 # 5.9.5-SCRIPTS-END
+
+# --- KILL CENSUS (5.9.16) -------------------------------------------------
+# One log line naming which kill targets are gone and which survived,
+# so "did the takeover kill X?" is answered from takeover_app.log
+# instead of by code inspection. Runs AFTER every kill + readiness
+# loop above, BEFORE the guest is launched (so no guest process can
+# appear in the census yet).
+_KILL_GONE=""
+_KILL_ALIVE=""
+for _svc in surfaceflinger bootanimation app_process64 zygote_exec zygote64 system_server media.codec media.metrics wificond; do
+    if pidof "$_svc" >/dev/null 2>&1; then
+        _KILL_ALIVE="$_KILL_ALIVE $_svc"
+    else
+        _KILL_GONE="$_KILL_GONE $_svc"
+    fi
+done
+echo "KILL_CENSUS: gone=[${_KILL_GONE# }] survived=[${_KILL_ALIVE# }] (empty survived list = all targets dead)"
+
+# --- GSI WATCHDOG FEEDER (5.9.16, host namespace) --------------------------
+# SAFE-BY-DESIGN: this only ADDS kicking. It never disables, closes,
+# magic-closes, or stops the host watchdog or host watchdogd, and it
+# never stops watchdogd. The reboots stop because kicking becomes
+# reliable, not because protection is removed.
+# Moved here from master_prepare.sh: the feeder now starts AFTER the
+# kill spree (and after the pkill -f patterns above), so the kill
+# spree is excluded as a suspect class for a dead feeder.
+# Design: supervisor (restart-on-exit) + worker (open-write-close
+# every 2 s, like the old feeder, so WDIOF_MAGICCLOSE keeps the timer
+# running only while the loop runs). Write errors are LOGGED, never
+# discarded with 2>/dev/null: the worker logs its test write, its
+# first failure, every 30th failure, and a heartbeat every 30
+# successful writes (~60 s), so the log proves kicking without
+# flooding one line per 2 s write. A missing /dev/watchdog is logged
+# the same throttled way and the worker keeps retrying.
+# Liveness is REAL, not ps-grep on "/dev/watchdog": the supervisor
+# PID is recorded in gsi_watchdog_feeder.pid and liveness requires
+# kill -0 on that PID plus a /proc cmdline containing the exact
+# supervisor script name (with a ps fallback on the exact script
+# name). A legacy pre-5.9.16 feeder (cmdline containing /dev/watchdog)
+# is killed before starting, because the new supervisor/worker
+# cmdlines do NOT contain "/dev/watchdog" and so are not matched by
+# that legacy cleanup.
+gsi_feeder_alive() {
+    if [ -f /data/local/tmp/gsi_watchdog_feeder.pid ]; then
+        _fpid="$(cat /data/local/tmp/gsi_watchdog_feeder.pid 2>/dev/null)"
+        if [ -n "$_fpid" ]; then
+            if kill -0 "$_fpid" 2>/dev/null; then
+                _fcl="$(tr '\0' ' ' < /proc/$_fpid/cmdline 2>/dev/null)"
+                case "$_fcl" in
+                    *gsi_watchdog_supervisor.sh*) return 0 ;;
+                esac
+            fi
+        fi
+    fi
+    if ps -ef 2>/dev/null | grep -v grep | grep -q "gsi_watchdog_supervisor.sh"; then
+        return 0
+    fi
+    return 1
+}
+if gsi_feeder_alive; then
+    echo "WATCHDOG_FEEDER: supervisor already alive (pid $(cat /data/local/tmp/gsi_watchdog_feeder.pid 2>/dev/null || echo unknown)), not starting a duplicate"
+else
+    if [ -e /dev/watchdog ]; then
+        echo "WATCHDOG_FEEDER: /dev/watchdog present, starting supervised feeder after kill spree"
+    else
+        echo "WATCHDOG_FEEDER: WARNING /dev/watchdog MISSING at feeder start — feeder will log this and keep retrying (host watchdog protection may be absent)"
+    fi
+    ls -l /dev/watchdog* 2>/dev/null || echo "WATCHDOG_FEEDER: no /dev/watchdog* nodes listed"
+    pkill -f "/dev/watchdog" 2>/dev/null || true
+    cat > /data/local/tmp/gsi_watchdog_feeder.sh <<'GSIFEEDER'
+#!/system/bin/sh
+# GSI watchdog feeder WORKER (host namespace). Open-write-close
+# /dev/watchdog every 2 s. Never magic-closes, never holds the node
+# open, never touches watchdogd. Failures are logged, not discarded.
+LOG=/data/local/tmp/gsi_watchdog_feeder.log
+ERR=/data/local/tmp/gsi_watchdog_feeder.err
+ok=0; fail=0; missing=0
+echo "$(date) feeder worker started pid $$" >> "$LOG"
+if [ -e /dev/watchdog ]; then
+    if echo -n 1 > /dev/watchdog 2>"$ERR"; then
+        echo "$(date) feeder test write OK (/dev/watchdog present)" >> "$LOG"; ok=1
+    else
+        echo "$(date) feeder test write FAILED: $(cat "$ERR" 2>/dev/null)" >> "$LOG"; fail=1
+    fi
+else
+    echo "$(date) feeder test write SKIPPED: /dev/watchdog missing" >> "$LOG"; missing=1
+fi
+while true; do
+    sleep 2
+    if [ -e /dev/watchdog ]; then
+        if echo -n 1 > /dev/watchdog 2>"$ERR"; then
+            ok=$((ok + 1)); missing=0
+            if [ $((ok % 30)) -eq 0 ]; then
+                echo "$(date) feeder heartbeat: $ok writes OK, $fail failures" >> "$LOG"
+            fi
+        else
+            fail=$((fail + 1))
+            if [ "$fail" -eq 1 ] || [ $((fail % 30)) -eq 0 ]; then
+                echo "$(date) feeder write FAILED (failure #$fail): $(cat "$ERR" 2>/dev/null)" >> "$LOG"
+            fi
+        fi
+    else
+        missing=$((missing + 1))
+        if [ "$missing" -eq 1 ] || [ $((missing % 30)) -eq 0 ]; then
+            echo "$(date) feeder: /dev/watchdog missing (missing count $missing)" >> "$LOG"
+        fi
+    fi
+done
+GSIFEEDER
+    cat > /data/local/tmp/gsi_watchdog_supervisor.sh <<'GSISUPER'
+#!/system/bin/sh
+# GSI watchdog feeder SUPERVISOR: restart-on-exit. The worker loop
+# above never exits on a single failed write, so this loop normally
+# waits; if the worker process dies for any reason, it is restarted
+# after 1 s and the restart is logged. Killing this supervisor alone
+# does not stop protection while the worker lives, and return_to_oneui.sh
+# kills both by exact script name.
+LOG=/data/local/tmp/gsi_watchdog_feeder.log
+while true; do
+    echo "$(date) supervisor: starting feeder worker" >> "$LOG"
+    /system/bin/sh /data/local/tmp/gsi_watchdog_feeder.sh
+    echo "$(date) supervisor: feeder worker exited, restarting in 1s" >> "$LOG"
+    sleep 1
+done
+GSISUPER
+    chmod 755 /data/local/tmp/gsi_watchdog_feeder.sh /data/local/tmp/gsi_watchdog_supervisor.sh
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh /data/local/tmp/gsi_watchdog_supervisor.sh </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh /data/local/tmp/gsi_watchdog_supervisor.sh </dev/null >/dev/null 2>&1 &
+    fi
+    echo "$!" > /data/local/tmp/gsi_watchdog_feeder.pid 2>/dev/null || true
+    sleep 1
+    if gsi_feeder_alive; then
+        echo "WATCHDOG_FEEDER_STARTED: supervisor pid $(cat /data/local/tmp/gsi_watchdog_feeder.pid 2>/dev/null || echo unknown), log /data/local/tmp/gsi_watchdog_feeder.log"
+    else
+        echo "WATCHDOG_FEEDER_START_FAILED: supervisor not alive after start — check /data/local/tmp/gsi_watchdog_feeder.log (guest boot continues; host watchdogd, if any, is still the kicker)"
+    fi
+fi
+
+# --- HOST WATCHDOGD KEEPALIVE (5.9.16) ------------------------------------
+# Mirrors the adbd/imsd watchdogs above, but for the HOST watchdogd:
+# it only ever RESTARTS watchdogd (via init) if its init service
+# exists and is not running. It never stops, kills, closes, or
+# disables watchdogd, and it never writes /dev/watchdog itself — it
+# is a keepalive for the host's own protection, not a replacement
+# kicker. If no watchdogd service exists on this phone, it logs that
+# once (state change) and the fork feeder above is the sole kicker.
+gsi_keepalive_alive() {
+    if [ -f /data/local/tmp/host_watchdogd_keepalive.pid ]; then
+        _kpid="$(cat /data/local/tmp/host_watchdogd_keepalive.pid 2>/dev/null)"
+        if [ -n "$_kpid" ]; then
+            if kill -0 "$_kpid" 2>/dev/null; then
+                _kcl="$(tr '\0' ' ' < /proc/$_kpid/cmdline 2>/dev/null)"
+                case "$_kcl" in
+                    *host_watchdogd_keepalive.sh*) return 0 ;;
+                esac
+            fi
+        fi
+    fi
+    if ps -ef 2>/dev/null | grep -v grep | grep -q "host_watchdogd_keepalive.sh"; then
+        return 0
+    fi
+    return 1
+}
+if gsi_keepalive_alive; then
+    echo "HOST_WATCHDOGD_KEEPALIVE: already alive, not starting a duplicate"
+else
+    cat > /data/local/tmp/host_watchdogd_keepalive.sh <<'HOSTWD'
+#!/system/bin/sh
+# Host watchdogd keepalive: restart-only. Never stops watchdogd,
+# never writes /dev/watchdog. Logs only on state change plus any
+# restart request, so a phone with no watchdogd service logs once.
+LOG=/data/local/tmp/host_watchdogd_keepalive.log
+last_state=""
+while true; do
+    sleep 60
+    _svc="$(getprop init.svc.watchdogd 2>/dev/null || echo "")"
+    if pidof watchdogd >/dev/null 2>&1; then
+        _state="running"
+    elif [ -n "$_svc" ] && [ "$_svc" != "running" ]; then
+        setprop ctl.start watchdogd 2>/dev/null
+        echo "$(date) host watchdogd keepalive: watchdogd not running (init.svc.watchdogd=$_svc), requested ctl.start" >> "$LOG"
+        _state="restarted:$_svc"
+    else
+        _state="absent"
+    fi
+    if [ "$_state" != "$last_state" ]; then
+        echo "$(date) host watchdogd keepalive: state $last_state -> $_state" >> "$LOG"
+        last_state="$_state"
+    fi
+done
+HOSTWD
+    chmod 755 /data/local/tmp/host_watchdogd_keepalive.sh
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh /data/local/tmp/host_watchdogd_keepalive.sh </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh /data/local/tmp/host_watchdogd_keepalive.sh </dev/null >/dev/null 2>&1 &
+    fi
+    echo "$!" > /data/local/tmp/host_watchdogd_keepalive.pid 2>/dev/null || true
+    if gsi_keepalive_alive; then
+        echo "HOST_WATCHDOGD_KEEPALIVE_STARTED: pid $(cat /data/local/tmp/host_watchdogd_keepalive.pid 2>/dev/null || echo unknown), log /data/local/tmp/host_watchdogd_keepalive.log"
+    else
+        echo "HOST_WATCHDOGD_KEEPALIVE_START_FAILED: keepalive not alive after start (watchdogd itself is untouched)"
+    fi
+fi
+
 # Suppress the host zygote only, so Samsung init does not resurrect it
 nohup $BB sh -c "while true; do [ \"\$(getprop init.svc.zygote)\" = \"running\" ] && setprop ctl.stop zygote; sleep 1; done" </dev/null >/dev/null 2>&1 &
 
@@ -362,6 +569,23 @@ echo "Takeover daemon PID: $TAKEOVER_PID"
 # return_to_oneui.sh removes this once the rootfs is unmounted.
 touch "$STAGE/.guest_running" 2>/dev/null || true
 # 5.9.5-SCRIPTS-END
+
+# 5.9.16: watchdog visibility verification (host namespace). Guest
+# mounts live in a separate mount namespace via unshare -m above, so
+# they SHOULD NOT hide /dev/watchdog from host daemons — verify and
+# log, don't assume. This check runs in the host namespace after the
+# guest launch, so a FAIL here means the host's own view changed.
+if [ -e /dev/watchdog ]; then
+    echo "WATCHDOG_VISIBILITY_OK: host /dev/watchdog still visible after guest launch (guest mounts did not hide it from host daemons)"
+    ls -l /dev/watchdog* 2>/dev/null || true
+else
+    echo "WATCHDOG_VISIBILITY_FAIL: host /dev/watchdog NOT visible after guest launch — host kicking may be blind this session, check mounts"
+fi
+if gsi_feeder_alive 2>/dev/null; then
+    echo "WATCHDOG_FEEDER_ALIVE_POST_LAUNCH: supervised feeder still alive after guest launch"
+else
+    echo "WATCHDOG_FEEDER_DEAD_POST_LAUNCH: supervised feeder NOT alive after guest launch — check /data/local/tmp/gsi_watchdog_feeder.log"
+fi
 
 # Start UI Activator daemon
 $BB sh -c "

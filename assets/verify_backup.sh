@@ -4,9 +4,11 @@
 # (read-only loop mount, looking for system/bin/sh + init.environ.rc)
 # when loop mounting is possible, or falls back to structural checks
 # (ext4 magic 53ef @1080 / EROFS magic e2e1f5e0 @1024, size consistency).
-# Prints "VERIFY_OK" or "VERIFY_FAIL <reason>"; exit 0 on OK, 1 on FAIL.
-# A mount attempt that fails (no loop device, not root, dummy test file)
-# is NOT a failure by itself: it falls through to the structural checks.
+# Prints "VERIFY_OK" (mount-checked), "VERIFY_STRUCTURAL" (5.9.16:
+# sha/size/manifest + magic pass but no mount check ever ran — never
+# to be read as OK), or "VERIFY_FAIL <reason>"; exit 0 on OK or
+# STRUCTURAL, 1 on FAIL. When a loop device IS available the mount
+# check is mandatory: a failed mount is VERIFY_FAIL, not a fallback.
 BACKUP="$1"
 if [ -z "$BACKUP" ]; then
     echo "VERIFY_FAIL usage: verify_backup.sh <backupDir>" >&2
@@ -113,7 +115,25 @@ if [ "$MOUNTED_OK" = "1" ]; then
     echo "VERIFY_OK"
     exit 0
 fi
-# Structural fallback (also the path taken when mounting is impossible).
+# 5.9.16: the mount check is MANDATORY when a loop device is
+# available. The old code fell through to a structural pass here and
+# printed VERIFY_OK on magic + size alone even when mounting was
+# never attempted — a file with the right magic and size passed
+# without any mount check. That must never read as OK again.
+# Loop availability: losetup can hand out a free loop device.
+_LOOP_AVAIL=0
+if command -v losetup >/dev/null 2>&1; then
+    [ -n "$(losetup -f 2>/dev/null)" ] && _LOOP_AVAIL=1
+fi
+if [ "$MOUNT_TRIED" = "1" ] && [ "$_LOOP_AVAIL" = "1" ]; then
+    echo "VERIFY_FAIL mount check attempted but the image could not be loop-mounted (loop device available, mount failed)"
+    exit 1
+fi
+# Structural fallback: only reached when mounting was never
+# attempted (not root / no mount / no temp dir) or no loop device
+# exists at all. It is a DIFFERENT verdict, never VERIFY_OK: hashes
+# and manifest above already passed, and magic + size below are
+# consistent, but no mount check ever ran.
 case "$FSTYPE" in
     ext4|erofs) ;;
     *) echo "VERIFY_FAIL unknown filesystem magic (not ext4/EROFS)"; exit 1 ;;
@@ -121,8 +141,8 @@ esac
 _SZ="$(stat -c %s "$BACKUP/system.raw" 2>/dev/null || echo 0)"
 [ "$_SZ" -gt 2048 ] || { echo "VERIFY_FAIL system.raw too small for its magic offsets"; exit 1; }
 if [ "$MOUNT_TRIED" = "1" ]; then
-    echo "VERIFY_OK"
+    echo "VERIFY_STRUCTURAL: sha/size/manifest + filesystem magic pass, but the loop mount could not be attempted (no loop device) — NOT a full verify"
 else
-    echo "VERIFY_OK"
+    echo "VERIFY_STRUCTURAL: sha/size/manifest + filesystem magic pass, but mounting was never attempted — NOT a full verify"
 fi
 exit 0

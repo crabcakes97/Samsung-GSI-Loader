@@ -64,12 +64,63 @@
 #      string-compared. Counts (NIMG, N) and MB values are small and
 #      may still use shell tests.
 # All failures print INSTALL_ERROR: <reason> and exit 1.
+# 5.9.16: the sweep is logged + whitelisted (backups, snapshots,
+# slots, data, rootfs never swept); long steps emit INSTALL_PROGRESS
+# markers to $STAGE/install_progress.log for the app poller; a
+# pre-install fit check prints FIT_WARNING when the guest SDK is
+# older than the host vendor SDK; format rejects print the exact
+# conversion to run instead of a bare unsupported line; and 7zz /
+# simg2img are hash-checked against .engine_hashes when present.
 INPUT="$1"
 MOVE="$2"
 STAGE="$3"
 OUT="$4"
 CONVERTED_FILE=""
-fail() { [ -n "$CONVERTED_FILE" ] && rm -f "$CONVERTED_FILE" 2>/dev/null || true; echo "INSTALL_ERROR: $1"; exit 1; }
+PROGRESS_FILE=""
+PROGRESS_FLAG=""
+fail() { [ -n "$PROGRESS_PID" ] && kill "$PROGRESS_PID" 2>/dev/null || true; [ -n "$CONVERTED_FILE" ] && rm -f "$CONVERTED_FILE" 2>/dev/null || true; [ -n "$PROGRESS_FLAG" ] && rm -f "$PROGRESS_FLAG" 2>/dev/null || true; [ -n "$PROGRESS_FILE" ] && echo "INSTALL_PROGRESS: failed" >> "$PROGRESS_FILE" 2>/dev/null || true; echo "INSTALL_ERROR: $1"; exit 1; }
+# 5.9.16 install progress markers. Long steps (7zz extraction of a
+# ~1 GB archive, simg2img conversion of a ~2.7 GB sparse image) used
+# to run silent for minutes, which already produced force-restarts
+# mid-install. Now each long step runs a background tick loop that
+# appends INSTALL_PROGRESS lines to $STAGE/install_progress.log
+# every 5 s; the app polls that file (same pattern as
+# streamBootProgress polling takeover_app.log). The loop is bounded
+# by a flag file holding the script's PID: removing the flag stops
+# it, and if the script dies the PID check stops it too, so a
+# failed install never leaves a stray tick loop behind. Ticks are
+# diagnostic only — they never gate the install.
+progress_start() {
+    # $1 = label, $2 = mode (stage|file), $3 = probe file (file mode),
+    # $4 = expected MB (file mode, 0 when unknown).
+    PROGRESS_FLAG="$STAGE/.install_progress_active"
+    echo "$$" > "$PROGRESS_FLAG" 2>/dev/null || true
+    (
+        _label="$1"; _mode="$2"; _file="$3"; _exp="$4"
+        while [ -f "$PROGRESS_FLAG" ] && kill -0 "$(cat "$PROGRESS_FLAG" 2>/dev/null)" 2>/dev/null; do
+            if [ "$_mode" = "file" ]; then
+                _sz="$(stat -c %s "$_file" 2>/dev/null || echo 0)"
+                _mb="$(awk -v s="$_sz" 'BEGIN{printf "%d", s/1048576}' 2>/dev/null || echo 0)"
+                if [ "$_exp" != "0" ] && [ -n "$_exp" ]; then
+                    echo "INSTALL_PROGRESS: $_label ($_mb MB of ~$_exp MB written)" >> "$PROGRESS_FILE" 2>/dev/null
+                else
+                    echo "INSTALL_PROGRESS: $_label ($_mb MB written)" >> "$PROGRESS_FILE" 2>/dev/null
+                fi
+            else
+                _kb="$(du -sk "$STAGE" 2>/dev/null | cut -f1)"
+                echo "INSTALL_PROGRESS: $_label (stage ${_kb} KB and growing)" >> "$PROGRESS_FILE" 2>/dev/null
+            fi
+            sleep 5
+        done
+    ) &
+    PROGRESS_PID=$!
+}
+progress_stop() {
+    [ -n "$PROGRESS_FLAG" ] && rm -f "$PROGRESS_FLAG" 2>/dev/null || true
+    [ -n "$PROGRESS_PID" ] && kill "$PROGRESS_PID" 2>/dev/null || true
+    [ -n "$PROGRESS_PID" ] && wait "$PROGRESS_PID" 2>/dev/null || true
+    PROGRESS_PID=""
+}
 
 [ -n "$INPUT" ] && [ -n "$STAGE" ] && [ -n "$OUT" ] || fail "BAD_ARGUMENTS"
 case "$STAGE" in
@@ -96,9 +147,9 @@ fi
 [ -f "$INPUT" ] || fail "INPUT_MISSING"
 
 case "$INPUT" in
-    *.zst|*.zstd) fail "UNSUPPORTED_COMPRESSION: .zst needs a newer extractor than the bundled 7zz 23.01" ;;
-    *.lz4) fail "UNSUPPORTED_COMPRESSION: raw .lz4 frames are not supported by the bundled extractor" ;;
-    *.br) fail "UNSUPPORTED_COMPRESSION: raw .br frames are not supported by the bundled extractor" ;;
+    *.zst|*.zstd) fail "UNSUPPORTED_COMPRESSION: .zst needs a newer extractor than the bundled 7zz 23.01 — convert it first, then install the result: on a PC run 'zstd -d file.zst' (or on-device if zstd is installed), or re-download the EXT4/EROFS .7z preset instead" ;;
+    *.lz4) fail "UNSUPPORTED_COMPRESSION: raw .lz4 frames are not supported by the bundled extractor — convert it first, then install the result: run 'lz4 -d file.lz4' to get the raw image (lz4 must be installed), then install that raw image" ;;
+    *.br) fail "UNSUPPORTED_COMPRESSION: raw .br frames are not supported by the bundled extractor — convert it first, then install the result: run 'brotli -d file.br' to get the raw image (brotli must be installed), then install that raw image" ;;
 esac
 
 mkdir -p "$STAGE" || fail "STAGE_MKDIR_FAILED"
@@ -113,6 +164,32 @@ mkdir -p "$STAGE" || fail "STAGE_MKDIR_FAILED"
 # with 7zz's error tail. Logs live in the stage dir (small files,
 # never swept, never .img) so the next report shows why.
 [ -x "$STAGE/7zz" ] || fail "EXTRACTOR_MISSING: bundled 7zz not found in stage dir"
+# 5.9.16: progress file for the app's install poller (created here,
+# after the sweep point below would have removed any stale one only
+# if it were >100 MB — it never is — and before the long steps).
+PROGRESS_FILE="$STAGE/install_progress.log"
+echo "INSTALL_PROGRESS: starting install" > "$PROGRESS_FILE" 2>/dev/null || true
+# 5.9.16: engine tool hash check. The app's engine sync records
+# SHA-256 hashes of the big binaries in $STAGE/.engine_hashes (slot
+# sync) or the Default stage copy (install copies 7zz/simg2img
+# without writing a hash file, so fall back to that one). If a hash
+# file exists and a tool's hash mismatches, the extractor/converter
+# is stale or corrupt — fail loudly instead of installing from it.
+# No hash file means the old behaviour (proceed); a hash file that
+# lacks a tool also proceeds for that tool.
+_HASHFILE="$STAGE/.engine_hashes"
+if [ ! -f "$_HASHFILE" ] && [ "$STAGE" != "/data/local/tmp/lineage_stage" ]; then
+    [ -f "/data/local/tmp/lineage_stage/.engine_hashes" ] && _HASHFILE="/data/local/tmp/lineage_stage/.engine_hashes"
+fi
+if [ -f "$_HASHFILE" ] && type gsi_sha256 >/dev/null 2>&1; then
+    for _tool in 7zz simg2img; do
+        [ -f "$STAGE/$_tool" ] || continue
+        _want="$(awk -v t="$_tool" '$2 == t {print $1}' "$_HASHFILE" 2>/dev/null | head -n 1)"
+        [ -n "$_want" ] || continue
+        _got="$(gsi_sha256 "$STAGE/$_tool" 2>/dev/null)"
+        [ "$_got" = "$_want" ] || fail "TOOL_HASH_MISMATCH: $STAGE/$_tool does not match the engine hash recorded by the app — re-launch the app to re-sync the engine before installing (a stale/corrupt extractor or converter must not install anything)"
+    done
+fi
 case "$INPUT" in
     *.7z|*.zip|*.xz|*.gz|*.tgz|*.tar)
         TESTLOG="$STAGE/archive-test.log"
@@ -134,9 +211,30 @@ esac
 # stale .new / .converted temps from crashed installs are dropped too
 # (the atomic rename below is the only thing that may replace
 # system.raw). The input file is excluded from both sweeps.
-find "$STAGE" -type f -name '*.img' ! -path "$INPUT" 2>/dev/null -exec rm -f {} + 2>/dev/null || true
-find "$STAGE" -type f -size +100M ! -path "$OUT" ! -path "$INPUT" 2>/dev/null -exec rm -f {} + 2>/dev/null || true
+# 5.9.16: logged, whitelisted sweep. The old sweep deleted every
+# *.img and every >100 MB file under the stage dir without saying
+# what it deleted — and that included user data that merely lives
+# under the stage dir (backups/, snapshots/, other slots/, guest
+# data/, and the mounted rootfs tree). Now every swept path is
+# logged with its size BEFORE deletion, and paths outside the
+# whitelist are refused: backups, snapshots, slots, data and rootfs
+# subtrees are never swept, nor are the input, the output
+# (system.raw), or any file literally named system.raw anywhere.
+find "$STAGE" \( -path "$STAGE/backups" -o -path "$STAGE/snapshots" -o -path "$STAGE/slots" -o -path "$STAGE/data" -o -path "$STAGE/rootfs" \) -prune -o -type f \( -name '*.img' -o -size +100M \) -print 2>/dev/null > "$STAGE/.sweep_list" || true
+while IFS= read -r _sweep || [ -n "$_sweep" ]; do
+    [ -n "$_sweep" ] || continue
+    case "$_sweep" in
+        "$STAGE/backups/"*|"$STAGE/snapshots/"*|"$STAGE/slots/"*|"$STAGE/data/"*|"$STAGE/rootfs/"*) echo "SWEEP_SKIP: protected path kept: $_sweep"; continue ;;
+        "$INPUT"|"$OUT") echo "SWEEP_SKIP: input/output kept: $_sweep"; continue ;;
+        */system.raw) echo "SWEEP_SKIP: system.raw kept: $_sweep"; continue ;;
+    esac
+    _ssz="$(stat -c %s "$_sweep" 2>/dev/null || echo 0)"
+    echo "SWEEP: deleting $_sweep ($_ssz bytes)"
+    rm -f "$_sweep" 2>/dev/null || echo "SWEEP_WARN: could not delete $_sweep"
+done < "$STAGE/.sweep_list"
+rm -f "$STAGE/.sweep_list" 2>/dev/null
 rm -f "$OUT.new" "$OUT.converted" 2>/dev/null
+echo "SWEEP: stale temps $OUT.new and $OUT.converted removed (if present)"
 # 5.9.9: 7zz's exit code used to be ignored and its output discarded,
 # so a failed extraction slid silently into candidate selection and
 # died with a confusing error. Now a failed extraction fails loudly
@@ -149,28 +247,45 @@ rm -f "$OUT.new" "$OUT.converted" 2>/dev/null
 case "$INPUT" in
     *.7z|*.zip|*.xz|*.gz|*.tgz|*.tar)
         EXTRACTLOG="$STAGE/extract.log"
+        echo "INSTALL_PROGRESS: extracting archive" >> "$PROGRESS_FILE" 2>/dev/null || true
+        progress_start "extracting archive" "stage" "" "0"
         "$STAGE/7zz" x -y -o"$STAGE" "$INPUT" >"$EXTRACTLOG" 2>&1 || {
+            progress_stop
             INPSIZE=$(stat -c %s "$INPUT" 2>/dev/null || echo 0)
             echo "EXTRACT_FAILED: 7zz could not extract $INPUT ($INPSIZE bytes):"
             tail -n 10 "$EXTRACTLOG" 2>/dev/null
             fail "EXTRACT_FAILED: 7zz extraction failed for $INPUT ($INPSIZE bytes; 7zz error above)"
         }
+        progress_stop
+        echo "INSTALL_PROGRESS: extraction done" >> "$PROGRESS_FILE" 2>/dev/null || true
         ;;
 esac
 
+# 5.9.16: protected-subtree filter, shared with the sweep
+# whitelist below. The sweep no longer deletes backups, snapshots,
+# other slots, guest data or the mounted rootfs — so candidate
+# selection must not COUNT them either, or a slot with any backup
+# (>100 MB by definition) would now fail every install with
+# AMBIGUOUS on files the sweep deliberately kept (proven by VM
+# test: with backups + data present, selection counted them as
+# candidates). Filter helper: drop any path under a protected
+# subtree from a find listing.
+filter_protected() {
+    grep -v -F "$STAGE/backups/" | grep -v -F "$STAGE/snapshots/" | grep -v -F "$STAGE/slots/" | grep -v -F "$STAGE/data/" | grep -v -F "$STAGE/rootfs/"
+}
 CAND=""
 for n in system.img system_a.img system_b.img; do
-    CAND=$(find "$STAGE" -maxdepth 3 -name "$n" 2>/dev/null | head -n 1)
+    CAND=$(find "$STAGE" -maxdepth 3 -name "$n" 2>/dev/null | filter_protected | head -n 1)
     [ -n "$CAND" ] && break
 done
 if [ -z "$CAND" ]; then
-    CAND=$(find "$STAGE" -maxdepth 3 -name '*system*.img' ! -name 'system_ext*' 2>/dev/null | head -n 1)
+    CAND=$(find "$STAGE" -maxdepth 3 -name '*system*.img' ! -name 'system_ext*' 2>/dev/null | filter_protected | head -n 1)
 fi
 # 5.9.8: a release-named image (e.g. LineageOS-23.2-...-GSI.img) matches
 # neither pattern above, so any *.img at all now beats the large-file
 # fallback. system_ext is excluded here too — it is not a system image.
 if [ -z "$CAND" ]; then
-    IMGS=$(find "$STAGE" -maxdepth 3 -type f -name '*.img' ! -name 'system_ext*' 2>/dev/null | grep -v -F "$OUT" | grep -v -F "$INPUT")
+    IMGS=$(find "$STAGE" -maxdepth 3 -type f -name '*.img' ! -name 'system_ext*' 2>/dev/null | filter_protected | grep -v -F "$OUT" | grep -v -F "$INPUT")
     NIMG=$(printf '%s' "$IMGS" | grep -c . || true)
     if [ "$NIMG" = "1" ]; then
         CAND="$IMGS"
@@ -189,7 +304,10 @@ if [ -z "$CAND" ]; then
     fi
 fi
 if [ -z "$CAND" ]; then
-    BIG=$(find "$STAGE" -maxdepth 3 -type f -size +100M ! -name '*.img' 2>/dev/null | grep -v -F "$OUT" | grep -v -F "$INPUT")
+    # 5.9.16: same protected-subtree filter as the .img search
+    # above — a backup or guest-data file must never be picked as
+    # the install candidate either.
+    BIG=$(find "$STAGE" -maxdepth 3 -type f -size +100M ! -name '*.img' 2>/dev/null | filter_protected | grep -v -F "$OUT" | grep -v -F "$INPUT")
     N=$(printf '%s' "$BIG" | grep -c . || true)
     if [ "$N" = "1" ]; then
         CAND="$BIG"
@@ -233,7 +351,7 @@ fi
 [ -n "$CAND" ] || fail "NO_IMAGE_PRODUCED"
 
 case "$CAND" in
-    *super.img) fail "SUPER_IMAGE: this is a super image (LP container), not a system image" ;;
+    *super.img) fail "SUPER_IMAGE: this is a super image (LP container), not a system image — convert it first, then install the result: on a PC run 'lpunpack super.img <outdir>' (lpunpack ships with Android build tools / otatools) and install the system.img inside that folder; do not install super.img directly" ;;
 esac
 
 MAGIC0=$(od -An -tx1 -N4 "$CAND" 2>/dev/null | tr -d ' \n')
@@ -251,7 +369,14 @@ if [ "$MAGIC0" = "3aff26ed" ]; then
     TOTAL_BLKS=$(dd if="$CAND" bs=1 skip=16 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n')
     CONVERTED_FILE="$OUT.converted"
     rm -f "$CONVERTED_FILE" 2>/dev/null
-    "$SIMG" "$CAND" "$CONVERTED_FILE" >/dev/null 2>&1 || fail "SPARSE_CONVERT_FAILED: simg2img failed on $CAND"
+    # 5.9.16: periodic progress markers while simg2img runs (see
+    # progress_start above; the app polls install_progress.log).
+    _EXP_MB="$(awk -v b="$BLK_SZ" -v t="$TOTAL_BLKS" 'BEGIN{printf "%d", b*t/1048576}' 2>/dev/null || echo 0)"
+    echo "INSTALL_PROGRESS: converting sparse image (~$_EXP_MB MB expected)" >> "$PROGRESS_FILE" 2>/dev/null || true
+    progress_start "converting sparse image" "file" "$CONVERTED_FILE" "$_EXP_MB"
+    "$SIMG" "$CAND" "$CONVERTED_FILE" >/dev/null 2>&1 || { progress_stop; fail "SPARSE_CONVERT_FAILED: simg2img failed on $CAND"; }
+    progress_stop
+    echo "INSTALL_PROGRESS: sparse conversion done" >> "$PROGRESS_FILE" 2>/dev/null || true
     [ -f "$CONVERTED_FILE" ] || fail "SPARSE_CONVERT_FAILED: simg2img produced no output"
     CONV_SIZE=$(stat -c %s "$CONVERTED_FILE" 2>/dev/null || echo 0)
     case "$BLK_SZ" in ''|*[!0-9]*) fail "SPARSE_CONVERT_FAILED: cannot parse sparse header blk_sz" ;; esac
@@ -272,7 +397,7 @@ MAGIC_EROFS=$(dd if="$CAND" bs=1 skip=1024 count=4 2>/dev/null | od -An -tx1 | t
 FSTYPE="unknown"
 [ "$MAGIC_EXT" = "53ef" ] && FSTYPE="ext4"
 [ "$MAGIC_EROFS" = "e2e1f5e0" ] && FSTYPE="erofs"
-[ "$FSTYPE" = "unknown" ] && fail "UNKNOWN_FORMAT: not an ext4 or EROFS system image"
+[ "$FSTYPE" = "unknown" ] && fail "UNKNOWN_FORMAT: not an ext4 or EROFS system image — if this file is a super.img, unpack it first with 'lpunpack super.img <outdir>' and install the system.img inside; if it is compressed (.zst/.lz4/.br), decompress it first ('zstd -d' / 'lz4 -d' / 'brotli -d') and install the result; if it is a ROM zip, it needs an sdat2img-style conversion this installer does not do — install a raw system image instead"
 
 SIZE=$(stat -c %s "$CAND" 2>/dev/null || echo 0)
 case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
@@ -289,6 +414,32 @@ if [ ! -s "$CAND" ]; then
     echo "CANDIDATE_EMPTY_DIAG: magic ext4=$MAGIC_EXT erofs=$MAGIC_EROFS fstype=$FSTYPE"
     fail "CANDIDATE_EMPTY: candidate $CAND statted at $SIZE bytes (magic ext4=$MAGIC_EXT erofs=$MAGIC_EROFS)"
 fi
+# 5.9.16: pre-install fit check (diagnostic only — it NEVER fails
+# the install). The candidate is loop-mounted read-only, its
+# build.prop SDK/release read with keyed greps, and compared with
+# the host vendor SDK from /system/build.prop. A guest older than
+# the vendor prints FIT_WARNING before the install completes, so
+# the skew is flagged before the first failed boot instead of
+# diagnosed after three. SDKs are small ints, so plain shell tests
+# here are safe (the 32-bit rule covers raw byte sizes only). If
+# the mount fails (EROFS support, loop busy), the check is skipped
+# honestly and the install proceeds — boot will tell.
+FITMNT="$STAGE/.fitcheck_mnt"
+rm -rf "$FITMNT" 2>/dev/null; mkdir -p "$FITMNT" 2>/dev/null || true
+if mount -t "$FSTYPE" -o ro,loop "$CAND" "$FITMNT" 2>/dev/null; then
+    _GSDK="$(grep -m1 '^ro.build.version.sdk=' "$FITMNT/system/build.prop" 2>/dev/null | cut -d= -f2-)"
+    _GREL="$(grep -m1 '^ro.build.version.release=' "$FITMNT/system/build.prop" 2>/dev/null | cut -d= -f2-)"
+    _HSDK="$(grep -m1 '^ro.build.version.sdk=' /system/build.prop 2>/dev/null | cut -d= -f2-)"
+    case "$_GSDK" in ''|*[!0-9]*) echo "FIT_CHECK_SKIPPED: guest build.prop has no readable ro.build.version.sdk" ;;
+        *) case "$_HSDK" in ''|*[!0-9]*) echo "FIT_CHECK_SKIPPED: host build.prop has no readable ro.build.version.sdk" ;;
+            *) if [ "$_GSDK" -lt "$_HSDK" ]; then echo "FIT_WARNING: this guest is older than your vendor (guest Android ${_GREL} SDK $_GSDK vs host vendor SDK $_HSDK) — expect HAL trouble (radio/camera/audio may misbehave); it may still boot, but do not be surprised"; else echo "FIT_OK: guest SDK $_GSDK vs host vendor SDK $_HSDK"; fi ;;
+            esac ;;
+    esac
+    umount "$FITMNT" 2>/dev/null || true
+else
+    echo "FIT_CHECK_SKIPPED: candidate could not be loop-mounted read-only for a build.prop fit check (install proceeds; boot will tell)"
+fi
+rmdir "$FITMNT" 2>/dev/null || true
 AVAIL_KB=$(df "$STAGE" 2>/dev/null | tail -n 1 | awk '{print $4}')
 if [ -n "$AVAIL_KB" ]; then
     case "$AVAIL_KB" in
@@ -320,5 +471,6 @@ CONVERTED_FILE=""
 # 5.9.10: SIZE/1048576 in $(( )) wraps to a negative MB display
 # for >2 GiB images; MB via awk instead.
 IMAGE_MB=$(awk -v s="$SIZE" 'BEGIN{printf "%d", s/1048576}' 2>/dev/null || echo 0)
+echo "INSTALL_PROGRESS: done" >> "$PROGRESS_FILE" 2>/dev/null || true
 echo "IMAGE_OK: $FSTYPE $IMAGE_MB MB -> $OUT"
 exit 0

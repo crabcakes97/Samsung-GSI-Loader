@@ -161,5 +161,117 @@ echo "[Pivoted Root] App storage sweeper started..."
 echo "[Pivoted Root] Cleaning stale sockets..."
 rm -f /dev/socket/zygote /dev/socket/usap_pool_primary 2>/dev/null || true
 
+# 5.9.16: GUEST-SIDE watchdog kicker (defense in depth, rank 2b).
+# The guest has no init and no watchdogd of its own, so previously
+# kicking depended solely on host daemons surviving. /dev is
+# rbind-shared into the guest (master_prepare.sh), so a guest loop
+# CAN write /dev/watchdog. This starts a supervised guest kicker
+# (supervisor restart-on-exit + worker open-write-close every 2 s)
+# BEFORE exec'ing zygote_exec, detached via setsid so it survives
+# the exec (it is reparented to host init, PID 1, like the other
+# guest daemons). It does NOT replace the host feeder — both kick,
+# so either side surviving keeps the 100 s timer fed.
+# It never magic-closes, never holds the node open, and never stops
+# watchdogd. If the host watchdogd/feeder already holds /dev/watchdog
+# open, guest writes may fail EBUSY: that is LOGGED (throttled, like
+# the host feeder) and is not fatal — the host kicker still protects.
+# Liveness here is pidfile + /proc cmdline on the exact supervisor
+# script name, not a cmdline substring on /dev/watchdog.
+# On return, return_to_oneui.sh kills this kicker by its exact script
+# names (and kill_guest_procs kills anything rooted under the guest
+# rootfs), so it does not leak into One UI.
+guest_kicker_alive() {
+    if [ -f /data/guest_watchdog_kicker.pid ]; then
+        _gpid="$(cat /data/guest_watchdog_kicker.pid 2>/dev/null)"
+        if [ -n "$_gpid" ]; then
+            if kill -0 "$_gpid" 2>/dev/null; then
+                _gcl="$(tr '\0' ' ' < /proc/$_gpid/cmdline 2>/dev/null)"
+                case "$_gcl" in
+                    *gsi_guest_kicker_supervisor.sh*) return 0 ;;
+                esac
+            fi
+        fi
+    fi
+    if ps -ef 2>/dev/null | grep -v grep | grep -q "gsi_guest_kicker_supervisor.sh"; then
+        return 0
+    fi
+    return 1
+}
+if guest_kicker_alive; then
+    echo "[Pivoted Root] Guest watchdog kicker already alive, not starting a duplicate"
+else
+    mkdir -p /data/local/tmp 2>/dev/null || true
+    if [ -e /dev/watchdog ]; then
+        echo "[Pivoted Root] Guest watchdog kicker: /dev/watchdog visible inside guest, starting supervised kicker"
+    else
+        echo "[Pivoted Root] Guest watchdog kicker: WARNING /dev/watchdog NOT visible inside guest — kicker will log this and keep retrying"
+    fi
+    cat > /data/local/tmp/gsi_guest_kicker.sh <<'GUESTKICKER'
+#!/system/bin/sh
+# Guest watchdog kicker WORKER (guest namespace, /dev rbind-shared).
+# Open-write-close /dev/watchdog every 2 s. Failures logged, not discarded.
+LOG=/data/guest_watchdog_kicker.log
+ERR=/data/guest_watchdog_kicker.err
+ok=0; fail=0; missing=0
+echo "$(date) guest kicker worker started pid $$" >> "$LOG"
+if [ -e /dev/watchdog ]; then
+    if echo -n 1 > /dev/watchdog 2>"$ERR"; then
+        echo "$(date) guest kicker test write OK" >> "$LOG"; ok=1
+    else
+        echo "$(date) guest kicker test write FAILED: $(cat "$ERR" 2>/dev/null)" >> "$LOG"; fail=1
+    fi
+else
+    echo "$(date) guest kicker test write SKIPPED: /dev/watchdog missing in guest" >> "$LOG"; missing=1
+fi
+while true; do
+    sleep 2
+    if [ -e /dev/watchdog ]; then
+        if echo -n 1 > /dev/watchdog 2>"$ERR"; then
+            ok=$((ok + 1)); missing=0
+            if [ $((ok % 30)) -eq 0 ]; then
+                echo "$(date) guest kicker heartbeat: $ok writes OK, $fail failures" >> "$LOG"
+            fi
+        else
+            fail=$((fail + 1))
+            if [ "$fail" -eq 1 ] || [ $((fail % 30)) -eq 0 ]; then
+                echo "$(date) guest kicker write FAILED (failure #$fail): $(cat "$ERR" 2>/dev/null)" >> "$LOG"
+            fi
+        fi
+    else
+        missing=$((missing + 1))
+        if [ "$missing" -eq 1 ] || [ $((missing % 30)) -eq 0 ]; then
+            echo "$(date) guest kicker: /dev/watchdog missing in guest (missing count $missing)" >> "$LOG"
+        fi
+    fi
+done
+GUESTKICKER
+    cat > /data/local/tmp/gsi_guest_kicker_supervisor.sh <<'GUESTSUPER'
+#!/system/bin/sh
+# Guest kicker SUPERVISOR: restart-on-exit (see host supervisor note
+# in switch_to_gsi.sh). The worker never exits on a single failed
+# write; if it dies, it is restarted after 1 s and logged.
+LOG=/data/guest_watchdog_kicker.log
+while true; do
+    echo "$(date) guest supervisor: starting kicker worker" >> "$LOG"
+    /system/bin/sh /data/local/tmp/gsi_guest_kicker.sh
+    echo "$(date) guest supervisor: kicker worker exited, restarting in 1s" >> "$LOG"
+    sleep 1
+done
+GUESTSUPER
+    chmod 755 /data/local/tmp/gsi_guest_kicker.sh /data/local/tmp/gsi_guest_kicker_supervisor.sh 2>/dev/null || true
+    if [ -x /system/bin/setsid ]; then
+        setsid /system/bin/sh /data/local/tmp/gsi_guest_kicker_supervisor.sh < /dev/null > /dev/null 2>&1 &
+    else
+        /system/bin/sh /data/local/tmp/gsi_guest_kicker_supervisor.sh < /dev/null > /dev/null 2>&1 &
+    fi
+    echo "$!" > /data/guest_watchdog_kicker.pid 2>/dev/null || true
+    sleep 1
+    if guest_kicker_alive; then
+        echo "[Pivoted Root] Guest watchdog kicker STARTED (supervisor pid $(cat /data/guest_watchdog_kicker.pid 2>/dev/null || echo unknown), log /data/guest_watchdog_kicker.log)"
+    else
+        echo "[Pivoted Root] Guest watchdog kicker START_FAILED (host feeder is still the kicker; check /data/guest_watchdog_kicker.log)"
+    fi
+fi
+
 echo "[Pivoted Root] Launching guest Zygote & SystemServer via zygote_exec..."
 exec /data/zygote_exec

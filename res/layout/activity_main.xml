@@ -104,7 +104,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:text="A second Android system, run as a guest. Nothing is flashed — reboot always brings Samsung back."
+                android:text="A second Android system as a guest. Nothing is flashed — reboot brings Samsung back."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="13sp" />
         </LinearLayout>
@@ -275,7 +275,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="Opens the Root-My-Galaxy-Next page in your browser, where you can get the root app."
+                android:text="Opens the Root-My-Galaxy-Next page to get the root app."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="12sp" />
         </LinearLayout>
@@ -369,7 +369,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="EXT4 is the read-write default. EROFS is read-only and faster to read; EROFS presets are the 23.2 release, same as EXT4."
+                android:text="EXT4 is the read-write default. EROFS is read-only and faster to read."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="12sp" />
 
@@ -700,7 +700,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="Reports a picked file's format and size, or lists an archive's contents. Read-only."
+                android:text="Reports a picked file's format and size, or lists an archive. Read-only."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="12sp" />
 
@@ -847,7 +847,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="Pause keeps the partial file. Resume appears only for a real partial download."
+                android:text="Pause keeps the partial file. Resume shows only when a partial exists."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="12sp" />
 
@@ -1093,7 +1093,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="Built for LineageOS 23.2 only. Auto-on for 23.2 EXT4 presets, off for EROFS presets and custom images."
+                android:text="LineageOS 23.2 only. Auto-on for 23.2 EXT4 presets, off otherwise."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="13sp" />
 
@@ -1292,7 +1292,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="Removes ALL guest state: every slot's image + data, stage files, cached downloads. The phone itself is untouched."
+                android:text="Removes ALL guest state: every slot's image, data, and cached downloads. The phone itself is untouched."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="12sp" />
 
@@ -1868,7 +1868,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:text="Guest options: set above; they are passed to the boot scripts and take effect at the next boot."
+                android:text="Guest options are set above and take effect at the next boot."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="13sp" />
 
@@ -2061,8 +2061,8 @@
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:text="Activity Log"
-                    android:textColor="?attr/themeTextSecondary"
-                    android:textSize="13sp"
+                    android:textColor="?attr/themeTextPrimary"
+                    android:textSize="14sp"
                     android:fontFamily="sans-serif-medium" />
 
                 <TextView
@@ -2145,7 +2145,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="Save: writes log + system log to files. Share: sends the shown log. Experimental: kernel log, live streams, diagnostics, takeover log, RescueParty toggle, device info."
+                android:text="Save writes logs to files. Share sends the shown log. Experimental has kernel logs, live streams, and diagnostics."
                 android:textColor="?attr/themeTextSecondary"
                 android:textSize="12sp" />
 

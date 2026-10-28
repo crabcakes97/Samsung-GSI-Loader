@@ -43,11 +43,24 @@ if [ -f "$STAGE/gsi_flags.conf" ]; then
 fi
 echo "Patch flags: PATCH_FRAMEWORK=$PATCH_FRAMEWORK PATCH_PERMISSION_CONTROLLER=$PATCH_PERMISSION_CONTROLLER USE_LINEAGE_APEX_LIST=$USE_LINEAGE_APEX_LIST"
 
-echo "=== 1. Ensuring Watchdog Feeder is Active ==="
-if ! ps -ef | grep -v grep | grep -q "/dev/watchdog"; then
-    echo "Starting watchdog feeder..."
-    nohup $BB sh -c "while true; do echo -n 1 > /dev/watchdog 2>/dev/null; sleep 2; done" </dev/null >/dev/null 2>&1 &
+echo "=== 1. Watchdog feeder (deferred — NOT started here) ==="
+# 5.9.16: the host watchdog feeder is NO LONGER started here. Starting it
+# in master_prepare meant it ran BEFORE the kill spree in
+# switch_to_gsi.sh, so the kill spree could never be excluded as a
+# suspect class for a dead feeder. switch_to_gsi.sh now starts the
+# supervised feeder AFTER the kill spree (see that script's
+# "GSI WATCHDOG FEEDER" section), and return_to_oneui.sh kills it on
+# return. This step only records the pre-takeover watchdog-node state
+# for the log; it writes nothing to /dev/watchdog and starts nothing.
+# Host protection is NOT weakened by this deferral: the feeder starts
+# later in the same takeover, before the guest is launched, and the
+# host watchdogd (if any) is untouched throughout.
+if [ -e /dev/watchdog ]; then
+    echo "WATCHDOG_FEEDER_DEFERRED: /dev/watchdog present; feeder will start in switch_to_gsi.sh after the kill spree"
+else
+    echo "WATCHDOG_FEEDER_DEFERRED: WARNING /dev/watchdog MISSING at prepare time — feeder start in switch_to_gsi.sh will log this and keep retrying"
 fi
+ls -l /dev/watchdog* 2>/dev/null || echo "WATCHDOG_FEEDER_DEFERRED: no /dev/watchdog* nodes listed"
 
 echo "=== 2. Creating Loop Device Nodes ==="
 for i in $(seq 50 150); do
@@ -171,12 +184,15 @@ else
     echo "WARNING: FRAMEWORK_VERSION not provided — patch gating skipped, flags control patches"
 fi
 # 5.9.5-SCRIPTS-END
-# 5.9.5-INT-START: report fix flags honestly (no invented fixes).
-echo "Fix flags: IMS_FIX=$IMS_FIX DEV_OPTIONS_FIX=$DEV_OPTIONS_FIX CODEC_FIX=$CODEC_FIX"
-if [ "$DEV_OPTIONS_FIX" = "1" ]; then
-    echo "DEV_OPTIONS_FIX: no workaround available in this build — flag ignored, guest boots unchanged"
-fi
-# 5.9.5-INT-END
+# 5.9.16: dead-flag cleanup. The old block only echoed three fix
+# flags and explicitly ignored the dev-options one ("no workaround
+# available in this build"). The echoes and the ignored-flag branch
+# are removed so no log or UI can imply a dev-options / IMS / codec
+# fix exists. Scripts tolerate the env vars being absent: nothing
+# else in this file reads them (verified by grep), and unset vars
+# simply expand empty under POSIX sh here.
+# (No replacement fix is claimed: there is still no dev-options
+# workaround in this build.)
 # Framework patches: gated on PATCH_FRAMEWORK. Presence of the files in
 # $STAGE alone must NOT trigger a bind (the app always extracts them).
 # 5.9.13: a failed framework bind is FATAL (named error + abort), not

@@ -8,10 +8,7 @@
     <string name="status_root_granted">KernelSU Root Active</string>
     <string name="status_root_denied">Root Access Required</string>
 
-    <string name="btn_boot_lineage">Switch to GSI</string>
     <string name="btn_return_oneui">Return to One UI</string>
-    <string name="btn_download_lineage">Download &amp; Install</string>
-    <string name="btn_delete_lineage">Delete GSI Files</string>
     <string name="btn_create_slot">Create slot</string>
     <string name="btn_delete_slot">Delete slot</string>
     <string name="btn_duplicate_slot">Duplicate slot</string>
