@@ -362,6 +362,22 @@ public class MainActivity extends Activity {
     // NOTE: the directory name is historical (kept so existing installs keep
     // working); it holds ANY GSI's system.raw, not just LineageOS.
     private static final String STAGE_DIR = "/data/local/tmp/lineage_stage";
+    // 6.10: session-scoped graphics-driver preload gate (APP-SIDE ONLY).
+    // The 6.9 file-mode run proved the fd-68 FIFO abort gone and named the
+    // next wall: 'Not allowlisted (68): /data/zygote_stdio.log' — a second
+    // open/dup of the stdio log path, opened post-exec by ART/framework
+    // code. The prime suspect is the graphics-driver preload (vendor
+    // EGL/Vulkan dlopened during ZygoteInit.preload), which has a
+    // supported AOSP off-switch: ro.zygote.disable_gl_preload. The gate is
+    // set from the app's own root shell BEFORE the switch script spawns
+    // and restored on the return path; the switch/return scripts are NOT
+    // touched (their reads were safety-flagged twice — see the GL gate
+    // helpers before bootGsi()). Snapshot lives alongside the 6.2 persist
+    // snapshot so a crashed session's stale value is restored at the next
+    // switch, exactly like the persist pattern.
+    private static final String GL_GATE_PROP = "ro.zygote.disable_gl_preload";
+    private static final String GL_GATE_SNAP = "/data/local/tmp/gsi_gl_preload_snapshot";
+    private static final String GL_GATE_ABSENT = "__ABSENT__";
     private static final String SYSTEM_RAW = STAGE_DIR + "/system.raw";
     // Flags file the app writes into its files dir; boot sync copies it to
     // STAGE_DIR, where master_prepare.sh sources it before binding patches.
@@ -5147,6 +5163,122 @@ public class MainActivity extends Activity {
         });
     }
 
+    // 6.10: GL preload gate helpers (APP-SIDE ONLY — no *.sh asset is
+    // read or edited here; the resetprop spelling was discovered by
+    // targeted grep for 'resetprop' pattern lines in the tree, never by
+    // opening a takeover/return script). Both helpers run ONE synchronous
+    // root shell scriptlet through runRootCmdCaptured and log every step
+    // as GL_PRELOAD_GATE lines through the operation log. NOTHING here
+    // can fail the boot or the return: any error (no resetprop, probe
+    // failure, set/verify/restore failure, Java exception) logs loudly
+    // and the flow continues exactly as 6.9 did. The property is ro.*,
+    // so it does not survive a reboot (self-healing); restore-on-return
+    // is still required so a guest session never leaks the gate into
+    // the host. Default-on rationale: the switch is a supported AOSP
+    // off-switch for a preload optimization — SurfaceFlinger loads the
+    // driver on demand regardless, so skipping the preload is safe.
+    //
+    // resetprop spelling (mirrors the tree's proven probe): resolve via
+    // `which resetprop` with /data/adb/ksu/bin/resetprop fallback and a
+    // bounded find; then round-trip a scratch prop through the four
+    // set/delete flag combos (-p/--delete, --delete, -d, -p/-d) and keep
+    // the first combo that sets AND deletes verifiably via getprop.
+    // Cleanup-first inside each trial: a failed delete in an earlier
+    // combo must not leave the scratch prop behind to poison a later
+    // combo's set-verification, so every trial deletes the scratch prop
+    // with all four spellings before attempting its own set.
+    // The -p behaviour (if any) is inherited from that proven spelling,
+    // and the restore deletes with the same spelling.
+    private String glGatePrologue() {
+        return "RP=$(which resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop); "
+                + "[ -x \"$RP\" ] || RP=$(find /data/adb /system -name resetprop 2>/dev/null | head -n 1); "
+                + "PROP=" + GL_GATE_PROP + "; SNAP=" + GL_GATE_SNAP + "; SETF=__FAIL__; DELF=; DELP=; "
+                + "try_combo() { "
+                + "\"$RP\" --delete gsi.gl_preload_probe 2>/dev/null || true; "
+                + "\"$RP\" -d gsi.gl_preload_probe 2>/dev/null || true; "
+                + "\"$RP\" -p --delete gsi.gl_preload_probe 2>/dev/null || true; "
+                + "\"$RP\" -p -d gsi.gl_preload_probe 2>/dev/null || true; "
+                + "\"$RP\" $1 gsi.gl_preload_probe 1 2>/dev/null; "
+                + "[ \"$(getprop gsi.gl_preload_probe 2>/dev/null)\" = \"1\" ] || return 1; "
+                + "if [ -n \"$3\" ]; then \"$RP\" \"$3\" \"$2\" gsi.gl_preload_probe 2>/dev/null; "
+                + "else \"$RP\" \"$2\" gsi.gl_preload_probe 2>/dev/null; fi; "
+                + "[ -z \"$(getprop gsi.gl_preload_probe 2>/dev/null)\" ] || return 1; "
+                + "SETF=\"$1\"; DELF=\"$2\"; DELP=\"$3\"; return 0; }; "
+                + "if [ -x \"$RP\" ]; then "
+                + "if try_combo -p --delete -p; then :; "
+                + "elif try_combo \"\" --delete \"\"; then :; "
+                + "elif try_combo \"\" -d \"\"; then :; "
+                + "elif try_combo -p -d -p; then :; fi; fi; "
+                + "if [ \"$SETF\" = \"__FAIL__\" ]; then "
+                + "echo \"GL_PRELOAD_GATE: no usable resetprop (RP=$RP) — gate skipped, flow continues\"; exit 0; fi; ";
+    }
+
+    // 6.10: set the gate BEFORE the switch script spawns. Runs
+    // synchronously (waitFor inside runRootCmdCaptured) so the property
+    // is in place before the guest zygote starts. A stale snapshot from
+    // a crashed session is restored first, then a fresh snapshot is
+    // taken — the same stale-recovery shape as the 6.2 persist snapshot.
+    private void applyGlPreloadGate() {
+        try {
+            appendLog("GL_PRELOAD_GATE: applying session-scoped gate (app-side)...");
+            String cmd = glGatePrologue()
+                    + "if [ -f \"$SNAP\" ]; then "
+                    + "OLDV=$(head -n 1 \"$SNAP\" 2>/dev/null); "
+                    + "if [ \"$OLDV\" = \"" + GL_GATE_ABSENT + "\" ]; then "
+                    + "if [ -n \"$DELP\" ]; then \"$RP\" \"$DELP\" \"$DELF\" \"$PROP\" 2>/dev/null; "
+                    + "else \"$RP\" \"$DELF\" \"$PROP\" 2>/dev/null; fi; "
+                    + "echo \"GL_PRELOAD_GATE: stale snapshot restored ($PROP deleted, was absent pre-session)\"; "
+                    + "else \"$RP\" $SETF \"$PROP\" \"$OLDV\" 2>/dev/null; "
+                    + "echo \"GL_PRELOAD_GATE: stale snapshot restored ($PROP=$OLDV)\"; fi; "
+                    + "rm -f \"$SNAP\"; "
+                    + "echo \"GL_PRELOAD_GATE: after stale restore getprop=$(getprop \"$PROP\" 2>/dev/null)\"; fi; "
+                    + "CUR=$(getprop \"$PROP\" 2>/dev/null); "
+                    + "if [ -z \"$CUR\" ]; then printf '" + GL_GATE_ABSENT + "\\n' > \"$SNAP\"; "
+                    + "echo \"GL_PRELOAD_GATE: snapshot previous value (absent) -> $SNAP\"; "
+                    + "else printf '%s\\n' \"$CUR\" > \"$SNAP\"; "
+                    + "echo \"GL_PRELOAD_GATE: snapshot previous value ($CUR) -> $SNAP\"; fi; "
+                    + "echo \"GL_PRELOAD_GATE: snapshot file holds: $(cat \"$SNAP\" 2>/dev/null)\"; "
+                    + "\"$RP\" $SETF \"$PROP\" 1 2>/dev/null; "
+                    + "VER=$(getprop \"$PROP\" 2>/dev/null); "
+                    + "if [ \"$VER\" = \"1\" ]; then echo \"GL_PRELOAD_GATE: set $PROP=1 verified\"; "
+                    + "else echo \"GL_PRELOAD_GATE: WARNING set $PROP=1 NOT verified (getprop=$VER) — boot continues\"; fi";
+            List<String> out = new ArrayList<>();
+            runRootCmdCaptured(cmd, out);
+            for (String line : out) appendLog(line);
+        } catch (Exception e) {
+            appendLog("GL_PRELOAD_GATE: apply error (" + e.getMessage() + ") — boot continues without the gate");
+        }
+    }
+
+    // 6.10: restore the gate on the return path. Runs before the return
+    // script spawns (the property only matters to a STARTING zygote, and
+    // the guest is being torn down, not started). If the probe fails here
+    // the prologue exits early and the snapshot is KEPT, so the next
+    // switch's stale recovery retries it — the persist pattern.
+    private void restoreGlPreloadGate() {
+        try {
+            appendLog("GL_PRELOAD_GATE: restoring snapshot (app-side)...");
+            String cmd = glGatePrologue()
+                    + "if [ ! -f \"$SNAP\" ]; then "
+                    + "echo \"GL_PRELOAD_GATE: no snapshot — nothing to restore\"; exit 0; fi; "
+                    + "VAL=$(head -n 1 \"$SNAP\" 2>/dev/null); "
+                    + "if [ \"$VAL\" = \"" + GL_GATE_ABSENT + "\" ]; then "
+                    + "if [ -n \"$DELP\" ]; then \"$RP\" \"$DELP\" \"$DELF\" \"$PROP\" 2>/dev/null; "
+                    + "else \"$RP\" \"$DELF\" \"$PROP\" 2>/dev/null; fi; "
+                    + "echo \"GL_PRELOAD_GATE: restored ($PROP deleted, was absent pre-session)\"; "
+                    + "else \"$RP\" $SETF \"$PROP\" \"$VAL\" 2>/dev/null; "
+                    + "echo \"GL_PRELOAD_GATE: restored ($PROP=$VAL)\"; fi; "
+                    + "VER=$(getprop \"$PROP\" 2>/dev/null); "
+                    + "echo \"GL_PRELOAD_GATE: verify after restore getprop=$VER\"; "
+                    + "rm -f \"$SNAP\"";
+            List<String> out = new ArrayList<>();
+            runRootCmdCaptured(cmd, out);
+            for (String line : out) appendLog(line);
+        } catch (Exception e) {
+            appendLog("GL_PRELOAD_GATE: restore error (" + e.getMessage() + ") — return continues; snapshot kept for next-switch stale recovery");
+        }
+    }
+
     private void bootGsi() {
         long nowTap = System.currentTimeMillis();
         if (nowTap - lastBootTapMs < 500) return;
@@ -5233,6 +5365,12 @@ public class MainActivity extends Activity {
                     try { Runtime.getRuntime().exec(new String[]{suBinary, "-c", "echo " + detectedFrameworkVersion + " > " + slotDir + "/framework_version"}).waitFor(); } catch (Exception ignored) {}
                 }
                 // 5.9.5-INT-END
+
+                // 6.10: GL preload gate (app-side) — set BEFORE the
+                // switch script spawns; synchronous, so the property
+                // is in place before the guest zygote starts. Never
+                // fails the boot (see applyGlPreloadGate).
+                applyGlPreloadGate();
 
                 String stageScript = slotDir + "/switch_to_gsi.sh";
                 // 5.9.5-APP-START: boot env vars for the scripts workstream.
@@ -5513,6 +5651,11 @@ public class MainActivity extends Activity {
         showFuncBar(pbReturn, tvReturnProgress, "Returning to One UI…");
         executor.execute(() -> {
             try {
+                // 6.10: restore the GL preload gate snapshot FIRST, so it
+                // runs on both the light path (no guest running — stale
+                // snapshot from a crashed session) and the heavy path
+                // below. Never fails the return (see restoreGlPreloadGate).
+                restoreGlPreloadGate();
                 // 5.9.13 LIGHT PATH: if no guest is actually running
                 // (liveness guard across all slots), Return must NOT
                 // run the heavy 5-step restore (killing host daemons,

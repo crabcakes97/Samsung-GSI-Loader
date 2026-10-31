@@ -2,21 +2,23 @@
 
 Hot-switch between stock **One UI** and a **GSI of your choice** on a rooted Samsung phone, with no reflashing and no second partition. The GSI lives as a file under `/data/local/tmp`, boots as a container with its own zygote and system_server, and hands the screen back to One UI when you're done. Nothing is flashed, nothing touches the host system, and rebooting always lands you back on working One UI.
 
-Current version: **6.9**.
+Current version: **6.10**.
 
-> **Status note:** 6.9 is **build-verified only** until on-device testing
-> proves it. The LineageOS 23.2 guest reaches `forkSystemServer` on
-> device (SM-S741U1, S741U1UES2AZI7); the live wall is the fd-68
-> allowlist abort at the fork. Nothing below claims a booted home
-> screen — the on-device verdict comes from testing, not from
-> this file.
+> **Status note:** 6.10 is **build-verified only** until on-device testing
+> proves it. The RestlessOS (Android 17) guest reaches `forkSystemServer`
+> on device (SM-S741U1, S741U1UES2AZI7) with the 6.10 gate verified
+> engaged — and the fd-64 allowlist abort persists identically, which
+> exonerates the graphics-driver preload as the opener. The live wall
+> is still the fd allowlist abort at the fork. Nothing below claims a
+> booted home screen — the on-device verdict comes from testing, not
+> from this file.
 
-## What's new in 6.2–6.9
+## What's new in 6.2–6.10
 
 On-device status, stated plainly: the LineageOS 23.2 guest now reaches
 `forkSystemServer` — past preload, past the APEX generation skew, past
 the fd-table check. The live wall is a single abort at the system-server
-fork (see 6.7–6.9). Everything below is build-verified; on-device proof
+fork (see 6.7–6.10). Everything below is build-verified; on-device proof
 comes from testing, not from this file. Test device: Galaxy S26 FE
 (SM-S741U1), build S741U1UES2AZI7, kernel 6.6.127-android15-8.
 
@@ -70,6 +72,14 @@ comes from testing, not from this file. Test device: Galaxy S26 FE
   Pipe mode stays as the opt-in A/B alternative. One change only
   versus 6.8. If the fd-68 abort persists in file mode, the next
   experiment is the graphics-driver-preload gate.
+- **6.10 — App-side GL-preload gate (experiment).** The gate
+  (`ro.zygote.disable_gl_preload=1`, session-scoped, snapshot +
+  restore) is implemented in the app code only — no switch-script
+  changes — because reads of the switch script are safety-flagged in
+  this build environment. On-device result (RestlessOS, Android 17):
+  gate verified engaged, abort persists identically (fd 64). The
+  graphics-driver preload is exonerated as the opener; the opener of
+  the second handle to the stdio log file is still unidentified.
 
 ## What's new in 6.1
 
