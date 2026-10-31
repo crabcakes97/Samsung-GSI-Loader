@@ -63,8 +63,11 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
+import java.util.Locale;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -149,6 +152,7 @@ public class MainActivity extends Activity {
     private Button btnSlotColor;
     private TextView tvInfoStorage;
     private Button btnShareLog;
+    private Button btnPrevLogs; // 6.1: Previous Logs / Log History button
     private static final String PREF_COLOR_PREFIX = "slot_color_";
     // 5.9.5-INT-END
     private Button btnEditNote;
@@ -362,6 +366,17 @@ public class MainActivity extends Activity {
     // Flags file the app writes into its files dir; boot sync copies it to
     // STAGE_DIR, where master_prepare.sh sources it before binding patches.
     private static final String GSI_FLAGS_FILE = "gsi_flags.conf";
+    // 6.1: persistent per-session log history. One dir per app launch
+    // under the app files dir (survives reboots; only app-data-clear
+    // or uninstall removes it). Session dirs are named
+    // yyyyMMdd_HHmmss_SSS (lexically sortable = chronological), plus
+    // an optional "_recovered" suffix for orphan script logs.
+    private static final String LOG_HISTORY_DIRNAME = "log_history";
+    private static final int LOG_HISTORY_MAX_SESSIONS = 20;
+    private static final String LOG_HISTORY_APP_LOG = "app_log.txt";
+    private static final String LOG_HISTORY_OUTCOME = "outcome.txt";
+    private File logHistoryCurrentDir = null;
+    private boolean logHistoryFinalized = false;
 
     // LineageOS presets (kept for backwards compatibility with the original
     // app; they are no longer the only supported sources).
@@ -434,6 +449,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 6.1: start this launch's log-history session BEFORE any log
+        // line is written, so every appendLog line lands on disk.
+        // Recovery + pruning run on the background executor so a slow
+        // or missing su can never block launch.
+        startLogHistorySession();
+        executor.execute(() -> { recoverLogHistorySessions(); pruneLogHistory(); });
         applyTheme();
         setContentView(R.layout.activity_main);
 
@@ -995,6 +1016,11 @@ public class MainActivity extends Activity {
                     out.write((text + "\n").getBytes("UTF-8"));
                 }
             } catch (Exception ignored) {}
+            // 6.1: incremental session-log write (open-append-write-
+            // close per line, crash-safe). Swallowed separately so a
+            // failed session write never breaks the log view or the
+            // operation log above.
+            try { writeSessionAppLogLine(text); } catch (Exception ignored) {}
             if (tvConsoleLog != null) {
                 tvConsoleLog.append(text + "\n");
                 // 5.9.11: trim the log VIEW (bug fix). The log FILE was
@@ -1060,6 +1086,528 @@ public class MainActivity extends Activity {
             }
         });
     }
+
+
+    // ================= 6.1: persistent per-session log history =================
+    // Design (local-only, no upload, no script changes):
+    //  - The app log is written incrementally: every appendLog line is
+    //    appended AND closed to <session>/app_log.txt as it arrives, so
+    //    a mid-session reboot/panic still leaves every line up to the
+    //    crash on disk. A failed write is swallowed, never fatal.
+    //  - Script logs (takeover/inner/boot-diagnostics) live in
+    //    STAGE_DIR and are written by the engine scripts; they are
+    //    captured here in Java via the existing runRootCmd* helpers
+    //    (cat through su, written by the app so the files stay
+    //    app-owned and readable). Zero script changes in 6.1.
+    //  - Finalize path: a clean Return (RETURN_OK) snapshots the
+    //    current STAGE_DIR script logs into the current session dir
+    //    and writes outcome.txt. RETURN_PARTIAL is deliberately NOT a
+    //    clean end, so it does not finalize.
+    //  - Crash-recovery path: at next startup, STAGE_DIR script logs
+    //    not already preserved anywhere are attached to an unfinalized
+    //    session dir (or, if none exists, to a new "_recovered" dir)
+    //    and outcome.txt is written. Byte comparison across session
+    //    dirs means a cleanly finalized run is never duplicated on
+    //    the next launch, and files already present are never
+    //    overwritten by recovery.
+    //  - Without root, the app log is still recorded (files dir needs
+    //    no su); script logs are noted as unavailable, never blocking.
+    private File logHistoryRoot() {
+        try { return new File(getFilesDir(), LOG_HISTORY_DIRNAME); }
+        catch (Exception e) { return null; }
+    }
+
+    private String logHistoryStamp() {
+        try { return new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date()); }
+        catch (Exception e) { return String.valueOf(System.currentTimeMillis()); }
+    }
+
+    private void startLogHistorySession() {
+        try {
+            File root = logHistoryRoot();
+            if (root == null) return;
+            if (!root.exists()) root.mkdirs();
+            File dir = new File(root, logHistoryStamp());
+            if (dir.mkdirs() || dir.exists()) logHistoryCurrentDir = dir;
+            logHistoryFinalized = false;
+        } catch (Exception ignored) {}
+    }
+
+    // Open-append-write-close per line: the close is the flush, so a
+    // crash/reboot cannot lose buffered lines. Called from appendLog's
+    // main-thread runnable; volume is low (one line per log entry).
+    private void writeSessionAppLogLine(String text) {
+        try {
+            File dir = logHistoryCurrentDir;
+            if (dir == null || text == null) return;
+            if (!dir.exists()) dir.mkdirs();
+            try (OutputStream out = new FileOutputStream(new File(dir, LOG_HISTORY_APP_LOG), true)) {
+                out.write((text + "\n").getBytes("UTF-8"));
+                out.flush();
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private boolean rootProbeOk() {
+        try {
+            List<String> probe = new ArrayList<>();
+            int rc = runRootCmdCaptured("echo LOGHISTORY_OK", probe);
+            if (rc != 0) return false;
+            for (String l : probe) if ("LOGHISTORY_OK".equals(l.trim())) return true;
+            return false;
+        } catch (Exception e) { return false; }
+    }
+
+    private boolean stageFileExists(String path) {
+        try {
+            List<String> out = new ArrayList<>();
+            int rc = runRootCmdCaptured("[ -f \"" + path + "\" ] && echo PRESENT || echo ABSENT", out);
+            if (rc != 0) return false;
+            for (String l : out) if ("PRESENT".equals(l.trim())) return true;
+            return false;
+        } catch (Exception e) { return false; }
+    }
+
+    private byte[] readStageFileBytes(String path) {
+        try {
+            List<String> lines = new ArrayList<>();
+            runRootCmdCaptured("cat \"" + path + "\" 2>/dev/null", lines);
+            StringBuilder sb = new StringBuilder();
+            for (String l : lines) sb.append(l).append("\n");
+            return sb.toString().getBytes("UTF-8");
+        } catch (Exception e) { return new byte[0]; }
+    }
+
+    // Script-log sources, reusing the exact paths the diagnostics
+    // bundle export (5.9.16) already reads: slot + stage takeover
+    // logs, the inner log, and both boot-diagnostics logs. When the
+    // selected slot is Default, slotDir == STAGE_DIR, so duplicates
+    // are dropped by path.
+    // 6.4: the zygote launcher logs (zygote_exec.log /
+    // zygote_stderr.log) persist in slot data across sessions, so
+    // they are copied into session dirs too — slot-data path first,
+    // host /data fallback (a fallback entry must never overwrite a
+    // primary copy: see the "fallback" guard in copyStageLogsInto).
+    // 6.5: same treatment for the zygote stdio capture
+    // (zygote_stdio.log) and the cap-time logcat snapshot
+    // (logcat_cap.txt) — both persist in slot data across sessions.
+    // Each entry: {destName, devicePath, "" | "fallback"}.
+    private String[][] logHistoryStageSources(String slotDir) {
+        List<String[]> src = new ArrayList<>();
+        List<String> seen = new ArrayList<>();
+        String[][] cand = {
+            {"takeover_slot.log", slotDir + "/takeover_app.log", ""},
+            {"takeover_stage.log", STAGE_DIR + "/takeover_app.log", ""},
+            {"inner_takeover.log", slotDir + "/data/takeover.log", ""},
+            {"boot_diagnostics_slot.log", slotDir + "/boot_diagnostics.log", ""},
+            {"boot_diagnostics_stage.log", STAGE_DIR + "/boot_diagnostics.log", ""},
+            {"zygote_exec.log", slotDir + "/data/zygote_exec.log", ""},
+            {"zygote_exec.log", "/data/zygote_exec.log", "fallback"},
+            {"zygote_stderr.log", slotDir + "/data/zygote_stderr.log", ""},
+            {"zygote_stderr.log", "/data/zygote_stderr.log", "fallback"},
+            {"zygote_stdio.log", slotDir + "/data/zygote_stdio.log", ""},
+            {"zygote_stdio.log", "/data/zygote_stdio.log", "fallback"},
+            {"logcat_cap.txt", slotDir + "/data/logcat_cap.txt", ""},
+            {"logcat_cap.txt", "/data/logcat_cap.txt", "fallback"},
+        };
+        for (String[] c : cand) {
+            if (!seen.contains(c[1])) { seen.add(c[1]); src.add(c); }
+        }
+        return src.toArray(new String[0][]);
+    }
+
+    private byte[] readSessionFileBytes(File dir, String name) {
+        try {
+            File f = new File(dir, name);
+            if (!f.exists()) return null;
+            try (FileInputStream in = new FileInputStream(f)) {
+                byte[] buf = new byte[32768]; int n; java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                while ((n = in.read(buf)) != -1) baos.write(buf, 0, n);
+                return baos.toByteArray();
+            }
+        } catch (Exception e) { return null; }
+    }
+
+    private boolean alreadyPreservedAnywhere(File root, String fileName, byte[] content, File exceptDir) {
+        try {
+            if (root == null || !root.exists() || content == null) return false;
+            File[] dirs = root.listFiles();
+            if (dirs == null) return false;
+            for (File d : dirs) {
+                if (!d.isDirectory() || (exceptDir != null && d.getAbsolutePath().equals(exceptDir.getAbsolutePath()))) continue;
+                byte[] other = readSessionFileBytes(d, fileName);
+                if (other != null && Arrays.equals(other, content)) return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    // Copies the current STAGE_DIR script logs into destDir.
+    // Returns: number of files written, or -1 if root was unavailable
+    // (nothing written, caller notes it instead of failing).
+    // onlyMissing=true (recovery): never overwrite a file already in
+    // destDir, and never duplicate bytes already preserved in any
+    // other session dir. onlyMissing=false (finalize): write fresh.
+    private int copyStageLogsInto(File destDir, String slotDir, boolean onlyMissing) {
+        try {
+            if (destDir == null) return 0;
+            if (!rootProbeOk()) return -1;
+            if (!destDir.exists()) destDir.mkdirs();
+            File root = logHistoryRoot();
+            int written = 0;
+            for (String[] c : logHistoryStageSources(slotDir)) {
+                String fileName = c[0], path = c[1];
+                try {
+                    if (!stageFileExists(path)) continue;
+                    File dest = new File(destDir, fileName);
+                    // 6.4: a "fallback" source (host /data) must never
+                    // overwrite the primary (slot-data) copy.
+                    if (c.length > 2 && "fallback".equals(c[2]) && dest.exists()) continue;
+                    if (onlyMissing && dest.exists()) continue;
+                    byte[] content = readStageFileBytes(path);
+                    if (content.length == 0) continue;
+                    if (onlyMissing && alreadyPreservedAnywhere(root, fileName, content, destDir)) continue;
+                    try (OutputStream out = new FileOutputStream(dest, false)) { out.write(content); out.flush(); }
+                    written++;
+                } catch (Exception ignored) {}
+            }
+            return written;
+        } catch (Exception e) { return 0; }
+    }
+
+    private void writeOutcomeFile(File dir, String outcome) {
+        try {
+            if (dir == null) return;
+            if (!dir.exists()) dir.mkdirs();
+            String text = outcome + "\nSaved: " + new Date().toString() + "\n";
+            try (OutputStream out = new FileOutputStream(new File(dir, LOG_HISTORY_OUTCOME), false)) {
+                out.write(text.getBytes("UTF-8")); out.flush();
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private boolean isSessionDirName(String name) {
+        return name != null && name.matches("\\d{8}_\\d{6}(_\\d{3})?(_recovered)?");
+    }
+
+    private File[] listSessionDirs() {
+        try {
+            File root = logHistoryRoot();
+            if (root == null || !root.exists()) return new File[0];
+            File[] all = root.listFiles();
+            if (all == null) return new File[0];
+            List<File> dirs = new ArrayList<>();
+            for (File d : all) if (d.isDirectory() && isSessionDirName(d.getName())) dirs.add(d);
+            Collections.sort(dirs, (a, b) -> a.getName().compareTo(b.getName()));
+            return dirs.toArray(new File[0]);
+        } catch (Exception e) { return new File[0]; }
+    }
+
+    // Recovery reads the SAVED slot straight from prefs rather than
+    // the selectedSlot field: recovery runs on the background executor
+    // concurrently with onCreate, and restoreGsiPrefs() may not have
+    // run yet when it starts. Reading prefs here removes that race.
+    private String logHistoryRecoverySlotDir() {
+        try {
+            String saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_SLOT, DEFAULT_SLOT);
+            return slotDir(isValidSlotName(saved) ? saved : DEFAULT_SLOT);
+        } catch (Exception e) { return STAGE_DIR; }
+    }
+
+    // Crash-recovery at startup (background thread): attach any
+    // STAGE_DIR script logs not already preserved to the newest
+    // unfinalized session dir, or to a new "_recovered" dir if every
+    // session is already finalized. Unfinalized = no outcome.txt.
+    // Never overwrites, never duplicates, never blocks launch.
+    private void recoverLogHistorySessions() {
+        try {
+            File root = logHistoryRoot();
+            if (root == null) return;
+            File[] dirs = listSessionDirs();
+            File target = null;
+            for (int i = dirs.length - 1; i >= 0; i--) {
+                File d = dirs[i];
+                if (logHistoryCurrentDir != null && d.getAbsolutePath().equals(logHistoryCurrentDir.getAbsolutePath())) continue;
+                if (!new File(d, LOG_HISTORY_OUTCOME).exists()) { target = d; break; }
+            }
+            boolean createdRecovered = false;
+            if (target == null) {
+                // Orphan case only: is there anything new to preserve?
+                int probe = copyStageLogsIntoProbeOnly();
+                if (probe <= 0) return;
+                target = new File(root, logHistoryStamp() + "_recovered");
+                if (!target.mkdirs() && !target.exists()) return;
+                createdRecovered = true;
+            }
+            String slotDir = logHistoryRecoverySlotDir();
+            int written = copyStageLogsInto(target, slotDir, true);
+            if (written == -1) {
+                writeOutcomeFile(target, "unfinalized (app closed / reboot / crash) — script logs unavailable (no root at recovery time); app log preserved");
+            } else if (written > 0 || createdRecovered) {
+                writeOutcomeFile(target, "unfinalized (app closed / reboot / crash) — script logs recovered at next launch (" + written + " file(s))");
+            }
+            // written == 0 with an existing unfinalized dir and nothing
+            // new: leave it unfinalized; a later launch may still
+            // recover script logs once a new boot writes them.
+        } catch (Exception ignored) {}
+    }
+
+    // Dry-run helper for the orphan case: counts STAGE_DIR script logs
+    // that exist and are not already preserved anywhere, without
+    // writing anything. Returns -1 if root is unavailable.
+    private int copyStageLogsIntoProbeOnly() {
+        try {
+            if (!rootProbeOk()) return -1;
+            File root = logHistoryRoot();
+            int fresh = 0;
+            String probeSlotDir = logHistoryRecoverySlotDir();
+            for (String[] c : logHistoryStageSources(probeSlotDir)) {
+                try {
+                    // 6.4: a "fallback" source counts as fresh only when
+                    // the primary (slot-data) file does not exist.
+                    if (c.length > 2 && "fallback".equals(c[2]) && stageFileExists(probeSlotDir + "/data/" + c[0])) continue;
+                    if (!stageFileExists(c[1])) continue;
+                    byte[] content = readStageFileBytes(c[1]);
+                    if (content.length == 0) continue;
+                    if (!alreadyPreservedAnywhere(root, c[0], content, null)) fresh++;
+                } catch (Exception ignored) {}
+            }
+            return fresh;
+        } catch (Exception e) { return 0; }
+    }
+
+    // Cap: keep the last 20 session dirs (by dir-name timestamp);
+    // prune older automatically at startup. Session dirs only — the
+    // name pattern guard means nothing else under files/ is touched.
+    private void pruneLogHistory() {
+        try {
+            File[] dirs = listSessionDirs();
+            if (dirs.length <= LOG_HISTORY_MAX_SESSIONS) return;
+            int excess = dirs.length - LOG_HISTORY_MAX_SESSIONS;
+            for (int i = 0; i < excess && i < dirs.length; i++) {
+                File d = dirs[i];
+                if (logHistoryCurrentDir != null && d.getAbsolutePath().equals(logHistoryCurrentDir.getAbsolutePath())) continue;
+                deleteDirRecursive(d);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void deleteDirRecursive(File f) {
+        try {
+            if (f == null || !f.exists()) return;
+            if (f.isDirectory()) {
+                File[] kids = f.listFiles();
+                if (kids != null) for (File k : kids) deleteDirRecursive(k);
+            }
+            f.delete();
+        } catch (Exception ignored) {}
+    }
+
+    // Finalize path: clean Return (RETURN_OK only). Snapshots the
+    // current STAGE_DIR script logs into the current session dir and
+    // writes outcome.txt. Idempotent; runs on the background executor.
+    private void finalizeLogHistorySession(final String outcome) {
+        final File dir = logHistoryCurrentDir;
+        if (dir == null || logHistoryFinalized) return;
+        logHistoryFinalized = true;
+        executor.execute(() -> {
+            try {
+                int written = copyStageLogsInto(dir, currentSlotDir(), false);
+                if (written == -1) writeOutcomeFile(dir, outcome + " — script logs unavailable (no root at return time); app log preserved");
+                else writeOutcomeFile(dir, outcome + " (" + written + " script log file(s) saved)");
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private String logHistoryDisplayStamp(String dirName) {
+        try {
+            String base = dirName.replace("_recovered", "");
+            // yyyyMMdd_HHmmss_SSS -> yyyy-MM-dd HH:mm:ss
+            if (base.length() >= 15) {
+                return base.substring(0, 4) + "-" + base.substring(4, 6) + "-" + base.substring(6, 8)
+                    + " " + base.substring(9, 11) + ":" + base.substring(11, 13) + ":" + base.substring(13, 15)
+                    + (dirName.endsWith("_recovered") ? " (recovered)" : "");
+            }
+        } catch (Exception ignored) {}
+        return dirName;
+    }
+
+    private String logHistorySessionSummary(File dir) {
+        try {
+            long bytes = 0; long lines = 0;
+            File[] files = dir.listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    if (!f.isFile()) continue;
+                    bytes += f.length();
+                    if (LOG_HISTORY_APP_LOG.equals(f.getName())) {
+                        try (FileInputStream in = new FileInputStream(f)) {
+                            byte[] buf = new byte[32768]; int n;
+                            while ((n = in.read(buf)) != -1) for (int i = 0; i < n; i++) if (buf[i] == '\n') lines++;
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+            String outcome = "(unfinalized)";
+            try {
+                File oc = new File(dir, LOG_HISTORY_OUTCOME);
+                if (oc.exists()) {
+                    try (FileInputStream in = new FileInputStream(oc)) {
+                        byte[] buf = new byte[4096]; int n = in.read(buf);
+                        if (n > 0) {
+                            String first = new String(buf, 0, n, "UTF-8").split("\n")[0];
+                            if (!first.trim().isEmpty()) outcome = first.trim();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+            String cur = (logHistoryCurrentDir != null && dir.getAbsolutePath().equals(logHistoryCurrentDir.getAbsolutePath())) ? " (current)" : "";
+            return logHistoryDisplayStamp(dir.getName()) + cur + " — " + outcome + " — " + bytes + " bytes" + (lines > 0 ? ", " + lines + " app-log lines" : "");
+        } catch (Exception e) { return dir.getName(); }
+    }
+
+    // Previous Logs / Log History view: lists saved sessions
+    // newest-first (timestamp + outcome + size/line count); tapping
+    // one opens it READ-ONLY as one combined scrollable view with
+    // per-source section headers. Live log, save-logs, share-log and
+    // the diagnostics bundle export are untouched.
+    private void showPreviousLogs() {
+        executor.execute(() -> {
+            try {
+                final File[] dirs = listSessionDirs();
+                final String[] labels = new String[dirs.length];
+                for (int i = 0; i < dirs.length; i++) labels[i] = logHistorySessionSummary(dirs[dirs.length - 1 - i]);
+                final File[] newestFirst = new File[dirs.length];
+                for (int i = 0; i < dirs.length; i++) newestFirst[i] = dirs[dirs.length - 1 - i];
+                mainHandler.post(() -> {
+                    try {
+                        if (newestFirst.length == 0) {
+                            new AlertDialog.Builder(MainActivity.this)
+                                .setTitle("Previous logs")
+                                .setMessage("No previous sessions saved yet.\n\nEach app launch saves its log here automatically; a session appears once the app has logged anything. Script logs (takeover / inner / boot diagnostics) are added on a clean Return, or recovered at the next launch after a reboot/crash.")
+                                .setPositiveButton("OK", null).show();
+                            return;
+                        }
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("Previous logs")
+                            .setItems(labels, (dlg, which) -> openPreviousLogSession(newestFirst[which]))
+                            .setPositiveButton("Close", null).show();
+                    } catch (Exception ignored) {}
+                });
+            } catch (Exception e) {
+                appendLog("Previous logs failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void openPreviousLogSession(final File dir) {
+        executor.execute(() -> {
+            try {
+                String[] order = {LOG_HISTORY_OUTCOME, LOG_HISTORY_APP_LOG, "takeover_slot.log", "takeover_stage.log",
+                    "inner_takeover.log", "boot_diagnostics_slot.log", "boot_diagnostics_stage.log",
+                    "zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log", "logcat_cap.txt"};
+                StringBuilder sb = new StringBuilder();
+                sb.append("Session: ").append(logHistoryDisplayStamp(dir.getName())).append("\n");
+                sb.append("Read-only — this is a saved copy; it cannot be edited.\n");
+                for (String name : order) {
+                    File f = new File(dir, name);
+                    if (!f.exists()) continue;
+                    sb.append("\n===== ").append(name).append(" =====\n");
+                    try (FileInputStream in = new FileInputStream(f)) {
+                        byte[] buf = new byte[32768]; int n; int total = 0;
+                        while ((n = in.read(buf)) != -1) {
+                            if (total + n > 300000) { sb.append("\n… (truncated at 300,000 chars for this file)\n"); break; }
+                            sb.append(new String(buf, 0, n, "UTF-8")); total += n;
+                        }
+                    } catch (Exception e) { sb.append("(read failed: ").append(e.getMessage()).append(")\n"); }
+                }
+                // Any other files in the session dir (future-proofing).
+                File[] extra = dir.listFiles();
+                if (extra != null) {
+                    for (File f : extra) {
+                        boolean known = false;
+                        for (String k : order) if (k.equals(f.getName())) { known = true; break; }
+                        if (!known && f.isFile()) sb.append("\n===== ").append(f.getName()).append(" =====\n(present, ").append(f.length()).append(" bytes)\n");
+                    }
+                }
+                // 6.4/6.5: zygote launcher logs persist in slot data
+                // across sessions. If this session dir has no saved
+                // copy (recorded before 6.4, or the session ended
+                // before finalize/recovery ran), read them live so
+                // the view still shows them. Labeled as a live read:
+                // they may be from a later session than the one
+                // being viewed.
+                if (!new File(dir, "zygote_exec.log").exists() || !new File(dir, "zygote_stderr.log").exists()
+                        || !new File(dir, "zygote_stdio.log").exists() || !new File(dir, "logcat_cap.txt").exists()) {
+                    if (rootProbeOk()) {
+                        String liveSlotDir = currentSlotDir();
+                        if (!new File(dir, "zygote_exec.log").exists())
+                            appendLiveZygoteLog(sb, "zygote_exec.log", liveSlotDir + "/data/zygote_exec.log");
+                        if (!new File(dir, "zygote_stderr.log").exists())
+                            appendLiveZygoteLog(sb, "zygote_stderr.log", liveSlotDir + "/data/zygote_stderr.log");
+                        if (!new File(dir, "zygote_stdio.log").exists())
+                            appendLiveZygoteLog(sb, "zygote_stdio.log", liveSlotDir + "/data/zygote_stdio.log");
+                        if (!new File(dir, "logcat_cap.txt").exists())
+                            appendLiveZygoteLog(sb, "logcat_cap.txt", liveSlotDir + "/data/logcat_cap.txt");
+                    }
+                }
+                final String text = sb.toString();
+                final String title = "Session " + logHistoryDisplayStamp(dir.getName());
+                mainHandler.post(() -> {
+                    try {
+                        TextView tv = new TextView(MainActivity.this);
+                        tv.setText(text);
+                        tv.setTextSize(11);
+                        tv.setPadding(32, 24, 32, 24);
+                        ScrollView sv = new ScrollView(MainActivity.this);
+                        sv.addView(tv);
+                        new AlertDialog.Builder(MainActivity.this).setTitle(title).setView(sv)
+                            .setPositiveButton("Close", null)
+                            .setNeutralButton("Share", (d, w) -> {
+                                // 6.3: Previous Logs had no Share at all.
+                                // Export this session to Downloads and
+                                // share the file; fall back to text.
+                                executor.execute(() -> {
+                                    android.net.Uri uri = exportTextToDownloads("gsi-logs-" + dir.getName() + ".txt", text);
+                                    final android.net.Uri fUri = uri;
+                                    mainHandler.post(() -> shareDownloadedText(fUri, "GSI Loader session log", text));
+                                });
+                            }).show();
+                    } catch (Exception ignored) {}
+                });
+            } catch (Exception e) {
+                appendLog("Could not open saved session: " + e.getMessage());
+            }
+        });
+    }
+
+    // 6.4: live-read fallback for one zygote launcher log, used by
+    // the Previous Logs view when the session dir has no saved copy.
+    // 6.5 reuses it for zygote_stdio.log and logcat_cap.txt.
+    // Slot-data path first, host /data fallback; a loud marker line
+    // names the file found, or its absence. Runs on the background
+    // executor (callers already hold it); bounded to the last 200
+    // lines so a long-lived zygote_exec.log cannot flood the view.
+    private void appendLiveZygoteLog(StringBuilder sb, String fileName, String slotDataPath) {
+        try {
+            String found = null;
+            if (stageFileExists(slotDataPath)) found = slotDataPath;
+            else if (stageFileExists("/data/" + fileName)) found = "/data/" + fileName;
+            sb.append("\n===== ").append(fileName).append(" (live read — current slot data; may be from a later session) =====\n");
+            if (found == null) {
+                sb.append("(").append(fileName).append(" NOT FOUND in slot data or /data — zygote never wrote it, or no root right now)\n");
+                return;
+            }
+            sb.append("(found: ").append(found).append(")\n");
+            List<String> lines = new ArrayList<>();
+            runRootCmdCaptured("tail -200 \"" + found + "\" 2>/dev/null", lines);
+            if (lines.isEmpty()) sb.append("(empty)\n");
+            else for (String l : lines) sb.append(l).append("\n");
+        } catch (Exception e) {
+            sb.append("(live read failed: ").append(e.getMessage()).append(")\n");
+        }
+    }
+    // ================= 6.1 end =================
 
     // Runs a root shell command with stdout+stderr merged and continuously drained.
     // Process.waitFor() deadlocks forever if the child fills its stdout/stderr pipe
@@ -1760,6 +2308,79 @@ public class MainActivity extends Activity {
             appendLog("Share log failed: " + e.getMessage());
         }
     }
+    // 6.3: Downloads export. Saved logs/bundles used to land only in
+    // app-private folders (getFilesDir / Android/data) that are not
+    // reachable on-device without a PC, and Previous Logs had no Share
+    // at all — diagnosis was blocked. These helpers write to the
+    // shared Downloads folder (Download/GSI Loader/) via MediaStore,
+    // which any file manager can open and which can be shared as a
+    // content Uri without a FileProvider. No permission is needed on
+    // API 29+ for the app's own files. Uri-returning helpers return
+    // null on failure; callers fall back to sharing text.
+    private android.net.Uri insertDownloadsEntry(String fileName, String mimeType) {
+        try {
+            android.content.ContentValues values = new android.content.ContentValues();
+            values.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+            values.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType);
+            values.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/GSI Loader");
+            return getContentResolver().insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        } catch (Exception e) {
+            appendLog("Downloads export failed (insert): " + e.getMessage());
+            return null;
+        }
+    }
+    private android.net.Uri exportTextToDownloads(String fileName, String text) {
+        try {
+            android.net.Uri uri = insertDownloadsEntry(fileName, "text/plain");
+            if (uri == null) return null;
+            try (java.io.OutputStream out = getContentResolver().openOutputStream(uri)) {
+                if (out == null) return null;
+                out.write(text.getBytes("UTF-8"));
+            }
+            return uri;
+        } catch (Exception e) {
+            appendLog("Downloads export failed: " + e.getMessage());
+            return null;
+        }
+    }
+    private android.net.Uri exportFileToDownloads(String fileName, java.io.File src) {
+        try {
+            if (src == null || !src.exists()) return null;
+            android.net.Uri uri = insertDownloadsEntry(fileName, "text/plain");
+            if (uri == null) return null;
+            try (java.io.FileInputStream in = new java.io.FileInputStream(src);
+                 java.io.OutputStream out = getContentResolver().openOutputStream(uri)) {
+                if (out == null) return null;
+                byte[] buf = new byte[32768];
+                int n;
+                while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+            }
+            return uri;
+        } catch (Exception e) {
+            appendLog("Downloads export failed: " + e.getMessage());
+            return null;
+        }
+    }
+    // 6.3: share a Downloads file Uri, falling back to truncated text
+    // when the export failed, so Share always offers something.
+    private void shareDownloadedText(android.net.Uri uri, String subject, String fallbackText) {
+        try {
+            android.content.Intent it = new android.content.Intent(android.content.Intent.ACTION_SEND);
+            it.setType("text/plain");
+            if (uri != null) {
+                it.putExtra(android.content.Intent.EXTRA_STREAM, uri);
+                it.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } else {
+                String t = (fallbackText != null) ? fallbackText : "";
+                if (t.length() > 400000) t = t.substring(0, 400000) + "\n… (truncated for sharing; the full log stayed in the app)";
+                it.putExtra(android.content.Intent.EXTRA_TEXT, t);
+            }
+            it.putExtra(android.content.Intent.EXTRA_SUBJECT, subject);
+            startActivity(android.content.Intent.createChooser(it, "Share log"));
+        } catch (Exception e) {
+            appendLog("Share failed: " + e.getMessage());
+        }
+    }
     private int slotColorForSlot(String slot) {
         try { return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(PREF_COLOR_PREFIX + slot, 0xFF888888); } catch (Exception e) { return 0xFF888888; }
     }
@@ -2001,7 +2622,13 @@ public class MainActivity extends Activity {
                 // 5.9.13: boot diagnostics (watchdog-timeout bundle)
                 // and pstore check (post-reboot panic verdict). Both
                 // are synced to the slot dir by bootGsi's sync loop.
-                "boot_diagnostics.sh", "pstore_check.sh"
+                "boot_diagnostics.sh", "pstore_check.sh",
+                // 6.0: AnyGSI port assets — native ioctl feeder (P1),
+                // host-layout backup (P11), synthetic android.xr
+                // aconfig data (P4). All synced to the slot dir by
+                // the same sync loop; scripts are always copied.
+                "watchdog_feeder", "backup_host.sh",
+                "xr.flag.map", "xr.info", "xr.package.map", "xr.val"
                 // 5.9.5-INT-END
             };
             File filesDir = getFilesDir();
@@ -2290,6 +2917,10 @@ public class MainActivity extends Activity {
                                 noteLastBootOutcome(returningSlot, home ? "home" : "returned");
                                 returningSlot = null;
                             }
+                            // 6.1: clean return finalizes this launch's
+                            // log-history session (script logs + outcome),
+                            // whether or not a returning slot was recorded.
+                            finalizeLogHistorySession(isReboot ? "returned-reboot" : "returned");
                             hideFuncBar(bar, label);
                             return;
                         } else if (line.contains("RETURN_PARTIAL")) {
@@ -2688,7 +3319,9 @@ public class MainActivity extends Activity {
     // 5.9.16: one-tap diagnostics bundle export (Experimental
     // menu). A single file holding: the app operation log, the
     // takeover log (slot + stage), the inner takeover log, the
-    // boot_diagnostics bundle, a pstore excerpt, and device info.
+    // boot_diagnostics bundle, the zygote launcher logs (6.4),
+    // the zygote stdio capture + cap-time logcat snapshot (6.5),
+    // a pstore excerpt, and device info.
     // Root-only sections are included only when temp root is
     // active; without root the bundle still exports the app log +
     // device info and says which sections were skipped. NOTE: the
@@ -2735,6 +3368,10 @@ public class MainActivity extends Activity {
                         {"takeover log (stage takeover_app.log, last 300 lines)", "tail -300 \"" + STAGE_DIR + "/takeover_app.log\" 2>/dev/null"},
                         {"inner takeover log (data/takeover.log, last 300 lines)", "tail -300 \"" + dir + "/data/takeover.log\" 2>/dev/null"},
                         {"boot diagnostics bundle", "cat \"" + dir + "/boot_diagnostics.log\" 2>/dev/null; cat \"" + STAGE_DIR + "/boot_diagnostics.log\" 2>/dev/null"},
+                        {"zygote launcher log (zygote_exec.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_exec.log\" ]; then echo \"(found: " + dir + "/data/zygote_exec.log)\"; tail -200 \"" + dir + "/data/zygote_exec.log\"; elif [ -f /data/zygote_exec.log ]; then echo \"(found: /data/zygote_exec.log)\"; tail -200 /data/zygote_exec.log; else echo \"(zygote_exec.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        {"zygote launcher errors (zygote_stderr.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stderr.log\" ]; then echo \"(found: " + dir + "/data/zygote_stderr.log)\"; tail -200 \"" + dir + "/data/zygote_stderr.log\"; elif [ -f /data/zygote_stderr.log ]; then echo \"(found: /data/zygote_stderr.log)\"; tail -200 /data/zygote_stderr.log; else echo \"(zygote_stderr.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        {"zygote stdio capture (zygote_stdio.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stdio.log\" ]; then echo \"(found: " + dir + "/data/zygote_stdio.log)\"; tail -200 \"" + dir + "/data/zygote_stdio.log\"; elif [ -f /data/zygote_stdio.log ]; then echo \"(found: /data/zygote_stdio.log)\"; tail -200 /data/zygote_stdio.log; else echo \"(zygote_stdio.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        {"cap-time logcat snapshot (logcat_cap.txt — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/logcat_cap.txt\" ]; then echo \"(found: " + dir + "/data/logcat_cap.txt)\"; tail -200 \"" + dir + "/data/logcat_cap.txt\"; elif [ -f /data/logcat_cap.txt ]; then echo \"(found: /data/logcat_cap.txt)\"; tail -200 /data/logcat_cap.txt; else echo \"(logcat_cap.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"pstore excerpt (console/dmesg ramoops, head 100 lines each — direct read, NOT pstore_check.sh)", "for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do [ -f \"$f\" ] && { echo \"== $f\"; head -100 \"$f\" 2>/dev/null; }; done"},
                     };
                     for (String[] sec : sections) {
@@ -2746,21 +3383,27 @@ public class MainActivity extends Activity {
                     }
                 } else {
                     sb.append("\n===== root sections skipped (no temp root) =====\n");
-                    sb.append("Takeover log, inner log, boot diagnostics and pstore excerpt need temp root — re-apply temp root and export again for the full bundle.\n");
+                    sb.append("Takeover log, inner log, boot diagnostics, zygote logs and pstore excerpt need temp root — re-apply temp root and export again for the full bundle.\n");
                 }
                 File logDir = new File(getExternalFilesDir(null), "logs");
                 if (!logDir.exists()) logDir.mkdirs();
-                File out = new File(logDir, "diagnostics_bundle_" + System.currentTimeMillis() + ".txt");
+                long bundleTs = System.currentTimeMillis();
+                File out = new File(logDir, "diagnostics_bundle_" + bundleTs + ".txt");
                 try (OutputStream o = new FileOutputStream(out)) {
                     o.write(sb.toString().getBytes("UTF-8"));
                 }
+                // 6.3: also export straight to Downloads (user-reachable).
+                final String dlName = "diagnostics_bundle_" + bundleTs + ".txt";
+                final android.net.Uri dlUri = exportTextToDownloads(dlName, sb.toString());
                 final String path = out.getAbsolutePath();
                 final int bytes = sb.length();
-                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + pstore excerpt + device info). Share this file when reporting a failed boot.");
+                final String bundleText = sb.toString();
+                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + pstore excerpt + device info). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
                 mainHandler.post(() -> new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Diagnostics bundle exported")
-                        .setMessage("Saved to:\n" + path + "\n\nIt holds the app log, takeover log, inner log, boot diagnostics, pstore excerpt and device info in one file — share it when reporting a failed boot.")
-                        .setPositiveButton("OK", null).show());
+                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, pstore excerpt and device info in one file — share it when reporting a failed boot.")
+                        .setPositiveButton("OK", null)
+                        .setNeutralButton("Share", (d, w) -> shareDownloadedText(dlUri, "GSI Loader diagnostics bundle", bundleText)).show());
             } catch (Exception e) {
                 appendLog("Diagnostics bundle export failed: " + e.getMessage());
             }
@@ -2790,7 +3433,7 @@ public class MainActivity extends Activity {
             + "ONE UI HOME SCREEN SAFETY\n"
             + "Saves a copy of Samsung's home screen layout (icons and widgets) so a guest session or a reboot cannot lose it. Restore puts that copy back. Backup markers show when the last backup was taken.\n\n"
             + "LOG\n"
-            + "Every action the app takes is written to the Activity Log in plain words, and the same log is saved on the phone. Save logs writes this log plus the phone's system log to the app's files folder and shows you the exact file paths. Share log sends the log shown above to another app. Note: this shows the Samsung-side log, not a log from inside the guest. Experimental (its own button under the log) holds the fun buttons: kernel log from dmesg, live error log and live kernel log streams, boot diagnostics on demand, panic-record check, guest processes, and RescueParty status. In 5.9.16 it is a themed panel of its own with thirteen tools, adding a takeover-log tail, a full chatty live system log, a RescueParty on/off toggle, a device info dump that works without root, and a one-tap diagnostics bundle export (app log + takeover log + inner log + boot diagnostics + pstore excerpt + device info in a single file). The log follows new lines only while you are already watching the tail — scroll up to read back and it stays put until you scroll back down.\n\n"
+            + "Every action the app takes is written to the Activity Log in plain words, and the same log is saved on the phone. Save logs writes this log plus the phone's system log to the Downloads folder (Download/GSI Loader/) and shows you the exact file names. Share log sends the log shown above to another app. Previous logs can be shared from inside each saved session. Note: this shows the Samsung-side log, not a log from inside the guest. Experimental (its own button under the log) holds the fun buttons: kernel log from dmesg, live error log and live kernel log streams, boot diagnostics on demand, panic-record check, guest processes, and RescueParty status. In 5.9.16 it is a themed panel of its own with thirteen tools, adding a takeover-log tail, a full chatty live system log, a RescueParty on/off toggle, a device info dump that works without root, and a one-tap diagnostics bundle export (app log + takeover log + inner log + boot diagnostics + pstore excerpt + device info in a single file). The log follows new lines only while you are already watching the tail — scroll up to read back and it stays put until you scroll back down.\n\n"
             + "WIPE AFTER INSTALL\n"
             + "Ticking 'Wipe guest userdata after install' deletes the slot's guest data right after a good install, so the next boot starts fresh setup. The system image is kept. Installs already wipe before installing (except when resuming a download), so the box mainly guarantees a clean first boot in the resume case. 'Wipe slot data' does the same wipe on demand, per slot.\n\n"
             + "PROGRESS BARS\n"
@@ -5038,6 +5681,7 @@ public class MainActivity extends Activity {
         btnResumeDownload = findViewById(R.id.btn_resume_download);
         cbLogAutoscroll = findViewById(R.id.cb_log_autoscroll);
         btnViewLogcat = findViewById(R.id.btn_view_logcat);
+        btnPrevLogs = findViewById(R.id.btn_prev_logs); // 6.1
         // 5.9.5-INT-START
         btnShareLog = findViewById(R.id.btn_share_log);
         btnExperimental = findViewById(R.id.btn_experimental);
@@ -5097,6 +5741,7 @@ public class MainActivity extends Activity {
         if (btnVerifyBackup != null) btnVerifyBackup.setOnClickListener(v -> verifyBackup());
         if (btnPreflight != null) btnPreflight.setOnClickListener(v -> runPreflight());
         if (btnViewLogcat != null) btnViewLogcat.setOnClickListener(v -> saveLogcatAndShow());
+        if (btnPrevLogs != null) btnPrevLogs.setOnClickListener(v -> showPreviousLogs()); // 6.1
         // 5.9.5-INT-START
         if (btnShareLog != null) btnShareLog.setOnClickListener(v -> shareLog());
         if (btnExperimental != null) btnExperimental.setOnClickListener(v -> showExperimentalMenu());
@@ -5901,6 +6546,11 @@ public class MainActivity extends Activity {
                     }
                 }
             } catch (Exception ignored) {}
+            // 6.3: mirror both files to Downloads (user-reachable) too —
+            // the app-private copies above are not reachable on-device.
+            long dlTs = System.currentTimeMillis();
+            android.net.Uri dlLogcat = exportFileToDownloads("logcat_" + dlTs + ".txt", logcatFile);
+            android.net.Uri dlOp = exportFileToDownloads("operation_log_" + dlTs + ".txt", opCopy);
             StringBuilder guest = new StringBuilder();
             if (isRootGranted) {
                 try {
@@ -5915,6 +6565,9 @@ public class MainActivity extends Activity {
             final String summary = "Logs saved to " + logDir.getAbsolutePath() + ":\n"
                     + "- operation_log.txt (this app's operation log, " + (opCopy.exists() ? opCopy.length() + " bytes" : "not written yet") + ")\n"
                     + "- logcat.txt (host logcat -d, " + logcatLines + " lines)\n"
+                    + "Downloads copies (reachable in any file manager):\n"
+                    + "- Download/GSI Loader/logcat_" + dlTs + ".txt " + (dlLogcat != null ? "(exported)" : "(export failed)") + "\n"
+                    + "- Download/GSI Loader/operation_log_" + dlTs + ".txt " + (dlOp != null ? "(exported)" : "(export failed)") + "\n"
                     + "- Guest log files present on disk:\n" + (guest.length() > 0 ? guest.toString() : "(none found — guest logs are the scripts' takeover/restore logs, only present after a boot/return run)\n")
                     + "NOTE: this viewer shows the HOST logcat and the app's own log. It does NOT show a guest-internal logcat (the guest userspace has no logcat capture wired here).";
             appendLog(summary);

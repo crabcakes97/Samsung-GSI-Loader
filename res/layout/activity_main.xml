@@ -18,7 +18,7 @@
         android:paddingStart="20dp"
         android:paddingEnd="20dp"
         android:paddingTop="36dp"
-        android:paddingBottom="48dp">
+        android:paddingBottom="64dp">
 
         <!-- Header -->
         <LinearLayout
@@ -50,7 +50,7 @@
                 android:layout_marginTop="2dp"
                 android:text="Dual Userspace Switcher • One UI • Poultry Council approved 🐔"
                 android:textColor="?attr/themeTextSecondary"
-                android:textSize="13sp" />
+                android:textSize="14sp" />
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -62,13 +62,13 @@
                     android:layout_height="wrap_content"
                     android:layout_marginEnd="6dp"
                     android:background="@drawable/chip_bg"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:paddingTop="6dp"
-                    android:paddingBottom="6dp"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp"
                     android:text="SAMSUNG"
                     android:textColor="?attr/themeTextSecondary"
-                    android:textSize="11sp"
+                    android:textSize="12sp"
                     android:fontFamily="sans-serif-medium" />
 
                 <TextView
@@ -76,26 +76,26 @@
                     android:layout_height="wrap_content"
                     android:layout_marginEnd="6dp"
                     android:background="@drawable/chip_bg"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:paddingTop="6dp"
-                    android:paddingBottom="6dp"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp"
                     android:text="ROOT"
                     android:textColor="?attr/themeTextSecondary"
-                    android:textSize="11sp"
+                    android:textSize="12sp"
                     android:fontFamily="sans-serif-medium" />
 
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:background="@drawable/chip_bg"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:paddingTop="6dp"
-                    android:paddingBottom="6dp"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp"
                     android:text="GUEST"
                     android:textColor="?attr/themeTextSecondary"
-                    android:textSize="11sp"
+                    android:textSize="12sp"
                     android:fontFamily="sans-serif-medium" />
             </LinearLayout>
 
@@ -114,10 +114,10 @@
             android:id="@+id/section_devwarn"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
@@ -142,19 +142,20 @@
             android:id="@+id/section_status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Status"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="13sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:id="@+id/tv_root_status"
@@ -214,6 +215,7 @@
                 android:id="@+id/btn_recheck_root"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="12dp"
                 android:background="@drawable/btn_skin_tonal"
                 android:text="Re-check root and status"
@@ -236,10 +238,10 @@
             android:id="@+id/section_unrooted"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp"
+            android:padding="24dp"
             android:visibility="gone">
 
             <TextView
@@ -247,9 +249,10 @@
                 android:layout_height="wrap_content"
                 android:text="Root required"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -263,6 +266,7 @@
                 android:id="@+id/btn_open_rmgn"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="12dp"
                 android:background="@drawable/btn_skin_tonal"
                 android:text="Open Root-My-Galaxy-Next on GitHub"
@@ -285,19 +289,20 @@
             android:id="@+id/section_hero"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_hero"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Install &amp; boot a guest system"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -382,7 +387,7 @@
                 android:layout_marginTop="12dp"
                 android:background="@drawable/radio_skin_selected"
                 android:orientation="vertical"
-                android:padding="14dp"
+                android:padding="16dp"
                 android:clickable="true"
                 android:focusable="true">
 
@@ -436,7 +441,7 @@
                 android:layout_marginTop="8dp"
                 android:background="@drawable/radio_skin_unselected"
                 android:orientation="vertical"
-                android:padding="14dp"
+                android:padding="16dp"
                 android:clickable="true"
                 android:focusable="true">
 
@@ -493,7 +498,7 @@
                 android:layout_marginTop="8dp"
                 android:background="@drawable/radio_skin_unselected"
                 android:orientation="vertical"
-                android:padding="14dp"
+                android:padding="16dp"
                 android:clickable="true"
                 android:focusable="true"
                 android:visibility="gone">
@@ -547,7 +552,7 @@
                 android:layout_marginTop="8dp"
                 android:background="@drawable/radio_skin_unselected"
                 android:orientation="vertical"
-                android:padding="14dp"
+                android:padding="16dp"
                 android:clickable="true"
                 android:focusable="true"
                 android:visibility="gone">
@@ -602,7 +607,7 @@
                 android:layout_marginTop="8dp"
                 android:background="@drawable/radio_skin_unselected"
                 android:orientation="vertical"
-                android:padding="14dp"
+                android:padding="16dp"
                 android:clickable="true"
                 android:focusable="true">
 
@@ -665,6 +670,7 @@
                 android:id="@+id/btn_browse_gsi"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:minHeight="52dp"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/field_skin"
                 android:padding="12dp"
@@ -688,6 +694,7 @@
                 android:id="@+id/btn_inspect_gsi"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="10dp"
                 android:background="@drawable/btn_skin_tonal"
                 android:text="Inspect image…"
@@ -729,6 +736,7 @@
                 android:id="@+id/btn_install_gsi"
                 android:layout_width="match_parent"
                 android:layout_height="56dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="16dp"
                 android:background="@drawable/btn_skin_primary"
                 android:text="Install GSI"
@@ -803,9 +811,10 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="13sp"
                 android:fontFamily="sans-serif-medium"
+                android:textStyle="bold"
                 android:visibility="gone" />
 
             <LinearLayout
@@ -910,6 +919,7 @@
                 android:id="@+id/btn_boot_gsi"
                 android:layout_width="match_parent"
                 android:layout_height="56dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="10dp"
                 android:background="@drawable/btn_skin_primary"
                 android:text="Boot GSI"
@@ -966,6 +976,7 @@
                     android:id="@+id/btn_return_oneui"
                     android:layout_width="0dp"
                     android:layout_height="48dp"
+                android:minHeight="52dp"
                     android:layout_marginEnd="6dp"
                     android:layout_weight="1"
                     android:background="@drawable/btn_skin_tonal"
@@ -979,6 +990,7 @@
                     android:id="@+id/btn_return_reboot"
                     android:layout_width="0dp"
                     android:layout_height="48dp"
+                android:minHeight="52dp"
                     android:layout_marginStart="6dp"
                     android:layout_weight="1"
                     android:background="@drawable/btn_skin_danger"
@@ -1058,6 +1070,7 @@
                 android:id="@+id/btn_more_tools"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="14dp"
                 android:background="@drawable/btn_skin_tonal"
                 android:text="More tools"
@@ -1075,19 +1088,20 @@
             android:id="@+id/section_patches"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Install options: compatibility patches"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -1130,19 +1144,20 @@
             android:id="@+id/section_slots"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Slots"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -1280,6 +1295,7 @@
                 android:id="@+id/btn_clean_slate"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
+                android:minHeight="52dp"
                 android:layout_marginTop="10dp"
                 android:background="@drawable/btn_skin_danger"
                 android:text="Clean slate"
@@ -1330,9 +1346,10 @@
                     android:layout_height="wrap_content"
                     android:text="Picked slot details"
                     android:textColor="?attr/themePrimary"
-                    android:letterSpacing="0.06"
+                    android:letterSpacing="0.08"
                 android:textSize="13sp"
-                    android:fontFamily="sans-serif-medium" />
+                    android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
                 <TextView
                     android:id="@+id/tv_info_slot"
@@ -1601,19 +1618,20 @@
             android:id="@+id/section_snapshots"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Snapshots &amp; backups"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -1727,19 +1745,20 @@
             android:id="@+id/section_guest"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Guest options"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -1886,19 +1905,20 @@
             android:id="@+id/section_safety"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Safety &amp; checks"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"
@@ -2045,10 +2065,10 @@
             android:id="@+id/section_log"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -2085,11 +2105,11 @@
             <TextView
                 android:id="@+id/tv_console_log"
                 android:layout_width="match_parent"
-                android:layout_height="180dp"
+                android:layout_height="220dp"
                 android:layout_marginTop="10dp"
                 android:background="@drawable/log_skin"
                 android:fontFamily="monospace"
-                android:padding="12dp"
+                android:padding="14dp"
                 android:scrollbars="vertical"
                 android:text="GSI Loader Samsung initialized. CRONCH 🐔🌮\n"
                 android:textColor="?attr/themeLogText"
@@ -2124,6 +2144,18 @@
                 android:layout_marginTop="10dp"
                 android:background="@drawable/btn_skin_tonal"
                 android:text="Share log"
+                android:textAllCaps="false"
+                android:textColor="?attr/themePrimary"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium" />
+
+            <Button
+                android:id="@+id/btn_prev_logs"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_skin_tonal"
+                android:text="Previous logs"
                 android:textAllCaps="false"
                 android:textColor="?attr/themePrimary"
                 android:textSize="13sp"
@@ -2176,19 +2208,20 @@
             android:id="@+id/section_look"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="24dp"
             android:background="@drawable/card_skin"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:padding="24dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Looks"
                 android:textColor="?attr/themePrimary"
-                android:letterSpacing="0.06"
+                android:letterSpacing="0.08"
                 android:textSize="14sp"
-                android:fontFamily="sans-serif-medium" />
+                android:fontFamily="sans-serif-medium"
+                android:textStyle="bold" />
 
             <TextView
                 android:layout_width="wrap_content"

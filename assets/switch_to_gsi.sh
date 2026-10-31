@@ -45,6 +45,17 @@ if [ -f "$STAGE/preflight_host.sh" ]; then
             ;;
     esac
 fi
+# 6.0 (P11): One UI host-layout backup BEFORE the takeover stops
+# anything. Launcher databases/shared_prefs, appwidgets, QS tiles
+# and the launcher UID go to /data/local/tmp/gsi_host_backup (a
+# separate dir from the legacy lineage_backups databases restore);
+# return_to_oneui.sh restores the extras from it. Best-effort and
+# never fatal: a failed backup must not block the guest boot.
+if [ -f "$STAGE/backup_host.sh" ]; then
+    /system/bin/sh "$STAGE/backup_host.sh" 2>&1 || echo "HOST_BACKUP_WARN: backup_host.sh failed (continuing; return will restore databases only)"
+else
+    echo "HOST_BACKUP_WARN: backup_host.sh missing from $STAGE (continuing; return will restore databases only)"
+fi
 # 5.9.5-SCRIPTS-END
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
@@ -62,6 +73,136 @@ set_prop() {
         setprop "$1" "$2" 2>/dev/null || true
     fi
 }
+
+# --- PERSIST SNAPSHOT (6.2 P3, SESSION-SCOPED) ---------------------------
+# Mechanism re-implemented from OneOS (fahadalijaved): snapshot all
+# persist.* props BEFORE anything below (or the guest) can change them,
+# so return_to_oneui.sh can restore One UI's exact values. The snapshot
+# is also the hard-reset recovery: if a previous session crashed, its
+# snapshot file is still here and is restored FIRST (below), before a
+# fresh snapshot is taken — otherwise the crashed session's values
+# would be captured as "originals".
+# Gate (OneOS's rule): resetprop must prove it can WRITE and DELETE a
+# persist prop, or the switch is REFUSED loudly — a session whose
+# persist changes cannot be undone must never start. The probe uses a
+# scratch prop in our own namespace and deletes it again; spellings
+# are tried in order (-p first, then plain; --delete, then -d) because
+# Magisk and KernelSU resetprop builds differ, and the winning
+# spelling is recorded for return_to_oneui.sh to reuse.
+PERSIST_SNAP_FILE="/data/local/tmp/gsi_persist_snapshot"
+PERSIST_SPELL_FILE="/data/local/tmp/gsi_persist_spelling"
+PERSIST_PROBE_PROP="persist.gsi_loader_probe"
+_RP_SETFLAGS=""
+_RP_DELFLAGS=""
+_RP_DELPERSIST=""
+gsi_resetprop_probe() {
+    # $1 = setflags ("-p" or ""), $2 = delflags ("--delete" or "-d"),
+    # $3 = delpersist ("-p" or ""). Returns 0 if a full write/read/delete
+    # cycle on the scratch prop works with this spelling.
+    _pset="$1"; _pdel="$2"; _pdelp="$3"
+    if [ -n "$_pset" ]; then
+        "$RP" $_pset "$PERSIST_PROBE_PROP" 1 2>/dev/null || return 1
+    else
+        "$RP" "$PERSIST_PROBE_PROP" 1 2>/dev/null || return 1
+    fi
+    [ "$(getprop "$PERSIST_PROBE_PROP" 2>/dev/null)" = "1" ] || return 1
+    if [ -n "$_pdelp" ]; then
+        "$RP" $_pdelp "$_pdel" "$PERSIST_PROBE_PROP" 2>/dev/null || return 1
+    else
+        "$RP" "$_pdel" "$PERSIST_PROBE_PROP" 2>/dev/null || return 1
+    fi
+    [ -z "$(getprop "$PERSIST_PROBE_PROP" 2>/dev/null)" ] || return 1
+    return 0
+}
+gsi_persist_restore_file() {
+    # $1 = snapshot file. Restores every name=value line via resetprop
+    # (proven spelling), then deletes persist.vendor.softdog ONLY if it
+    # was set by a session (absent from the snapshot). Never aborts the
+    # caller on a single bad line.
+    _snap="$1"
+    _restored=0; _failed=0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            ''|'#'*) continue ;;
+        esac
+        _pname="${_line%%=*}"; _pval="${_line#*=}"
+        [ -n "$_pname" ] || continue
+        if [ -n "$_RP_SETFLAGS" ]; then
+            "$RP" $_RP_SETFLAGS "$_pname" "$_pval" 2>/dev/null || { _failed=$((_failed + 1)); continue; }
+        else
+            "$RP" "$_pname" "$_pval" 2>/dev/null || { _failed=$((_failed + 1)); continue; }
+        fi
+        _restored=$((_restored + 1))
+    done < "$_snap"
+    echo "PERSIST_RESTORE: restored $_restored props from $_snap, $_failed failures"
+    if ! grep -q "^persist\.vendor\.softdog=" "$_snap" 2>/dev/null; then
+        if [ -n "$(getprop persist.vendor.softdog 2>/dev/null)" ]; then
+            if [ -n "$_RP_DELPERSIST" ]; then
+                "$RP" $_RP_DELPERSIST "$_RP_DELFLAGS" persist.vendor.softdog 2>/dev/null || true
+            else
+                "$RP" "$_RP_DELFLAGS" persist.vendor.softdog 2>/dev/null || true
+            fi
+            if [ -z "$(getprop persist.vendor.softdog 2>/dev/null)" ]; then
+                echo "PERSIST_RESTORE: persist.vendor.softdog deleted (set by a session, absent from snapshot)"
+            else
+                echo "PERSIST_RESTORE_WARNING: could not delete persist.vendor.softdog (resetprop delete failed; value stays until the next switch or a manual resetprop --delete)"
+            fi
+        fi
+    fi
+    return 0
+}
+if [ -z "$RP" ] || [ ! -x "$RP" ]; then
+    echo "!!! PERSIST_SNAPSHOT_REFUSED: no usable resetprop (RP='$RP') — One UI's persist.* props could not be saved and restored; refusing the switch"
+    exit 1
+fi
+if gsi_resetprop_probe "-p" "--delete" "-p"; then
+    _RP_SETFLAGS="-p"; _RP_DELFLAGS="--delete"; _RP_DELPERSIST="-p"
+elif gsi_resetprop_probe "" "--delete" ""; then
+    _RP_SETFLAGS=""; _RP_DELFLAGS="--delete"; _RP_DELPERSIST=""
+elif gsi_resetprop_probe "" "-d" ""; then
+    _RP_SETFLAGS=""; _RP_DELFLAGS="-d"; _RP_DELPERSIST=""
+elif gsi_resetprop_probe "-p" "-d" "-p"; then
+    _RP_SETFLAGS="-p"; _RP_DELFLAGS="-d"; _RP_DELPERSIST="-p"
+else
+    # Last-ditch cleanup of the scratch prop, then refuse loudly.
+    "$RP" --delete "$PERSIST_PROBE_PROP" 2>/dev/null || true
+    "$RP" -d "$PERSIST_PROBE_PROP" 2>/dev/null || true
+    echo "!!! PERSIST_SNAPSHOT_REFUSED: resetprop cannot write+delete persist props on this phone — One UI's props could not be restored on return; refusing the switch"
+    exit 1
+fi
+echo "PERSIST_SNAPSHOT: resetprop probe passed (setflags='$_RP_SETFLAGS' delflags='$_RP_DELFLAGS')"
+printf '%s|%s|%s\n' "$_RP_SETFLAGS" "$_RP_DELFLAGS" "$_RP_DELPERSIST" > "$PERSIST_SPELL_FILE" 2>/dev/null || true
+# Hard-reset recovery: a snapshot left by a crashed session is restored
+# now, before the fresh snapshot, so crashed-session values are never
+# captured as originals. A live guest is already refused above
+# (guards.sh), so no running session can own this file here.
+if [ -f "$PERSIST_SNAP_FILE" ]; then
+    echo "PERSIST_RECOVERY: stale snapshot from a previous session found ($PERSIST_SNAP_FILE) — restoring it before taking a fresh snapshot (hard-reset recovery)"
+    gsi_persist_restore_file "$PERSIST_SNAP_FILE"
+fi
+if ! getprop 2>/dev/null | sed -n 's/^\[\(persist\.[^]]*\)\]: \[\(.*\)\]$/\1=\2/p' > "$PERSIST_SNAP_FILE.tmp" 2>/dev/null; then
+    echo "!!! PERSIST_SNAPSHOT_REFUSED: could not enumerate persist.* props — refusing the switch"
+    exit 1
+fi
+# A failed getprop leaves an empty file while sed still exits 0 — never
+# trust an empty (or near-empty) snapshot: it would restore nothing and
+# could delete a legit persist.vendor.softdog. Any real phone has
+# dozens of persist.* props; fewer than 5 means enumeration broke.
+_PERSIST_SNAP_COUNT="$(grep -c . "$PERSIST_SNAP_FILE.tmp" 2>/dev/null || true)"
+case "$_PERSIST_SNAP_COUNT" in ''|*[!0-9]*) _PERSIST_SNAP_COUNT=0 ;; esac
+if [ "$_PERSIST_SNAP_COUNT" -lt 5 ]; then
+    echo "!!! PERSIST_SNAPSHOT_REFUSED: only $_PERSIST_SNAP_COUNT persist.* props enumerated (expected dozens) — refusing the switch"
+    rm -f "$PERSIST_SNAP_FILE.tmp" 2>/dev/null || true
+    exit 1
+fi
+# Atomic publish: the snapshot is only trusted once fully written.
+if ! mv -f "$PERSIST_SNAP_FILE.tmp" "$PERSIST_SNAP_FILE" 2>/dev/null; then
+    echo "!!! PERSIST_SNAPSHOT_REFUSED: could not publish $PERSIST_SNAP_FILE — refusing the switch"
+    exit 1
+fi
+_PERSIST_SNAP_COUNT="$(grep -c . "$PERSIST_SNAP_FILE" 2>/dev/null || true)"
+case "$_PERSIST_SNAP_COUNT" in ''|*[!0-9]*) _PERSIST_SNAP_COUNT=0 ;; esac
+echo "PERSIST_SNAPSHOT: $_PERSIST_SNAP_COUNT persist.* props saved to $PERSIST_SNAP_FILE (restored by return_to_oneui.sh)"
 
 BACKUP_DIR="/data/local/tmp/lineage_backups"
 
@@ -260,6 +401,172 @@ if [ $PREP_RET -ne 0 ]; then
     exit 1
 fi
 
+# --- GSI KERNEL WATCHDOG TIMEOUT CONTROL (5.9.18, SESSION-SCOPED) -------
+# 6.2 (O1): this block MOVED to before the [6/6] kill spree below. In
+# 5.9.18-6.1 it ran AFTER the zygote stop, leaving the softdog armed
+# and unfed during the kill spree and the feeder start. Neutralizing
+# first covers the softdog through the whole stop sequence; the
+# supervised feeder (started after the kill spree) then takes over
+# kicking, and the guest kicker covers the guest side.
+# User order: "get rid of the timeout" for GSI sessions. This neutralizes
+# the KERNEL watchdog timeout (softdog "Software Watchdog Timer expired",
+# ~100 s) for the duration of this guest session ONLY, and
+# return_to_oneui.sh restores the original value. It is NOT a permanent
+# host-wide disable: a reboot resets every timeout to the driver
+# default on its own, and return restores it explicitly.
+# The sysfs timeout store invokes the same watchdog_set_timeout as
+# WDIOC_SETTIMEOUT (disable if the driver accepts 0, else maximum).
+# If the driver rejects timeout control, this logs loudly and the
+# session falls back to the supervised feeder + guest kicker above --
+# it never pretends the timeout is gone.
+# Tradeoff, stated plainly: while the timeout is neutralized, a genuine
+# guest/host hang will NOT auto-reboot; force-restart manually
+# (power + volume down). The app boot watchdog (boot_watchdog.sh,
+# 600 s) is KEPT and is the only auto-return net during sessions.
+cat > /data/local/tmp/gsi_watchdog_timeout.sh <<'GSITIMEOUT'
+#!/system/bin/sh
+# GSI kernel watchdog timeout control (5.9.18, SESSION-SCOPED).
+# Verbs: neutralize | restore
+# neutralize: record each /sys/class/watchdog/watchdog*/timeout original
+#   value to $ORIG_FILE, then try to disable (write 0) else set to max.
+# restore: write recorded originals back, verify by read-back.
+# All logging goes to stdout; the caller (switch_to_gsi.sh /
+# return_to_oneui.sh) redirects it into the takeover/return log.
+# The sysfs timeout store invokes the same watchdog_set_timeout as
+# WDIOC_SETTIMEOUT (the watchdog core's set path): a rejected store
+# (EOPNOTSUPP/EINVAL) means the driver does not support timeout
+# control, and the caller falls back to the supervised feeder +
+# guest kicker — it must never pretend the timeout is gone.
+# Safety invariant: a timeout is NEVER changed before its original
+# value is recorded in $ORIG_FILE. If the orig file cannot be written,
+# neutralize aborts without touching any node.
+# A reboot resets every timeout to the driver default on its own, so
+# the session scope holds even if return never runs.
+SYSFS_ROOT="${WATCHDOG_SYSFS_ROOT:-/sys/class/watchdog}"
+ORIG_FILE="${WATCHDOG_ORIG_FILE:-/data/local/tmp/gsi_watchdog_timeout.orig}"
+
+_neutralize_node() {
+    # $1 = node dir. Returns 0 if this node is controlled, 1 otherwise.
+    _node="$1"
+    _name="${_node##*/}"
+    _ident="$(cat "$_node/identity" 2>/dev/null || echo unknown)"
+    _orig="$(cat "$_node/timeout" 2>/dev/null || echo "")"
+    if [ -z "$_orig" ]; then
+        echo "WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE: cannot read timeout for $_name ($_ident)"
+        return 1
+    fi
+    echo "$_name|$_orig" >> "$ORIG_FILE"
+    echo "WATCHDOG_TIMEOUT_ORIGINAL: node=$_name identity=$_ident timeout=$_orig"
+    # Attempt 1: disable (0). The watchdog API defines 0 as "disable
+    # if the driver supports it".
+    if echo 0 > "$_node/timeout" 2>/dev/null; then
+        _now="$(cat "$_node/timeout" 2>/dev/null || echo "")"
+        if [ "$_now" = "0" ]; then
+            echo "WATCHDOG_TIMEOUT_DISABLED: node=$_name timeout=0 (was $_orig)"
+            return 0
+        fi
+        # Driver accepted the write but clamped it to something else:
+        # undo at once, so a clamped-to-small value can never outlive
+        # this block (a 1 s timeout with a 2 s feeder cadence would
+        # fire before the next kick).
+        echo "$_orig" > "$_node/timeout" 2>/dev/null || true
+        _back="$(cat "$_node/timeout" 2>/dev/null || echo "")"
+        echo "WATCHDOG_TIMEOUT_DISABLE_CLAMPED: node=$_name wrote 0, read-back=$_back (trying max next)"
+    fi
+    # Attempt 2: maximum (max_timeout attr if present, else 65535).
+    _max="$(cat "$_node/max_timeout" 2>/dev/null || echo "")"
+    case "$_max" in
+        ''|*[!0-9]*) _max=65535 ;;
+    esac
+    if echo "$_max" > "$_node/timeout" 2>/dev/null; then
+        _now="$(cat "$_node/timeout" 2>/dev/null || echo "")"
+        echo "WATCHDOG_TIMEOUT_SET_MAX: node=$_name timeout=$_now (requested $_max, was $_orig)"
+        return 0
+    fi
+    # Neither worked: make sure the original is back, then report.
+    echo "$_orig" > "$_node/timeout" 2>/dev/null || true
+    echo "WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE: node=$_name identity=$_ident (timeout writes rejected; driver does not support timeout control)"
+    return 1
+}
+
+neutralize() {
+    # NOTE: do NOT use ": > file" here: ":" is a POSIX special builtin
+    # and a failed redirect on one kills a non-interactive shell at
+    # once (exit 2, no log line). "cat" is an external command, so a
+    # failed redirect just returns nonzero and the loud fallback below
+    # runs instead.
+    if ! cat /dev/null > "$ORIG_FILE" 2>/dev/null; then
+        echo "WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE: cannot write orig file $ORIG_FILE (refusing to change any timeout without a recorded original)"
+        return 1
+    fi
+    _found=0
+    _controlled=0
+    for _node in "$SYSFS_ROOT"/watchdog*; do
+        [ -d "$_node" ] || continue
+        if [ ! -f "$_node/timeout" ]; then
+            echo "WATCHDOG_TIMEOUT_SKIP: node ${_node##*/} has no timeout file"
+            _found=1
+            continue
+        fi
+        _found=1
+        if _neutralize_node "$_node"; then
+            _controlled=1
+        fi
+    done
+    if [ "$_found" -eq 0 ]; then
+        echo "WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE: no watchdog nodes found under $SYSFS_ROOT"
+        return 1
+    fi
+    if [ "$_controlled" -eq 0 ]; then
+        echo "WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE: no watchdog node accepted a timeout change — supervised feeder + guest kicker remain the protection (do NOT assume the timeout is gone)"
+        return 1
+    fi
+    return 0
+}
+
+restore() {
+    if [ ! -f "$ORIG_FILE" ]; then
+        echo "WATCHDOG_TIMEOUT_RESTORE_SKIPPED: no orig file $ORIG_FILE (timeout was never neutralized this boot, or a previous return already restored it)"
+        return 0
+    fi
+    _fail=0
+    while IFS='|' read -r _rn _ro || [ -n "$_rn" ]; do
+        [ -n "$_rn" ] || continue
+        [ -n "$_ro" ] || continue
+        _node="$SYSFS_ROOT/$_rn"
+        if [ ! -f "$_node/timeout" ]; then
+            echo "WATCHDOG_TIMEOUT_RESTORE_WARNING: node $_rn gone (cannot restore timeout $_ro)"
+            _fail=1
+            continue
+        fi
+        if echo "$_ro" > "$_node/timeout" 2>/dev/null; then
+            _now="$(cat "$_node/timeout" 2>/dev/null || echo "")"
+            if [ "$_now" = "$_ro" ]; then
+                echo "WATCHDOG_TIMEOUT_RESTORED: node=$_rn timeout=$_ro"
+            else
+                echo "WATCHDOG_TIMEOUT_RESTORE_WARNING: node=$_rn wrote $_ro, read-back=$_now (mismatch; a reboot resets the timeout to the driver default)"
+                _fail=1
+            fi
+        else
+            echo "WATCHDOG_TIMEOUT_RESTORE_WARNING: node=$_rn could not write original timeout $_ro (a reboot resets the timeout to the driver default)"
+            _fail=1
+        fi
+    done < "$ORIG_FILE"
+    if [ "$_fail" -eq 0 ]; then
+        rm -f "$ORIG_FILE" 2>/dev/null || true
+    fi
+    return "$_fail"
+}
+
+case "${1:-}" in
+    neutralize) neutralize ;;
+    restore) restore ;;
+    *) echo "Usage: $0 {neutralize|restore}" >&2; exit 2 ;;
+esac
+GSITIMEOUT
+chmod 755 /data/local/tmp/gsi_watchdog_timeout.sh
+/system/bin/sh /data/local/tmp/gsi_watchdog_timeout.sh neutralize || echo "WATCHDOG_TIMEOUT_FALLBACK: timeout control unavailable or failed -- supervised feeder + guest kicker start next and remain the protection (see WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE lines above)"
+
 # --- STOP HOST DAEMONS & LAUNCH CONTAINER ---
 echo "=== [6/6] Launching GSI Takeover Daemon ==="
 pkill -f "while true; do [ \"\$(getprop init.svc.zygote)\"" 2>/dev/null || true
@@ -307,10 +614,15 @@ done
 # would die too. Keep only the codec processes down, which is what causes the
 # spin described above.
 setprop ctl.start media 2>/dev/null || true
-for svc in media.codec media.metrics; do
+# 6.0 (P7): wider codec stop list. The software codec and the
+# mediaextractor service are further paths to the same codec-list
+# spin, and Samsung's software C2 HAL service is the Samsung-side
+# C2 path. Qualcomm's vendor-qti C2 service is deliberately NOT
+# stopped (this phone is Exynos; see DOES-NOT-APPLY D8).
+for svc in media.codec media.swcodec media.metrics mediaextractor samsung-software-media-c2-hal-1-0; do
     setprop ctl.stop $svc 2>/dev/null || true
 done
-kill -9 $(pidof media.codec) $(pidof media.metrics) 2>/dev/null || true
+kill -9 $(pidof media.codec) $(pidof mediaswcodec) $(pidof media.metrics) $(pidof mediaextractor) 2>/dev/null || true
 
 # Same handover for wifi. The guest's WifiService binds IWificond (service
 # "wifinl80211") and drives the vendor HAL through it. Samsung's wificond is
@@ -354,7 +666,7 @@ fi
 # appear in the census yet).
 _KILL_GONE=""
 _KILL_ALIVE=""
-for _svc in surfaceflinger bootanimation app_process64 zygote_exec zygote64 system_server media.codec media.metrics wificond; do
+for _svc in surfaceflinger bootanimation app_process64 zygote_exec zygote64 system_server media.codec mediaswcodec media.metrics mediaextractor wificond; do
     if pidof "$_svc" >/dev/null 2>&1; then
         _KILL_ALIVE="$_KILL_ALIVE $_svc"
     else
@@ -414,6 +726,16 @@ else
     fi
     ls -l /dev/watchdog* 2>/dev/null || echo "WATCHDOG_FEEDER: no /dev/watchdog* nodes listed"
     pkill -f "/dev/watchdog" 2>/dev/null || true
+    # 6.0 (P1): stage the native ioctl feeder binary for the
+    # supervisor below. If it is missing (old extraction), the
+    # supervisor falls back to the shell worker unchanged.
+    if [ -f "$STAGE/watchdog_feeder" ]; then
+        cp -f "$STAGE/watchdog_feeder" /data/local/tmp/watchdog_feeder 2>/dev/null || true
+        chmod 755 /data/local/tmp/watchdog_feeder 2>/dev/null || true
+        echo "WATCHDOG_FEEDER: native ioctl feeder staged at /data/local/tmp/watchdog_feeder"
+    else
+        echo "WATCHDOG_FEEDER: native feeder binary missing from $STAGE — supervisor will use the shell worker"
+    fi
     cat > /data/local/tmp/gsi_watchdog_feeder.sh <<'GSIFEEDER'
 #!/system/bin/sh
 # GSI watchdog feeder WORKER (host namespace). Open-write-close
@@ -465,7 +787,17 @@ GSIFEEDER
 LOG=/data/local/tmp/gsi_watchdog_feeder.log
 while true; do
     echo "$(date) supervisor: starting feeder worker" >> "$LOG"
-    /system/bin/sh /data/local/tmp/gsi_watchdog_feeder.sh
+    # 6.0 (P1): native ioctl feeder first (held fd, WDIOC_KEEPALIVE
+    # every 5 s, magic close on SIGTERM). The shell worker below is
+    # the fallback if the binary is missing or not executable.
+    # Supervision itself is unchanged: this supervisor, its pidfile,
+    # liveness checks, the guest kicker, and the host-watchdogd
+    # keepalive all stay exactly as in 5.9.16.
+    if [ -x /data/local/tmp/watchdog_feeder ]; then
+        /data/local/tmp/watchdog_feeder >> "$LOG" 2>&1
+    else
+        /system/bin/sh /data/local/tmp/gsi_watchdog_feeder.sh
+    fi
     echo "$(date) supervisor: feeder worker exited, restarting in 1s" >> "$LOG"
     sleep 1
 done
@@ -484,6 +816,54 @@ GSISUPER
         echo "WATCHDOG_FEEDER_START_FAILED: supervisor not alive after start — check /data/local/tmp/gsi_watchdog_feeder.log (guest boot continues; host watchdogd, if any, is still the kicker)"
     fi
 fi
+
+# --- PERSIST.VENDOR.SOFTDOG FALLBACK (6.2 P3, SESSION-SCOPED) -------------
+# Mechanism re-implemented from OneOS (fahadalijaved): if Samsung's
+# softdog cannot be fed at all (no usable node), turn it off through
+# Samsung's init via persist.vendor.softdog=off — but ONLY when all
+# three conditions hold: (1) a "V" write to /dev/watchdog is refused,
+# (2) no active software watchdog node exists under
+# /sys/class/watchdog, and (3) init.sysfw.rc contains the softdog
+# trigger. The prop is session-scoped: the 6.2 persist snapshot (taken
+# above) is restored by return_to_oneui.sh, which deletes this prop
+# again if it was not in the snapshot. Runs AFTER the zygote stop
+# above, when One UI's system_server can no longer kick the softdog.
+# The timeout neutralize (moved before the kill spree in 6.2, O1) is
+# the primary cover; this is the fallback when no node accepted it.
+_P3_V_OK=0
+_P3_V_ERR=""
+if _P3_V_TMP="$(printf V 2>&1 > /dev/watchdog)"; then
+    _P3_V_OK=1
+else
+    _P3_V_ERR="$_P3_V_TMP"
+fi
+_P3_SOFT_NODE=0
+for _p3w in /sys/class/watchdog/watchdog*; do
+    [ -d "$_p3w" ] || continue
+    [ "$(cat "$_p3w/state" 2>/dev/null)" = "active" ] || continue
+    case "$(cat "$_p3w/identity" 2>/dev/null)" in
+        *[Ss]oft*) _P3_SOFT_NODE=1; break ;;
+    esac
+done
+_P3_TRIGGER=0
+if [ -f /system/etc/init/init.sysfw.rc ] && grep -q "softdog" /system/etc/init/init.sysfw.rc 2>/dev/null; then
+    _P3_TRIGGER=1
+fi
+if [ "$_P3_V_OK" -eq 0 ] && [ "$_P3_SOFT_NODE" -eq 0 ] && [ "$_P3_TRIGGER" -eq 1 ]; then
+    if [ -n "$RP" ] && [ -x "$RP" ]; then
+        if [ -n "$_RP_SETFLAGS" ]; then
+            "$RP" $_RP_SETFLAGS persist.vendor.softdog off 2>/dev/null || true
+        else
+            "$RP" persist.vendor.softdog off 2>/dev/null || true
+        fi
+        echo "PERSIST_SOFTDOG_OFF: V-write refused ($_P3_V_ERR), no active software watchdog node, init.sysfw.rc has the softdog trigger — persist.vendor.softdog=off set (now: $(getprop persist.vendor.softdog 2>/dev/null); restored on return)"
+    else
+        echo "PERSIST_SOFTDOG_SKIP: all three fallback conditions held but no usable resetprop — softdog cannot be turned off (timeout neutralize + feeder remain the only cover)"
+    fi
+else
+    echo "PERSIST_SOFTDOG_SKIP: V-write ok=$_P3_V_OK, active-soft-node=$_P3_SOFT_NODE, sysfw-trigger=$_P3_TRIGGER (fallback needs 0/0/1; no change made)"
+fi
+unset _P3_V_OK _P3_V_ERR _P3_SOFT_NODE _P3_TRIGGER _P3_V_TMP _p3w
 
 # --- HOST WATCHDOGD KEEPALIVE (5.9.16) ------------------------------------
 # Mirrors the adbd/imsd watchdogs above, but for the HOST watchdogd:

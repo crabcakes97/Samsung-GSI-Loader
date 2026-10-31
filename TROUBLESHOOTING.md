@@ -132,6 +132,37 @@ sec_watchdog as executioner (would print its own message, not the softdog
 string), and "the guest hung" on its own (a guest hang does not stop
 host-side kicking without a second mechanism).
 
+### 5.9.18: kernel watchdog timeout control (session-scoped)
+
+5.9.18 narrows the 5.9.16 "do not disable" rule deliberately: the
+kernel watchdog timeout is neutralized DURING SESSIONS ONLY, then
+restored. At guest launch, switch_to_gsi.sh records each watchdog
+node's original timeout to
+`/data/local/tmp/gsi_watchdog_timeout.orig`, then asks the driver to
+disable (0) or take its maximum via the sysfs timeout store (the same
+watchdog_set_timeout WDIOC_SETTIMEOUT uses). return_to_oneui.sh writes
+the originals back and verifies by read-back. A reboot resets every
+timeout to the driver default on its own, so the host is never left
+permanently unprotected.
+
+What to look for in `<slot>/takeover_app.log` at launch:
+WATCHDOG_TIMEOUT_ORIGINAL (node + original value),
+WATCHDOG_TIMEOUT_DISABLED (0 stuck) or WATCHDOG_TIMEOUT_SET_MAX
+(value achieved), and on return WATCHDOG_TIMEOUT_RESTORED. If you see
+WATCHDOG_TIMEOUT_CONTROL_UNAVAILABLE instead, the driver rejected
+timeout control and the session runs on the 5.9.16 feeder + guest
+kicker — do NOT assume the timeout is gone.
+
+The app boot watchdog (10 min auto-return) is UNCHANGED in 5.9.18: it
+is a userspace return trigger, not a kernel panic source, and it
+remains the only auto-return net during sessions. Removing it would
+only remove auto-return; it would not fix a kernel panic.
+
+Tradeoff: with the kernel timeout neutralized, a genuine hang during
+a session will NOT auto-reboot — force-restart manually (power +
+volume down) or tap Return. Outside sessions the host timeout is
+restored, so host protection is intact.
+
 ## 4. Return partial (RETURN_PARTIAL, or "return may need manual reboot")
 
 `return_to_oneui.sh` verifies (no rootfs mount, zygote running, Enforcing)
@@ -219,7 +250,34 @@ panics at 100 s, the problem is guest/kernel-level. DSU needs ~10 GB free +
 dynamic partitions + a DSU loader (`com.android.dynsystem`) — verify the
 loader exists before promising anything.
 
-## 7. Evidence checklist (copy this into a bug report)
+## 7. 6.0 log markers (new in this build)
+
+- `WATCHDOG_FEEDER: native ioctl feeder staged` — the P1 binary was
+  staged; if you see the "missing from $STAGE" line instead, the
+  supervisor fell back to the shell worker (check the asset sync).
+- `WATCHDOG_FEEDER_KILL: native feeder SIGTERM sent (magic close)`
+  on return — the binary stopped cleanly. A remainder SIGKILL line
+  after it means the binary ignored SIGTERM.
+- `zygote_exec exited with code N after Ns` + `ZYGOTE_RESTART_CAP_REACHED`
+  — the P3 loop. A cap line with N=1 and tiny Ns means the new
+  zygote_exec binary itself is failing; check
+  `/data/zygote_stderr.log` and `/data/zygote_exec.log` before
+  anything else.
+- `ACONFIG_OVERLAY_OK` / `ACONFIG_OVERLAY_FAIL`,
+  `PRELOADED_CLASSES_CLEARED`, `APEX_FILTER_6.0: kept K, dropped D`
+  — P4/P5/P8 prepare steps. A dropped count of 0 on a foreign guest
+  is suspicious (the filter may not have run); a large dropped
+  count is expected on a host list full of Samsung entries.
+- `A17_SERVICES_PATCH_DISABLED` on an SDK 37 guest is EXPECTED in
+  6.0 (P6 ships disabled — the jar is unverified). It is not a bug
+  report; an A17 guest booting unpatched is the designed behavior
+  until the jar is DEX-verified.
+- `HOST_BACKUP_6.0` at takeover, `shared_prefs restored (6.0 host
+  backup)` / `appwidgets.xml restored` / `Quick Settings tiles
+  restored` on return — P11. Missing backup lines mean
+  backup_host.sh was absent from the stage (asset sync issue).
+
+## 8. Evidence checklist (copy this into a bug report)
 
 - [ ] App version + versionCode (5.9.16 / 30)
 - [ ] Slot name + GSI (preset or local file, Android version, ext4/erofs)

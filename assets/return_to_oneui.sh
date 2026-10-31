@@ -94,6 +94,23 @@ if pkill -9 -f "gsi_watchdog_supervisor.sh" 2>/dev/null; then
 else
     echo "WATCHDOG_FEEDER_KILL: supervisor not found (already dead or never started; pidfile was $_FEEDER_PID_BEFORE)"
 fi
+# 6.0 (P1): stop the native ioctl feeder cleanly. The supervisor is
+# already dead above, so it cannot restart the binary. SIGTERM
+# triggers the binary's magic close (write 'V' + close = driver
+# disarms); SIGKILL cleans up any remainder after a short wait.
+# The binary's cmdline is exactly /data/local/tmp/watchdog_feeder,
+# which matches neither the supervisor/worker script patterns nor
+# the legacy /dev/watchdog pattern below, so it needs this block.
+if pkill -TERM -f "/data/local/tmp/watchdog_feeder" 2>/dev/null; then
+    echo "WATCHDOG_FEEDER_KILL: native feeder SIGTERM sent (magic close)"
+    sleep 1
+else
+    echo "WATCHDOG_FEEDER_KILL: native feeder not found (shell worker only, or never started)"
+fi
+if pkill -KILL -f "/data/local/tmp/watchdog_feeder" 2>/dev/null; then
+    echo "WATCHDOG_FEEDER_KILL: native feeder remainder SIGKILLed"
+fi
+rm -f /data/local/tmp/watchdog_feeder 2>/dev/null || true
 if pkill -9 -f "gsi_watchdog_feeder.sh" 2>/dev/null; then
     echo "WATCHDOG_FEEDER_KILL: worker killed"
 else
@@ -124,6 +141,110 @@ if ps -ef 2>/dev/null | grep -v grep | grep -q "gsi_watchdog_supervisor.sh"; the
     echo "WATCHDOG_FEEDER_KILL: WARNING supervisor still listed after kill — check ps"
 else
     echo "WATCHDOG_FEEDER_KILL: confirmed no supervisor process remains"
+fi
+# 5.9.18: restore the kernel watchdog timeout neutralized at guest
+# launch (session-scoped only). The helper script was written by
+# switch_to_gsi.sh into /data/local/tmp/ at session start; if it is
+# missing (session started by an older build, or the file was deleted),
+# fall back to a minimal inline restore from the orig file. If neither
+# exists, the timeout was never neutralized — or a reboot already
+# reset it to the driver default — and there is nothing to restore.
+# The helper keeps the orig file on restore failure so a later return
+# can retry; a reboot resets the timeout regardless.
+if [ -f /data/local/tmp/gsi_watchdog_timeout.sh ]; then
+    /system/bin/sh /data/local/tmp/gsi_watchdog_timeout.sh restore || echo "WATCHDOG_TIMEOUT_RESTORE_WARNING: restore verb reported a failure (see lines above; a reboot resets the timeout to the driver default)"
+elif [ -f /data/local/tmp/gsi_watchdog_timeout.orig ]; then
+    _need=0; _done=0
+    while IFS='|' read -r _rn _ro || [ -n "$_rn" ]; do
+        [ -n "$_rn" ] || continue
+        [ -n "$_ro" ] || continue
+        _need=$((_need + 1))
+        if [ -f "/sys/class/watchdog/$_rn/timeout" ] && echo "$_ro" > "/sys/class/watchdog/$_rn/timeout" 2>/dev/null; then
+            echo "WATCHDOG_TIMEOUT_RESTORED: node=$_rn timeout=$_ro (inline fallback; helper script missing)"
+            _done=$((_done + 1))
+        fi
+    done < /data/local/tmp/gsi_watchdog_timeout.orig
+    if [ "$_need" -gt 0 ] && [ "$_done" -eq "$_need" ]; then
+        rm -f /data/local/tmp/gsi_watchdog_timeout.orig 2>/dev/null || true
+    elif [ "$_done" -eq 0 ]; then
+        echo "WATCHDOG_TIMEOUT_RESTORE_WARNING: inline fallback could not restore any timeout (a reboot resets the timeout to the driver default)"
+    else
+        echo "WATCHDOG_TIMEOUT_RESTORE_WARNING: inline fallback restored $_done of $_need timeouts (orig file kept for retry; a reboot resets the timeout to the driver default)"
+    fi
+else
+    echo "WATCHDOG_TIMEOUT_RESTORE_SKIPPED: no helper script and no orig file (timeout was never neutralized this boot)"
+fi
+# 6.2 (P3): restore One UI's persist.* props snapshotted at takeover
+# (mechanism re-implemented from OneOS/fahadalijaved; this restore is
+# our own code). Runs BEFORE the host zygote restarts in [5/5] below,
+# so One UI boots with its own values. The snapshot file survives a
+# reboot (/data/local/tmp persists), so a return after a hard reset
+# restores too; a return that runs twice is harmless (the file is
+# removed after a successful restore, and a missing file just logs).
+# The resetprop spelling proven at switch time is read back from the
+# spelling file so a persisted (-p) session value is fixed in the
+# persistent store too, not only live. persist.vendor.softdog set by
+# a session is deleted when it was not in the snapshot; every other
+# snapshotted value is written back. (Unlike OneOS's restore, props
+# the guest or host added mid-session are NOT deleted wholesale —
+# only the session's own softdog prop is removed — so no host state
+# is ever nuked by a delete-all.)
+# If resetprop is missing here, nothing is restored — logged loudly,
+# and the next switch's stale-snapshot recovery retries it.
+if [ -f /data/local/tmp/gsi_persist_snapshot ]; then
+    _PR_RP=$(which resetprop 2>/dev/null || echo "/data/adb/ksu/bin/resetprop")
+    [ -x "$_PR_RP" ] || _PR_RP=$(find /data/adb /system -name resetprop 2>/dev/null | head -n 1)
+    _SP_SET=""; _SP_DEL="--delete"; _SP_DELP=""
+    if [ -f /data/local/tmp/gsi_persist_spelling ]; then
+        _SP_LINE="$(head -n 1 /data/local/tmp/gsi_persist_spelling 2>/dev/null)"
+        _SP_SET="${_SP_LINE%%|*}"; _SP_REST="${_SP_LINE#*|}"
+        _SP_DEL="${_SP_REST%%|*}"; _SP_DELP="${_SP_REST#*|}"
+    fi
+    if [ -n "$_PR_RP" ] && [ -x "$_PR_RP" ]; then
+        _pr_restored=0; _pr_failed=0
+        while IFS= read -r _pr_line || [ -n "$_pr_line" ]; do
+            case "$_pr_line" in
+                ''|'#'*) continue ;;
+            esac
+            _pr_name="${_pr_line%%=*}"; _pr_val="${_pr_line#*=}"
+            [ -n "$_pr_name" ] || continue
+            if [ -n "$_SP_SET" ]; then
+                "$_PR_RP" $_SP_SET "$_pr_name" "$_pr_val" 2>/dev/null || { _pr_failed=$((_pr_failed + 1)); continue; }
+            else
+                "$_PR_RP" "$_pr_name" "$_pr_val" 2>/dev/null || { _pr_failed=$((_pr_failed + 1)); continue; }
+            fi
+            _pr_restored=$((_pr_restored + 1))
+        done < /data/local/tmp/gsi_persist_snapshot
+        echo "PERSIST_RESTORE: restored $_pr_restored props from gsi_persist_snapshot, $_pr_failed failures (return path)"
+        if ! grep -q "^persist\.vendor\.softdog=" /data/local/tmp/gsi_persist_snapshot 2>/dev/null; then
+            if [ -n "$(getprop persist.vendor.softdog 2>/dev/null)" ]; then
+                if [ -n "$_SP_DELP" ]; then
+                    "$_PR_RP" $_SP_DELP "$_SP_DEL" persist.vendor.softdog 2>/dev/null || true
+                else
+                    "$_PR_RP" "$_SP_DEL" persist.vendor.softdog 2>/dev/null || true
+                fi
+                # Second spelling as a fallback if the first did not clear it.
+                if [ -n "$(getprop persist.vendor.softdog 2>/dev/null)" ]; then
+                    "$_PR_RP" -d persist.vendor.softdog 2>/dev/null || true
+                fi
+                if [ -z "$(getprop persist.vendor.softdog 2>/dev/null)" ]; then
+                    echo "PERSIST_RESTORE: persist.vendor.softdog deleted (set by a session, absent from snapshot)"
+                else
+                    echo "PERSIST_RESTORE_WARNING: could not delete persist.vendor.softdog (value stays; next switch's stale-snapshot recovery will retry)"
+                fi
+            fi
+        fi
+        if [ "$_pr_failed" -eq 0 ]; then
+            rm -f /data/local/tmp/gsi_persist_snapshot /data/local/tmp/gsi_persist_spelling 2>/dev/null || true
+        else
+            echo "PERSIST_RESTORE_WARNING: snapshot kept (failures above) so a later return can retry"
+        fi
+    else
+        echo "PERSIST_RESTORE_WARNING: no usable resetprop at return — persist.* snapshot NOT restored (next switch's stale-snapshot recovery will retry it)"
+    fi
+    unset _PR_RP _SP_SET _SP_DEL _SP_DELP _SP_LINE _SP_REST _pr_restored _pr_failed _pr_line _pr_name _pr_val
+else
+    echo "PERSIST_RESTORE_SKIPPED: no persist snapshot file (session started by an older build, or a previous return already restored it)"
 fi
 # 5.9.5-SCRIPTS: guest processes (zygote, system_server, surfaceflinger,
 # vold, wificond, and any process rooted in a guest rootfs) via
@@ -167,6 +288,29 @@ if [ -d "$BACKUP_DIR" ] && [ -d "$LAUNCHER_DATA/databases" ]; then
     chmod 771 "$LAUNCHER_DATA/databases" 2>/dev/null || true
     chmod 660 "$LAUNCHER_DATA/databases"/* 2>/dev/null || true
     echo "One UI Home screen database restored with UID $LAUNCHER_UID:$LAUNCHER_GID"
+fi
+# 6.0 (P11): restore the host-layout extras backed up by
+# backup_host.sh at takeover (shared_prefs, appwidgets, QS tiles).
+# Separate dir from the legacy databases restore above, so the two
+# restores cannot interfere. Failures are logged, never fatal.
+_HOST_BACKUP="/data/local/tmp/gsi_host_backup"
+if [ -d "$_HOST_BACKUP/shared_prefs" ]; then
+    mkdir -p "$LAUNCHER_DATA/shared_prefs" 2>/dev/null || true
+    cp -a "$_HOST_BACKUP/shared_prefs/"* "$LAUNCHER_DATA/shared_prefs/" 2>/dev/null || true
+    chown -R ${LAUNCHER_UID}:${LAUNCHER_GID} "$LAUNCHER_DATA/shared_prefs" 2>/dev/null || true
+    echo "One UI launcher shared_prefs restored (6.0 host backup)"
+fi
+if [ -f "$_HOST_BACKUP/appwidgets.xml" ]; then
+    cp -f "$_HOST_BACKUP/appwidgets.xml" /data/system/users/0/appwidgets.xml 2>/dev/null || true
+    chown system:system /data/system/users/0/appwidgets.xml 2>/dev/null || true
+    chmod 600 /data/system/users/0/appwidgets.xml 2>/dev/null || true
+    echo "One UI appwidgets.xml restored (6.0 host backup)"
+fi
+if [ -f "$_HOST_BACKUP/sysui_qs_tiles.txt" ]; then
+    _QS_SAVED="$(cat "$_HOST_BACKUP/sysui_qs_tiles.txt" 2>/dev/null)"
+    if [ -n "$_QS_SAVED" ]; then
+        settings put secure sysui_qs_tiles "$_QS_SAVED" 2>/dev/null && echo "One UI Quick Settings tiles restored (6.0 host backup)" || echo "HOST_BACKUP_WARN: could not restore QS tiles (continuing)"
+    fi
 fi
 
 echo "=== [3/5] Unmounting Container Overlays ==="

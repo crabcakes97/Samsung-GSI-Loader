@@ -39,8 +39,11 @@
 #
 # Output: a VERDICT line first, then a bounded excerpt.
 #   PSTORE_PANIC [EROFS_HINT] — a panic is recorded (erofs lines
-#     present => the EROFS driver path is the prime suspect and the
-#     EXT4 preset avoids that driver entirely).
+#     present in the panic trace itself => the EROFS driver path is
+#     the prime suspect and the EXT4 preset avoids that driver
+#     entirely). 6.3: trace-section-only — a bare "erofs" mention
+#     elsewhere in the log (e.g. a healthy mount line) does NOT fire
+#     the hint.
 #   PSTORE_NO_PANIC — pstore/last_kmsg exist but hold no panic
 #     signature: the reboot was userspace or manual, NOT a panic.
 #   PSTORE_EMPTY — the pstore dir exists but holds no previous-boot
@@ -107,11 +110,18 @@ for _f in $_cands; do
         _sections="$_sections
 --- panic lines in $_f ---
 $(grep -a -i -e "kernel panic" -e "BUG:" -e "call trace" -e "Oops" "$_f" 2>/dev/null | head -10)"
-        if grep -a -q -i "erofs" "$_f" 2>/dev/null; then
+        # 6.3: EROFS_HINT is TRACE-SECTION-ONLY. The old check fired on
+        # ANY "erofs" string anywhere in the file — including the benign
+        # "mounted with root inode" line from a healthy mount — which
+        # over-fired on every erofs guest. Only erofs mentions inside
+        # the panic trace itself (from the first panic-signature line
+        # to end of file) count toward the hint.
+        _trace_from=$(grep -a -n -i -e "kernel panic" -e "BUG:" -e "call trace" -e "Oops" "$_f" 2>/dev/null | head -1 | cut -d: -f1)
+        if [ -n "$_trace_from" ] && tail -n +"$_trace_from" "$_f" 2>/dev/null | grep -a -q -i "erofs"; then
             _found_erofs=1
             _sections="$_sections
---- erofs lines in $_f ---
-$(grep -a -i "erofs" "$_f" 2>/dev/null | head -10)"
+--- erofs lines in the panic trace in $_f ---
+$(tail -n +"$_trace_from" "$_f" 2>/dev/null | grep -a -i "erofs" | head -10)"
         fi
         _sections="$_sections
 --- tail of $_f (last 15) ---
@@ -132,7 +142,7 @@ if [ "$_reported" = "0" ]; then
 fi
 if [ "$_found_panic" = "1" ]; then
     if [ "$_found_erofs" = "1" ]; then
-        echo "PSTORE_PANIC EROFS_HINT: a kernel panic IS recorded and its trace mentions erofs — the EROFS driver path is the prime suspect for the reboot; the EXT4 preset avoids that driver entirely"
+        echo "PSTORE_PANIC EROFS_HINT: a kernel panic IS recorded and erofs appears in the panic trace itself — the EROFS driver path is the prime suspect for the reboot; the EXT4 preset avoids that driver entirely"
     else
         echo "PSTORE_PANIC: a kernel panic IS recorded, but its trace does not mention erofs — the reboot was a kernel panic, not a guest-service crash"
     fi

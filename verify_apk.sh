@@ -15,18 +15,18 @@
 #   6. no keystore material inside the APK
 #
 # Expectations are overridable for future releases, but the defaults are
-# the 5.9.17 release values — do not change them to make a bad build pass.
+# the 6.1 release values — do not change them to make a bad build pass.
 #   GSI_EXPECT_PACKAGE       default com.cronch.gsiloader
-#   GSI_EXPECT_VERSION_CODE  default 31
-#   GSI_EXPECT_VERSION_NAME  default 5.9.17
+#   GSI_EXPECT_VERSION_CODE  default 34
+#   GSI_EXPECT_VERSION_NAME  default 6.1
 #   GSI_EXPECT_CERT_SHA256   default 3f4ed94497375a9fbe998dd82b265f65d0c5152baf11f11da9ec0397b85f883f
 #   GSI_SDK_ROOT             default /home/hatch/workspace/onelineage/android-sdk
 #                            (aapt2/apksigner fall back to PATH)
 
 APK="${1:-}"
 EXPECT_PACKAGE="${GSI_EXPECT_PACKAGE:-com.cronch.gsiloader}"
-EXPECT_CODE="${GSI_EXPECT_VERSION_CODE:-31}"
-EXPECT_NAME="${GSI_EXPECT_VERSION_NAME:-5.9.17}"
+EXPECT_CODE="${GSI_EXPECT_VERSION_CODE:-34}"
+EXPECT_NAME="${GSI_EXPECT_VERSION_NAME:-6.1}"
 EXPECT_CERT="${GSI_EXPECT_CERT_SHA256:-3f4ed94497375a9fbe998dd82b265f65d0c5152baf11f11da9ec0397b85f883f}"
 SDK_ROOT="${GSI_SDK_ROOT:-/home/hatch/workspace/onelineage/android-sdk}"
 
@@ -105,7 +105,7 @@ echo "Signer cert SHA-256: $FOUND_CERT"
 if [ "$FOUND_CERT" = "$EXPECT_CERT" ]; then
     pass "signing cert SHA-256 matches 5.9.15 continuity cert"
 else
-    fail "signing cert SHA-256 mismatch (got: $FOUND_CERT, want: $EXPECT_CERT) — 5.9.16 would NOT update over 5.9.15"
+    fail "signing cert SHA-256 mismatch (got: $FOUND_CERT, want: $EXPECT_CERT) — 6.1 would NOT update over 6.0"
 fi
 
 # --- 4. manifest component resolution ---

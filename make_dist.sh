@@ -23,7 +23,7 @@ set -e
 APK="${1:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="${GSI_PROJECT_DIR:-$SCRIPT_DIR}"
-VERSION="${GSI_DIST_VERSION:-5.9.16}"
+VERSION="${GSI_DIST_VERSION:-5.9.18}"
 OUT_ZIP="${2:-$PROJECT_DIR/../GSI-Loader-Samsung-${VERSION}-dist.zip}"
 
 if [ -z "$APK" ]; then

@@ -29,6 +29,42 @@ ROOTFS="$STAGE/rootfs"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
+# 6.2 (P10): resolve system_ext / product inside the guest rootfs.
+# In a GSI, /system_ext is often an ABSOLUTE symlink (/system/system_ext)
+# and /system/product an absolute symlink (/product); in this (host)
+# namespace those resolve to HOST paths, so a bind or copy using the
+# unresolved path lands on the host tree while the guest keeps its own
+# (OneOS's finding: PMS then aborts parsing apex paths host apexd
+# reports but the guest tree lacks). Mechanism re-implemented from
+# OneOS (fahadalijaved): pick the candidate that is a real directory.
+# gsi_resolve_rootfs_dir echoes the real in-rootfs dir for a logical
+# name; if neither candidate is a real dir it echoes the legacy path
+# (current behavior, logged loudly by the caller) rather than failing
+# the boot on an odd image.
+gsi_resolve_rootfs_dir() {
+    case "$1" in
+        system_ext)
+            if [ -d "$ROOTFS/system_ext" ] && [ ! -L "$ROOTFS/system_ext" ]; then
+                echo "$ROOTFS/system_ext"
+            elif [ -d "$ROOTFS/system/system_ext" ] && [ ! -L "$ROOTFS/system/system_ext" ]; then
+                echo "$ROOTFS/system/system_ext"
+            else
+                echo "$ROOTFS/system_ext"
+            fi
+            ;;
+        product)
+            if [ -d "$ROOTFS/system/product" ] && [ ! -L "$ROOTFS/system/product" ]; then
+                echo "$ROOTFS/system/product"
+            elif [ -d "$ROOTFS/product" ] && [ ! -L "$ROOTFS/product" ]; then
+                echo "$ROOTFS/product"
+            else
+                echo "$ROOTFS/system/product"
+            fi
+            ;;
+        *) echo "$ROOTFS/$1" ;;
+    esac
+}
+
 # Generic-GSI patch flags, written by the app as $STAGE/gsi_flags.conf.
 # DEFAULT IS ALL OFF: the patched files below were built against LineageOS
 # 23.2's framework and are version-coupled. Binding them over an arbitrary
@@ -128,7 +164,35 @@ done
 
 echo "=== 4. Setting up Core System Bind Mounts ==="
 mount | grep -q "$ROOTFS/proc " || $BB mount -t proc proc "$ROOTFS/proc"
-mount | grep -q "$ROOTFS/sys " || $BB mount -t sysfs sysfs "$ROOTFS/sys"
+# 6.2 (P2): bind the HOST /sys (rbind + rslave) instead of a fresh
+# sysfs mount, so the guest sees the host cgroup2 hierarchy at
+# /sys/fs/cgroup. Mechanism re-implemented from OneOS (fahadalijaved):
+# without the host cgroup2 hierarchy the guest zygote cannot put
+# system_server in a process group (createProcessGroup fails) and it
+# dies on fork — animation runs, logo stalls, ~100 s later the unfed
+# softdog panics. That is the prime suspect for the logo-stage panic.
+# rslave keeps guest-side mount changes from propagating back to the
+# host. Fallback: fresh sysfs if the rbind fails (logged loudly; the
+# guest then has NO host cgroup2, as in 6.1 and earlier). Tradeoff,
+# stated plainly: the guest (root, setenforce 0) can write host sysfs
+# nodes, the same exposure OneOS accepts with this mechanism.
+if mount | grep -q "$ROOTFS/sys "; then
+    echo "SYS_MOUNT_EXISTING: $ROOTFS/sys already mounted: $(mount 2>/dev/null | grep "$ROOTFS/sys " | head -n 1)"
+elif $BB mount --rbind /sys "$ROOTFS/sys" 2>/dev/null; then
+    if $BB mount --make-rslave "$ROOTFS/sys" 2>/dev/null; then
+        echo "SYS_RBIND_OK: host /sys rbound into guest (rslave); guest sees host cgroup2 hierarchy at /sys/fs/cgroup (6.2 P2)"
+    else
+        echo "SYS_RBIND_WARN: host /sys rbound but --make-rslave failed (guest mount changes may propagate to host; cgroup2 still visible)"
+    fi
+    if [ -d "$ROOTFS/sys/fs/cgroup" ]; then
+        echo "SYS_CGROUP_OK: guest /sys/fs/cgroup is present (host cgroup2 hierarchy visible)"
+    else
+        echo "SYS_CGROUP_WARN: guest /sys/fs/cgroup NOT present after rbind (system_server may die on fork; see SYS_RBIND lines)"
+    fi
+else
+    echo "SYS_RBIND_FAIL: host /sys rbind failed — falling back to fresh sysfs (guest will NOT see host cgroup2; system_server may die on fork, as in 6.1)"
+    $BB mount -t sysfs sysfs "$ROOTFS/sys" 2>/dev/null || echo "SYS_MOUNT_FAIL: fresh sysfs mount also failed"
+fi
 
 if [ ! -e /dev/binderfs/binder ]; then
     mount -t binder binder /dev/binderfs 2>/dev/null || true
@@ -146,14 +210,112 @@ mount | grep -q "$ROOTFS/linkerconfig " || $BB mount --rbind /linkerconfig "$ROO
 mount | grep -q "$ROOTFS/vendor " || $BB mount --bind /vendor "$ROOTFS/vendor"
 mount | grep -q "$ROOTFS/odm " || $BB mount --bind /odm "$ROOTFS/odm"
 mount | grep -q "$ROOTFS/vendor_dlkm " || $BB mount --bind /vendor_dlkm "$ROOTFS/vendor_dlkm"
+# 6.0 (P9): bind the remaining vendor-module partitions newer guests
+# expect — odm_dlkm, system_dlkm, config — each only if present on
+# the host. A missing host dir means no bind (logged by absence, not
+# failure): the guest simply does not see that partition.
+if [ -d /odm_dlkm ]; then
+    mkdir -p "$ROOTFS/odm_dlkm" 2>/dev/null || true
+    if mount | grep -q "$ROOTFS/odm_dlkm " || $BB mount --bind /odm_dlkm "$ROOTFS/odm_dlkm" 2>/dev/null; then
+        echo "Bound /odm_dlkm -> $ROOTFS/odm_dlkm (6.0 P9)"
+    fi
+fi
+if [ -d /system_dlkm ]; then
+    mkdir -p "$ROOTFS/system_dlkm" 2>/dev/null || true
+    if mount | grep -q "$ROOTFS/system_dlkm " || $BB mount --bind /system_dlkm "$ROOTFS/system_dlkm" 2>/dev/null; then
+        echo "Bound /system_dlkm -> $ROOTFS/system_dlkm (6.0 P9)"
+    fi
+fi
+if [ -d /config ]; then
+    mkdir -p "$ROOTFS/config" 2>/dev/null || true
+    if mount | grep -q "$ROOTFS/config " || $BB mount --rbind /config "$ROOTFS/config" 2>/dev/null; then
+        echo "Bound /config -> $ROOTFS/config (6.0 P9)"
+    fi
+fi
+# 6.0 (P5): cleared preloaded-classes. A foreign guest's preload list
+# can reference classes its own framework lacks, crashing zygote at
+# preload; bind an empty list over it. The target file exists in the
+# read-only rootfs, so the bind itself always works when the file is
+# present; a failure is logged, never fatal to prepare.
+if [ -f "$ROOTFS/system/etc/preloaded-classes" ]; then
+    mkdir -p "$STAGE/etc" 2>/dev/null || true
+    echo "# Cleared preloaded-classes for guest GSI (6.0 P5)" > "$STAGE/etc/preloaded-classes" 2>/dev/null || true
+    if $BB mount --bind "$STAGE/etc/preloaded-classes" "$ROOTFS/system/etc/preloaded-classes" 2>/dev/null; then
+        echo "PRELOADED_CLASSES_CLEARED: guest preload list replaced with empty list (6.0 P5)"
+    else
+        echo "PRELOADED_CLASSES_WARN: bind failed (guest preload list left as-is)"
+    fi
+fi
+# 6.0 (P4): /vendor/etc/aconfig overlay. Samsung's vendor lacks
+# etc/aconfig, which makes the guest's aconfigd-system abort. Overlay
+# host /vendor/etc with a writable upper layer in $STAGE so the
+# aconfig dir can be created without touching the host vendor, then
+# stage the guest's product aconfig files into it. Fallback (no
+# overlayfs): tmpfs + rebind each entry. Best-effort: if both fail,
+# the inner-script pre-population still runs and the failure is
+# logged loudly below.
+if [ ! -d "$ROOTFS/vendor/etc/aconfig" ]; then
+    mkdir -p "$STAGE/vendor_etc_upper" "$STAGE/vendor_etc_work" 2>/dev/null || true
+    if ! $BB mount -t overlay overlay -o lowerdir=/vendor/etc,upperdir="$STAGE/vendor_etc_upper",workdir="$STAGE/vendor_etc_work" "$ROOTFS/vendor/etc" 2>/dev/null; then
+        echo "ACONFIG_OVERLAY_FALLBACK: overlayfs failed on vendor/etc, using tmpfs + rebind"
+        $BB mount -t tmpfs tmpfs "$ROOTFS/vendor/etc" 2>/dev/null || true
+        for _item in /vendor/etc/*; do
+            [ -e "$_item" ] || continue
+            _base="$(basename "$_item")"
+            if [ -d "$_item" ]; then
+                mkdir -p "$ROOTFS/vendor/etc/$_base" 2>/dev/null || true
+                $BB mount --bind "$_item" "$ROOTFS/vendor/etc/$_base" 2>/dev/null || true
+            else
+                touch "$ROOTFS/vendor/etc/$_base" 2>/dev/null || true
+                $BB mount --bind "$_item" "$ROOTFS/vendor/etc/$_base" 2>/dev/null || true
+            fi
+        done
+    fi
+    mkdir -p "$ROOTFS/vendor/etc/aconfig" 2>/dev/null || true
+    # 6.2 (P10): read the guest's product aconfig through the resolved
+    # product dir — $ROOTFS/system/product is an absolute symlink
+    # (/product) in many GSIs, which would read the HOST's product
+    # aconfig instead of the guest's.
+    _GUEST_PRODUCT="$(gsi_resolve_rootfs_dir product)"
+    if [ -L "$ROOTFS/system/product" ]; then
+        echo "PRODUCT_RESOLVED: guest /system/product is a symlink; reading aconfig from $_GUEST_PRODUCT (6.2 P10)"
+    fi
+    cp -a "$_GUEST_PRODUCT/etc/aconfig/"* "$ROOTFS/vendor/etc/aconfig/" 2>/dev/null || true
+    if [ -d "$ROOTFS/vendor/etc/aconfig" ]; then
+        echo "ACONFIG_OVERLAY_OK: vendor/etc/aconfig staged (6.0 P4)"
+    else
+        echo "ACONFIG_OVERLAY_FAIL: could not create vendor/etc/aconfig (aconfigd-system may abort; inner pre-population still runs)"
+    fi
+fi
+# 6.0 (P4): bind host /metadata so the inner script's
+# /metadata/aconfig pre-population lands on a writable partition.
+if [ -d /metadata ]; then
+    mkdir -p "$ROOTFS/metadata" 2>/dev/null || true
+    if mount | grep -q "$ROOTFS/metadata " || $BB mount --rbind /metadata "$ROOTFS/metadata" 2>/dev/null; then
+        echo "ACONFIG_METADATA_BIND: host /metadata bound into guest (6.0 P4)"
+    fi
+fi
+# 6.0 (P4): stage the synthetic android.xr aconfig data into guest
+# /data (the inner script copies it into /metadata/aconfig).
+mkdir -p "$STAGE/data" 2>/dev/null || true
+for _x in xr.flag.map xr.info xr.package.map xr.val; do
+    if [ -f "$STAGE/$_x" ]; then
+        cp -f "$STAGE/$_x" "$STAGE/data/$_x" 2>/dev/null || true
+    fi
+done
 # apexd is a HOST daemon: it reports the Samsung apex set (/system/apex,
 # /system_ext/apex, /vendor/apex) to the container system_server, which then
 # tries to parse those exact paths inside this namespace. Keep the apex
 # directories identical to what host apexd sees (an empty tmpfs or the GSI's
 # own .capex layout makes PMS abort with "Unable to parse" at boot).
+# 6.2 (P10): resolve system_ext before binding (see resolver above).
+_GUEST_SYSTEM_EXT="$(gsi_resolve_rootfs_dir system_ext)"
+if [ -L "$ROOTFS/system_ext" ]; then
+    echo "SYS_EXT_RESOLVED: guest /system_ext is a symlink; using $_GUEST_SYSTEM_EXT for the apex bind (6.2 P10)"
+fi
 if [ -d /system_ext/apex ]; then
-    mkdir -p "$ROOTFS/system_ext/apex"
-    mount | grep -q "$ROOTFS/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system_ext/apex"
+    mkdir -p "$_GUEST_SYSTEM_EXT/apex"
+    mount | grep -q "$_GUEST_SYSTEM_EXT/apex " || $BB mount --bind /system_ext/apex "$_GUEST_SYSTEM_EXT/apex"
 fi
 mount | grep -q "$ROOTFS/mnt " || $BB mount --rbind /mnt "$ROOTFS/mnt"
 # 5.9.5-SCRIPTS-START: framework patch gating. The patched jars/apk
@@ -182,6 +344,21 @@ if [ -n "$FRAMEWORK_VERSION" ]; then
     esac
 else
     echo "WARNING: FRAMEWORK_VERSION not provided — patch gating skipped, flags control patches"
+fi
+# 6.0 (P6): guest SDK detection from the guest's own build.prop
+# (alongside Java's FRAMEWORK_VERSION gating above). Used only by
+# the Android 17 services-patch branch below.
+GUEST_SDK=""
+for _bp in "$ROOTFS/system/build.prop" "$ROOTFS/system/etc/build.prop" "$ROOTFS/build.prop" "$ROOTFS/etc/build.prop"; do
+    if [ -f "$_bp" ]; then
+        GUEST_SDK="$(grep -m1 '^ro.build.version.sdk=' "$_bp" 2>/dev/null | cut -d= -f2 | tr -d '\r')"
+        [ -n "$GUEST_SDK" ] && break
+    fi
+done
+if [ -n "$GUEST_SDK" ]; then
+    echo "GUEST_SDK_DETECTED: sdk=$GUEST_SDK (framework_version=${FRAMEWORK_VERSION:-unset})"
+else
+    echo "GUEST_SDK_DETECTED: sdk=unknown (no build.prop sdk found)"
 fi
 # 5.9.5-SCRIPTS-END
 # 5.9.16: dead-flag cleanup. The old block only echoed three fix
@@ -233,6 +410,25 @@ if [ "$PATCH_FRAMEWORK" = "1" ]; then
 else
     echo "Framework patches DISABLED by gsi_flags.conf (generic GSI mode): using the GSI's own framework untouched"
 fi
+# 6.0 (P6): Android 17 services-patch branch — SHIPPED DISABLED.
+# The candidate jar (services_android17_patched.jar) is binary-only
+# with unverified provenance, and no stock A17 services jar exists
+# on the build VM to DEX-diff it against, so the verification gate
+# cannot pass. Until a DEX-level comparison against stock A17
+# services is done, A17 guests boot UNPATCHED (same as 5.9.x) and
+# this branch only logs. To enable after verification: ship the
+# verified jar as $STAGE/services_android17_patched.jar and set
+# PATCH_A17_SERVICES=1 in gsi_flags.conf.
+PATCH_A17_SERVICES="${PATCH_A17_SERVICES:-0}"
+if [ "$GUEST_SDK" = "37" ]; then
+    if [ "$PATCH_A17_SERVICES" = "1" ] && [ -f "$STAGE/services_android17_patched.jar" ]; then
+        $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+        $BB mount --bind "$STAGE/services_android17_patched.jar" "$ROOTFS/system/framework/services.jar" || { echo "!!! PATCH_BIND_FAILED: services_android17_patched.jar (aborting — a half-patched framework crashes the guest)"; exit 1; }
+        echo "Bound services_android17_patched.jar -> $ROOTFS/system/framework/services.jar (A17 branch, verified jar)"
+    else
+        echo "A17_SERVICES_PATCH_DISABLED: guest SDK 37 detected but the A17 services patch is DISABLED (binary-only jar, unverified provenance, no DEX-vs-stock check possible) — guest boots with its own unpatched services.jar"
+    fi
+fi
 
 if [ "$PATCH_PERMISSION_CONTROLLER" = "1" ] && [ -f "$STAGE/PermissionController_patched.apk" ]; then
     chmod 644 "$STAGE/PermissionController_patched.apk"
@@ -262,13 +458,48 @@ mkdir -p "$STAGE/data/adb" "$STAGE/data/apex" "$STAGE/data/dalvik-cache/arm64"
 # seeing the phone entirely. Writing the XML now keeps the gadget stable through
 # the whole boot.
 GSET="$STAGE/data/system/users/0/settings_global.xml"
-if [ -f "$GSET" ]; then
+# 6.3 (dive R2): numeric-id settings seeding + repair of poisoned
+# staged files. Mechanism re-implemented from OneOS
+# (fahadalijaved/OneOS, seed_settings — credit; no OneOS code
+# copied): inserting <setting id="adb_enabled" .../> gave the entry a
+# NON-numeric id, which makes SettingsProvider fail to parse the
+# file and abort system_server. Only ever (a) change the value of an
+# existing name="adb_enabled" entry, or (b) insert with the next free
+# NUMERIC id. Any line a previous run inserted with the bad
+# non-numeric id is deleted first (repair — never the whole file),
+# and each edit is verified: a failed edit restores the backup
+# instead of leaving a half-written file. Never fatal: if the file
+# is absent or not a text XML file, the guest creates it and the UI
+# activator sets adb_enabled once the guest is up.
+if [ -f "$GSET" ] && [ "$(head -c 5 "$GSET" 2>/dev/null)" = "<?xml" ]; then
+    _gset_bak="$GSET.gsi-prev"
+    cp -f "$GSET" "$_gset_bak" 2>/dev/null || true
     if grep -q 'id="adb_enabled"' "$GSET" 2>/dev/null; then
-        sed -i 's/id="adb_enabled"\([^>]*\)value="[^"]*"/id="adb_enabled"\1value="1"/' "$GSET" 2>/dev/null
-    else
-        sed -i 's#</settings>#    <setting id="adb_enabled" name="adb_enabled" value="1" package="android" />\n</settings>#' "$GSET" 2>/dev/null
+        _repaired=$(grep -c 'id="adb_enabled"' "$GSET" 2>/dev/null || true)
+        sed -i '/id="adb_enabled"/d' "$GSET" 2>/dev/null || true
+        echo "SETTINGS_REPAIR: removed ${_repaired:-0} poisoned non-numeric-id adb_enabled line(s) from staged settings_global.xml (dive R2)"
     fi
-    echo "Pre-seeded adb_enabled=1 in guest settings_global.xml"
+    if grep -q 'name="adb_enabled"' "$GSET" 2>/dev/null; then
+        sed -i '/name="adb_enabled"/s/ value="[^"]*"/ value="1"/' "$GSET" 2>/dev/null || true
+        if ! grep -q 'name="adb_enabled" value="1"' "$GSET" 2>/dev/null; then
+            sed -i 's/ name="adb_enabled"/ name="adb_enabled" value="1"/' "$GSET" 2>/dev/null || true
+        fi
+    else
+        _maxid=$(awk -F'id="' '{for(i=2;i<=NF;i++){split($i,a,"\""); if(a[1] ~ /^[0-9]+$/) print a[1]}}' "$GSET" 2>/dev/null | sort -n | tail -1)
+        _nextid=$(( ${_maxid:-0} + 1 ))
+        sed -i "s#</settings>#    <setting id=\"$_nextid\" name=\"adb_enabled\" value=\"1\" package=\"android\" />\n</settings>#" "$GSET" 2>/dev/null || true
+        echo "SETTINGS_SEED: inserted adb_enabled=1 with numeric id=$_nextid"
+    fi
+    _got=$(grep -c 'name="adb_enabled" value="1"' "$GSET" 2>/dev/null || true)
+    if [ "${_got:-0}" != "1" ] || ! tail -c 32 "$GSET" 2>/dev/null | grep -q '</settings>'; then
+        cp -f "$_gset_bak" "$GSET" 2>/dev/null || true
+        echo "SETTINGS_SEED_WARN: edit did not verify (restored staged settings_global.xml unchanged; adb_enabled will be set by the UI activator once the guest is up)"
+    else
+        echo "Pre-seeded adb_enabled=1 in guest settings_global.xml (numeric id, verified)"
+    fi
+    rm -f "$_gset_bak" 2>/dev/null || true
+else
+    echo "SETTINGS_SEED: no text settings_global.xml staged yet (guest creates it; UI activator sets adb_enabled once up)"
 fi
 
 if [ -f /data/misc/adb/adb_keys ]; then
@@ -720,6 +951,71 @@ else
     cp -a /apex/apex-info-list.xml "$ROOTFS/apex/" 2>/dev/null || true
 fi
 chmod 644 "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || true
+# 6.6: core APEX set — every APEX whose jars land on a boot or
+# system-server classpath (guest derive_classpath output, proven
+# by the 6.4 bundle's classpath dumps). These MUST be
+# guest-generation: a host-served core APEX against the guest
+# framework is the conscrypt/core-libart NoSuchMethodError
+# (isInZygote) that killed every 6.5 zygote attempt, with the
+# patches OFF (stock guest jars). Short names (com.android.
+# prefix stripped); runtime/cellbroadcast/extservices stay
+# non-core (not on any classpath). Used by the P8 filter log,
+# mount_payload skew warnings, and the step-9 provenance log.
+_APEX_CORE="art i18n adservices appsearch bt configinfrastructure conscrypt crashrecovery devicelock healthfitness ipsec media mediaprovider nfcservices npumanager ondevicepersonalization os.statsd permission profiling scheduling sdkext telephonycore tethering uprobestats uwb virt webapp wifi compos rkpd"
+# 6.0 (P8): filter the apex-info list to entries that resolve in
+# this guest, and strip Samsung/SEC/lifeguard entries. A list entry
+# whose module path does not exist under the guest rootfs makes PMS
+# chase a path that cannot resolve; vendor entries from the host
+# list do not belong in a foreign guest. Header/footer lines pass
+# through untouched. Best-effort: if filtering fails, the unfiltered
+# list stays (boot continues; the failure is logged).
+if [ -f "$ROOTFS/apex/apex-info-list.xml" ]; then
+    _APEX_KEPT=0; _APEX_DROPPED=0
+    _APEX_TMP="$STAGE/apex-info-list.filtered"
+    if : > "$_APEX_TMP" 2>/dev/null; then
+        while IFS= read -r _aline || [ -n "$_aline" ]; do
+            case "$_aline" in
+                *"<apex-info"*)
+                    _mp="$(printf '%s' "$_aline" | sed -n 's/.*modulePath="\([^"]*\)".*/\1/p')"
+                    _mn="$(printf '%s' "$_aline" | sed -n 's/.*moduleName="\([^"]*\)".*/\1/p')"
+                    _ll="$(printf '%s' "$_aline" | tr 'A-Z' 'a-z')"
+                    _drop=0; _drop_reason=""
+                    case "$_ll" in
+                        *samsung*|*lifeguard*|*com.sec.*) _drop=1; _drop_reason="samsung-sec-lifeguard" ;;
+                    esac
+                    if [ "$_drop" -eq 0 ] && [ -n "$_mp" ] && [ ! -e "$ROOTFS$_mp" ]; then
+                        _drop=1; _drop_reason="missing-in-guest"
+                    fi
+                    if [ "$_drop" -eq 1 ]; then
+                        _APEX_DROPPED=$((_APEX_DROPPED + 1))
+                    else
+                        printf '%s\n' "$_aline" >> "$_APEX_TMP"
+                        _APEX_KEPT=$((_APEX_KEPT + 1))
+                    fi
+                    # 6.6: per-APEX filter provenance for classpath
+                    # APEXes — the bare kept/dropped counts cannot
+                    # prove generation consistency on-device.
+                    if [ -n "$_mn" ]; then
+                        case " $_APEX_CORE " in *" ${_mn#com.android.} "*)
+                            if [ "$_drop" -eq 1 ]; then
+                                echo "APEX_FILTER: $_mn DROPPED reason=$_drop_reason path=$_mp"
+                            else
+                                echo "APEX_FILTER: $_mn KEPT path=$_mp"
+                            fi
+                            ;;
+                        esac
+                    fi
+                    ;;
+                *) printf '%s\n' "$_aline" >> "$_APEX_TMP" ;;
+            esac
+        done < "$ROOTFS/apex/apex-info-list.xml"
+        cp -f "$_APEX_TMP" "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || echo "APEX_FILTER_WARN: could not write filtered list (unfiltered list stays)"
+        rm -f "$_APEX_TMP" 2>/dev/null || true
+        echo "APEX_FILTER_6.0: kept $_APEX_KEPT entries, dropped $_APEX_DROPPED (missing in guest or Samsung/SEC/lifeguard)"
+    else
+        echo "APEX_FILTER_WARN: could not create temp file (unfiltered list stays)"
+    fi
+fi
 
 echo "=== 8. Direct Mounting Extracted APEX Payloads ==="
 mount_payload() {
@@ -745,11 +1041,35 @@ mount_payload() {
         # or extraction failed (suspicious — e.g. an EROFS read error
         # while unzipping the capex, which would also explain a boot
         # crash minutes in).
+        # 6.6: flattened-APEX fallback. Some GSIs ship an APEX as an
+        # extracted directory under /system/apex instead of a .apex /
+        # .capex file. Guest content still wins: bind the guest
+        # directory onto the apex mount point so the step-9 host bind
+        # cannot substitute host-generation jars. Only trusted when
+        # $ROOTFS/system/apex is the guest's own dir (not a stale
+        # host bind left by a previous prepare — the host bind is
+        # applied after the payload mounts below).
+        _FLAT="$ROOTFS/system/apex/com.android.${NAME}"
+        if [ -d "$_FLAT" ] && ! mount | grep -q "$ROOTFS/system/apex "; then
+            mkdir -p "$DEST"
+            if $BB mount --bind "$_FLAT" "$DEST" 2>/dev/null; then
+                echo "Direct bound flattened guest APEX $NAME -> $DEST"
+                echo "APEX_PROVENANCE: $TARGET guest-flattened (bind $_FLAT)"
+                return 0
+            fi
+            echo "WARNING: mount_payload $NAME: flattened guest APEX bind failed for $DEST"
+        fi
         if [ -f "$CAPEX" ] || [ -f "$APEX" ]; then
             echo "WARNING: mount_payload $NAME: payload extraction failed (capex/apex present but no apex_payload.img) — APEX $TARGET will be missing"
         else
             echo "mount_payload: $NAME: no .capex/.apex in guest /system/apex — skipping (host apex binds may cover it)"
         fi
+        # 6.6: generation-skew warning. A classpath APEX with no
+        # guest payload is served by the step-9 host bind: host-
+        # generation jars against the guest framework — exactly the
+        # conscrypt/core-libart NoSuchMethodError (isInZygote) that
+        # killed every 6.5 zygote attempt with the patches OFF.
+        case " $_APEX_CORE " in *" $NAME "*) echo "APEX_SKEW_WARN: $TARGET has no guest payload — host bind will serve it; host-vs-guest generation skew possible" ;; esac
         return 0
     }
     if mount | grep "$DEST " | grep -q "/dev/block/dm-"; then
@@ -760,6 +1080,7 @@ mount_payload() {
     fi
     if mount | grep "$DEST " | grep -q "/dev/block/loop"; then
         echo "$NAME already mounted on loop at $DEST"
+        echo "APEX_PROVENANCE: $TARGET guest-payload (cached loop mount)"
         return 0
     fi
     mkdir -p "$DEST"
@@ -771,8 +1092,13 @@ mount_payload() {
     # binds may still cover this APEX.
     if $BB mount -t ext4 -o ro "$LOOP" "$DEST"; then
         echo "Direct mounted $NAME on $LOOP -> $DEST"
+        echo "APEX_PROVENANCE: $TARGET guest-payload (loop $LOOP)"
     else
         echo "WARNING: mount_payload $NAME: mount failed for $DEST — APEX $TARGET will be missing"
+        # 6.6: a failed payload mount falls through to the step-9
+        # host bind — same generation-skew exposure as a missing
+        # payload for a classpath APEX.
+        case " $_APEX_CORE " in *" $NAME "*) echo "APEX_SKEW_WARN: $TARGET payload mount failed — host bind will serve it; host-vs-guest generation skew possible" ;; esac
     fi
     for vdir in "$ROOTFS/apex/${TARGET}"@*; do
         if [ -d "$vdir" ]; then
@@ -805,6 +1131,26 @@ mount_payload "healthfitness" "com.android.healthfitness"
 mount_payload "ondevicepersonalization" "com.android.ondevicepersonalization"
 mount_payload "configinfrastructure" "com.android.configinfrastructure"
 mount_payload "bt" "com.android.bt"
+# 6.6: the classpath APEXes below were missing from the step-8 list,
+# so their jars were served ONLY by the step-9 host binds — host
+# generation against the guest framework (conscrypt A17 vs
+# core-libart A16 = the 6.5 NoSuchMethodError). Guest payloads win
+# for all of them now; a genuinely absent guest payload keeps the
+# host fallback with a loud APEX_SKEW_WARN (see mount_payload).
+mount_payload "conscrypt" "com.android.conscrypt"
+mount_payload "compos" "com.android.compos"
+mount_payload "devicelock" "com.android.devicelock"
+mount_payload "ipsec" "com.android.ipsec"
+mount_payload "media" "com.android.media"
+mount_payload "npumanager" "com.android.npumanager"
+mount_payload "os.statsd" "com.android.os.statsd"
+mount_payload "profiling" "com.android.profiling"
+mount_payload "scheduling" "com.android.scheduling"
+mount_payload "telephonycore" "com.android.telephonycore"
+mount_payload "uprobestats" "com.android.uprobestats"
+mount_payload "uwb" "com.android.uwb"
+mount_payload "virt" "com.android.virt"
+mount_payload "webapp" "com.android.webapp"
 
 # Payload extractions above used the GSI's own /system/apex files. Now that the
 # images are cached, present the HOST's /system/apex to the container so the
@@ -829,6 +1175,21 @@ for a in /apex/*; do
         mkdir -p "$ROOTFS/apex/$base"
         $BB mount --bind "$a" "$ROOTFS/apex/$base" 2>/dev/null || true
         echo "Bound $base -> $ROOTFS/apex/$base"
+        # 6.6: provenance for classpath APEXes. A core APEX reaching
+        # this bind has no guest payload (step 8 mounts first and
+        # this loop skips mounted entries) — it is host-served; the
+        # APEX_SKEW_WARN from mount_payload already named it.
+        # Versioned siblings (name@version) are inert for the
+        # classpaths, which resolve the unversioned path — log no
+        # provenance for them so a sibling bind is never misread
+        # as the active APEX being host-served.
+        case "$base" in
+            *@*) ;;
+            *)
+                _short="${base#com.android.}"
+                case " $_APEX_CORE " in *" $_short "*) echo "APEX_PROVENANCE: $base host-bind (no guest payload; generation-skew risk — see APEX_SKEW_WARN)" ;; esac
+                ;;
+        esac
     fi
 done
 
