@@ -148,6 +148,44 @@
  *    the list untouched: the sweep can never block booting.
  *    Idempotent across supervisor-loop retries: a filtered
  *    list re-reads clean and the sweep no-ops.
+ *  - 6.16: APEX bind (the APEX wall is a missing dir, not a
+ *    poisoned list - see below). The 6.15 on-device runs proved
+ *    the sweep works (gmssystem HIDDEN, kept=43 hidden=1) yet
+ *    PMS still dies on the same modulePath: PMS reads its APEX
+ *    set from host apexd over binder, not from
+ *    apex-info-list.xml, so filtering the list can never reach
+ *    it, and the guest never had /product/apex bound in, so
+ *    the open fails ENOENT (ziparchive reports any failed open
+ *    as a generic "I/O error"). Before the sweep, this launcher
+ *    now binds every distinct modulePath parent dir the guest
+ *    lacks (host dir found via the put_old mount or
+ *    /proc/1/root) onto the guest path, make-rslave, with a
+ *    tmpfs shadow mirroring the parent when the read-only
+ *    image refuses the mountpoint. The sweep is UNTOUCHED and
+ *    now keeps gmssystem once the bind makes it readable.
+ *    Placement is native, not Java: no Java seam exists before
+ *    the prepare script (the staged rootfs is not mounted yet
+ *    when Java runs), so the bind runs post-pivot in this
+ *    launcher, in the namespace the forked zygote inherits.
+ *    Every bind failure logs loudly and the boot continues.
+ *  - 6.17: DIAGNOSTICS ONLY — supervisor exit-status logging (see
+ *    below). The 6.16 Lineage run proved the launcher's child is
+ *    KILLED BY SIGNAL 9 (shell status 137) 6-10s in, 4 attempts:
+ *    an outside killer (lmkd/OOM/supervisor), not a Java fatal
+ *    (exit 10) or native abort (SIGABRT). This launcher used to
+ *    execve directly and never wait, so no record of HOW each
+ *    attempt died survived in its own log. main() now forks:
+ *    the CHILD sets PR_SET_PDEATHSIG (SIGKILL) and execve's
+ *    exactly as before (identical fd table, binds, environment,
+ *    fallbacks); the PARENT waitpid()s, appends one ZYGOTE_EXIT
+ *    line per attempt (raw status, exit code or signal,
+ *    lifetime, timestamp) to zygote_exec.log, sleeps the
+ *    existing backoff (2/4/8/16s), and repeats to the existing
+ *    cap (5 attempts), then exits with the last status
+ *    (128+signal when signaled, so the outer script sees the
+ *    same 137 it sees today). The outer script remains the
+ *    supervisor; this log is the authoritative per-attempt
+ *    record. Binds, sweep, stdio, FD handling: UNTOUCHED.
  *  - Four exec fallbacks in order: 64-bit with forced JIT zygote,
  *    64-bit without it, 32-bit with it, 32-bit without it. If all
  *    fail, the errno is logged and the process exits 1 so the
@@ -172,6 +210,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mount.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <signal.h>
+#include <time.h>
 
 extern char **environ;
 
@@ -738,6 +780,587 @@ static void apex_sweep(void) {
     free(data);
 }
 
+/* 6.16 APEX bind. Runs in main() BEFORE apex_sweep() (the
+ * sweep's filtered view would hide the very entries the bind
+ * must see) and in the same guest mount namespace the forked
+ * zygote inherits. The 6.15 sweep filters the XML list, but PMS
+ * reads its APEX set from host apexd over binder, so the
+ * filtered list never reaches PMS; PMS then opens each
+ * reported modulePath in the guest namespace, where host-only
+ * apex dirs (notably /product/apex) were never bound in and
+ * the open fails ENOENT (reported by ziparchive as a generic
+ * "I/O error"). This step makes those paths EXIST: for every
+ * distinct modulePath parent dir in the host list that the
+ * guest does not already have covered, it bind-mounts the host
+ * dir onto the guest path. The host dir is found through the
+ * previous-root mount (still mounted at its put_old path) or
+ * /proc/1/root. The guest image is loop-mounted read-only, so
+ * a missing mountpoint cannot be mkdir'd: the parent dir is
+ * then shadowed with a tmpfs that first mirrors the parent's
+ * existing children (one level, one bind per child, symlinks
+ * recreated), so nothing the guest already has is hidden.
+ * Every failure logs loudly and the boot continues: the bind
+ * can never block booting. The 6.15 sweep is left untouched;
+ * this step only adds the APEX_SWEEP_DIR / APEX_DIRS diagnostic
+ * lines and the APEX_BIND lines. */
+#ifndef GSI_APEX_BIND_TEST_ROOT
+#define GSI_APEX_BIND_TEST_ROOT ""
+#endif
+#define GSI_APEX_BIND_MAX_DIRS 16
+#define GSI_APEX_BIND_PATH_MAX 1024
+
+/* Prefix a guest-namespace path with the harness test root
+ * when one is compiled in; on device the prefix is empty and
+ * the path passes through unchanged. Host-source paths are
+ * never prefixed. Returns 1 on success, 0 on truncation. */
+static int apex_guest_path(const char *dir, char *out, size_t out_sz) {
+    int n;
+    if (GSI_APEX_BIND_TEST_ROOT[0] != '\0') {
+        n = snprintf(out, out_sz, "%s%s", GSI_APEX_BIND_TEST_ROOT, dir);
+    } else {
+        n = snprintf(out, out_sz, "%s", dir);
+    }
+    return n >= 0 && (size_t)n < out_sz;
+}
+
+/* Parent dir of path (everything before the last '/'; "/"
+ * when the path has no parent dir). No trailing slash except
+ * for the root itself. */
+static void apex_dirname(const char *path, char *out, size_t out_sz) {
+    const char *slash = strrchr(path, '/');
+    size_t n;
+    if (!slash || slash == path) {
+        snprintf(out, out_sz, "/");
+        return;
+    }
+    n = (size_t)(slash - path);
+    if (n >= out_sz) {
+        n = out_sz - 1;
+    }
+    memcpy(out, path, n);
+    out[n] = '\0';
+}
+
+/* Basename of path (after the last '/'; the whole path when it
+ * has no slash). */
+static const char *apex_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* Covered means the guest already has this apex dir usable: it
+ * exists, is a directory, and holds at least one readable
+ * entry. Guest-payload dirs (/system/apex) and host-bound dirs
+ * (/system_ext/apex, /odm/apex) satisfy this; a missing, empty,
+ * or only-unreadable dir does not. */
+static int apex_dir_covered(const char *guest_dir) {
+    struct stat st;
+    DIR *d;
+    struct dirent *e;
+    int tried = 0;
+    if (stat(guest_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+    d = opendir(guest_dir);
+    if (!d) {
+        return 0;
+    }
+    while ((e = readdir(d)) != NULL) {
+        char child[GSI_APEX_BIND_PATH_MAX];
+        char errbuf[128];
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        if (snprintf(child, sizeof(child), "%s/%s", guest_dir, e->d_name) >= (int)sizeof(child)) {
+            continue;
+        }
+        if (apex_entry_readable(child, errbuf, sizeof(errbuf))) {
+            closedir(d);
+            return 1;
+        }
+        if (++tried >= 4) {
+            break;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+/* Unescape "\040" (space) in a mountinfo field, in place. */
+static void apex_unescape040(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if (r[0] == '\\' && r[1] == '0' && r[2] == '4' && r[3] == '0') {
+            *w++ = ' ';
+            r += 4;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+/* Find the host-side dir for guest_dir. Scans
+ * /proc/self/mountinfo for a mountpoint M such that
+ * M + guest_dir exists as a directory (the previous root after
+ * pivot_root stays mounted at its put_old path); the LAST
+ * match wins, since pivot artifacts mount late. Falls back to
+ * /proc/1/root. Returns 1 with out set, else 0. Per-candidate
+ * failures are not logged (dozens of mountpoints). */
+static int apex_find_host_dir(const char *guest_dir, char *out, size_t out_sz) {
+    FILE *mi = fopen("/proc/self/mountinfo", "r");
+    char line[2048];
+    int found = 0;
+    if (mi) {
+        while (fgets(line, sizeof(line), mi)) {
+            char mp[GSI_APEX_BIND_PATH_MAX];
+            char cand[GSI_APEX_BIND_PATH_MAX];
+            struct stat st;
+            if (sscanf(line, "%*s %*s %*s %*s %1023s", mp) != 1) {
+                continue;
+            }
+            apex_unescape040(mp);
+            if (strncmp(mp, "/proc", 5) == 0 || strncmp(mp, "/sys", 4) == 0 ||
+                strncmp(mp, "/dev", 4) == 0) {
+                continue;
+            }
+            if (snprintf(cand, sizeof(cand), "%s%s", mp, guest_dir) >= (int)sizeof(cand)) {
+                continue;
+            }
+            if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+                int n = snprintf(out, out_sz, "%s", cand);
+                if (n >= 0 && (size_t)n < out_sz) {
+                    found = 1;
+                }
+            }
+        }
+        fclose(mi);
+    }
+    if (found) {
+        return 1;
+    }
+    {
+        char cand[GSI_APEX_BIND_PATH_MAX];
+        struct stat st;
+        if (snprintf(cand, sizeof(cand), "/proc/1/root%s", guest_dir) < (int)sizeof(cand) &&
+            stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int n = snprintf(out, out_sz, "%s", cand);
+            if (n >= 0 && (size_t)n < out_sz) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Mirror the direct children of src into dst (dst is an empty
+ * tmpfs): directories and files are bind-mounted (one level;
+ * subtrees replicate with MS_REC), symlinks are recreated.
+ * Best-effort per child; returns children mirrored. */
+static int apex_mirror_children(const char *src, const char *dst, FILE *log) {
+    DIR *d = opendir(src);
+    struct dirent *e;
+    int n = 0;
+    if (!d) {
+        return 0;
+    }
+    while ((e = readdir(d)) != NULL) {
+        char sp[GSI_APEX_BIND_PATH_MAX];
+        char dp[GSI_APEX_BIND_PATH_MAX];
+        struct stat st;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        if (snprintf(sp, sizeof(sp), "%s/%s", src, e->d_name) >= (int)sizeof(sp) ||
+            snprintf(dp, sizeof(dp), "%s/%s", dst, e->d_name) >= (int)sizeof(dp)) {
+            continue;
+        }
+        if (lstat(sp, &st) != 0) {
+            if (log) {
+                int se = errno;
+                fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: %s (%s)\n", sp, strerror(se));
+            }
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (mkdir(dp, 0755) != 0 && errno != EEXIST) {
+                if (log) {
+                    int se = errno;
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: mkdir %s (%s)\n", dp, strerror(se));
+                }
+                continue;
+            }
+            if (mount(sp, dp, NULL, MS_REC | MS_BIND, NULL) != 0) {
+                if (log) {
+                    int se = errno;
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: bind %s -> %s (%s)\n", sp, dp, strerror(se));
+                }
+                continue;
+            }
+            n++;
+        } else if (S_ISLNK(st.st_mode)) {
+            char tgt[GSI_APEX_BIND_PATH_MAX];
+            ssize_t k = readlink(sp, tgt, sizeof(tgt) - 1);
+            if (k < 0) {
+                if (log) {
+                    int se = errno;
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: readlink %s (%s)\n", sp, strerror(se));
+                }
+                continue;
+            }
+            tgt[k] = '\0';
+            unlink(dp);
+            if (symlink(tgt, dp) != 0) {
+                if (log) {
+                    int se = errno;
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: symlink %s (%s)\n", dp, strerror(se));
+                }
+                continue;
+            }
+            n++;
+        } else if (S_ISREG(st.st_mode)) {
+            int fd = open(dp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0) {
+                if (log) {
+                    int se = errno;
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: create %s (%s)\n", dp, strerror(se));
+                }
+                continue;
+            }
+            close(fd);
+            if (mount(sp, dp, NULL, MS_REC | MS_BIND, NULL) != 0) {
+                if (log) {
+                    int se = errno;
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_FAIL: bind %s -> %s (%s)\n", sp, dp, strerror(se));
+                }
+                continue;
+            }
+            n++;
+        } else if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND_MIRROR_SKIP: %s (not dir/link/file)\n", sp);
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+/* Mount a fresh tmpfs at a scratch dir for a shadow. Tries the
+ * harness test-root scratch first when compiled in, then the
+ * writable host tmpfs dirs. Returns 1 with scratch set. */
+static int apex_mount_shadow_tmpfs(char *scratch, size_t scratch_sz) {
+    static const char *lits[3] = { "/dev/.apex_shadow_tmp", "/mnt/.apex_shadow_tmp", "/data/.apex_shadow_tmp" };
+    char cand[GSI_APEX_BIND_PATH_MAX];
+    int i;
+    if (GSI_APEX_BIND_TEST_ROOT[0] != '\0') {
+        if (snprintf(cand, sizeof(cand), "%s/.apex_shadow_scratch",
+                     GSI_APEX_BIND_TEST_ROOT) < (int)sizeof(cand)) {
+            mkdir(cand, 0755);
+            if (mount("tmpfs", cand, "tmpfs", 0, "size=16M") == 0) {
+                snprintf(scratch, scratch_sz, "%s", cand);
+                return 1;
+            }
+        }
+    }
+    for (i = 0; i < 3; i++) {
+        mkdir(lits[i], 0755);
+        if (mount("tmpfs", lits[i], "tmpfs", 0, "size=16M") == 0) {
+            snprintf(scratch, scratch_sz, "%s", lits[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Ensure guest_dir exists as a directory. Plain mkdir first;
+ * when the read-only image refuses it, shadow the parent dir
+ * with a tmpfs that mirrors the parent's existing children,
+ * then the mountpoint exists inside the writable shadow.
+ * Returns 1 when guest_dir is a directory afterwards. */
+static int apex_ensure_mountpoint(const char *guest_dir, FILE *log) {
+    struct stat st;
+    char parent[GSI_APEX_BIND_PATH_MAX];
+    char scratch[GSI_APEX_BIND_PATH_MAX];
+    char mntpoint[GSI_APEX_BIND_PATH_MAX];
+    int mirrored;
+    if (stat(guest_dir, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? 1 : 0;
+    }
+    if (mkdir(guest_dir, 0755) == 0) {
+        return 1;
+    }
+    if (errno == EEXIST) {
+        if (stat(guest_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return 1;
+        }
+        return 0;
+    }
+    apex_dirname(guest_dir, parent, sizeof(parent));
+    if (strcmp(parent, "/") == 0) {
+        return 0;
+    }
+    if (stat(parent, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=no-parent target=%s\n", guest_dir, guest_dir);
+        }
+        return 0;
+    }
+    if (!apex_mount_shadow_tmpfs(scratch, sizeof(scratch))) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=no-scratch target=%s\n", guest_dir, guest_dir);
+        }
+        return 0;
+    }
+    mirrored = apex_mirror_children(parent, scratch, log);
+    if (log) {
+        fprintf(log, "[gsi_zygote_exec] APEX_BIND_SHADOW: %s mirrored %d children into %s\n", parent, mirrored, scratch);
+    }
+    if (snprintf(mntpoint, sizeof(mntpoint), "%s/%s", scratch, apex_basename(guest_dir)) >= (int)sizeof(mntpoint)) {
+        return 0;
+    }
+    if (mkdir(mntpoint, 0755) != 0 && errno != EEXIST) {
+        if (log) {
+            int se = errno;
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=shadow-mkdir-%s target=%s\n", guest_dir, strerror(se), guest_dir);
+        }
+        return 0;
+    }
+    /* MS_REC: the mirrored child binds must replicate into the
+     * shadow; a plain bind would leave them as empty dirs. */
+    if (mount(scratch, parent, NULL, MS_REC | MS_BIND, NULL) != 0) {
+        if (log) {
+            int se = errno;
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=shadow-bind-%s target=%s\n", guest_dir, strerror(se), guest_dir);
+        }
+        return 0;
+    }
+    if (mount(NULL, parent, NULL, MS_REC | MS_SLAVE, NULL) != 0 && log) {
+        int se = errno;
+        fprintf(log, "[gsi_zygote_exec] APEX_BIND_RSLAVE_WARN: %s (%s) — shadow stands\n", parent, strerror(se));
+    }
+    if (stat(guest_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Bind one host apex dir into the guest. dir is the guest-side
+ * path as named in the list (unprefixed, used for logs and for
+ * host-source discovery); filesystem operations use the
+ * test-root-prefixed path when compiled in. */
+static void apex_bind_one(const char *dir, FILE *log, int *bound, int *skipped, int *failed) {
+    char gdir[GSI_APEX_BIND_PATH_MAX];
+    char src[GSI_APEX_BIND_PATH_MAX];
+    if (!apex_guest_path(dir, gdir, sizeof(gdir))) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=path-too-long target=%s\n", dir, dir);
+        }
+        (*failed)++;
+        return;
+    }
+    if (apex_dir_covered(gdir)) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s SKIPPED reason=covered target=%s\n", dir, dir);
+        }
+        (*skipped)++;
+        return;
+    }
+    if (!apex_find_host_dir(dir, src, sizeof(src))) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=no-host-source target=%s\n", dir, dir);
+        }
+        (*failed)++;
+        return;
+    }
+    if (log) {
+        fprintf(log, "[gsi_zygote_exec] APEX_BIND_SRC: %s <- %s\n", dir, src);
+    }
+    if (!apex_ensure_mountpoint(gdir, log)) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=no-mountpoint src=%s target=%s\n", dir, src, dir);
+        }
+        (*failed)++;
+        return;
+    }
+    if (mount(src, gdir, NULL, MS_BIND, NULL) != 0) {
+        if (log) {
+            int se = errno;
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s FAIL reason=bind-%s src=%s target=%s\n", dir, strerror(se), src, dir);
+        }
+        (*failed)++;
+        return;
+    }
+    if (mount(NULL, gdir, NULL, MS_REC | MS_SLAVE, NULL) != 0 && log) {
+        int se = errno;
+        fprintf(log, "[gsi_zygote_exec] APEX_BIND_RSLAVE_WARN: %s (%s) — bind stands\n", dir, strerror(se));
+    }
+    {
+        DIR *d = opendir(gdir);
+        int n = 0;
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
+                    n++;
+                }
+            }
+            closedir(d);
+        }
+        if (n > 0) {
+            if (log) {
+                fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s BOUND src=%s target=%s entries=%d\n", dir, src, dir, n);
+            }
+        } else {
+            if (log) {
+                fprintf(log, "[gsi_zygote_exec] APEX_BIND: %s BOUND-UNVERIFIED src=%s target=%s entries=0\n", dir, src, dir);
+            }
+        }
+        (*bound)++;
+    }
+}
+
+/* 6.16 driver: read the host list, log the APEX_SWEEP_DIR /
+ * APEX_DIRS diagnostics, and bind every distinct modulePath
+ * parent dir the guest lacks. Runs before apex_sweep(). Any
+ * failure logs loudly and leaves the boot running. */
+static void apex_bind(void) {
+    FILE *log = fopen(GSI_ZYGOTE_LOG_PATH, "a");
+    int fd = open(GSI_APEX_INFO_LIST_PATH, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    char *data = NULL;
+    size_t len = 0;
+    char dirs[GSI_APEX_BIND_MAX_DIRS][GSI_APEX_BIND_PATH_MAX];
+    int ndirs = 0, truncated = 0;
+    int bound = 0, skipped = 0, failed = 0;
+    char *cur;
+    int i;
+    if (fd < 0) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: no list at %s (%s) — bind skipped, boot continues\n",
+                    GSI_APEX_INFO_LIST_PATH, strerror(errno));
+            fclose(log);
+        }
+        return;
+    }
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > GSI_APEX_LIST_MAX) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: list at %s unreadable or out of range — bind skipped, boot continues\n",
+                    GSI_APEX_INFO_LIST_PATH);
+            fclose(log);
+        }
+        close(fd);
+        return;
+    }
+    len = (size_t)st.st_size;
+    data = malloc(len + 1);
+    if (!data) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_BIND: out of memory — bind skipped, boot continues\n");
+            fclose(log);
+        }
+        close(fd);
+        return;
+    }
+    {
+        size_t got = 0;
+        while (got < len) {
+            ssize_t n = read(fd, data + got, len - got);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            got += (size_t)n;
+        }
+        close(fd);
+        if (got != len) {
+            if (log) {
+                fprintf(log, "[gsi_zygote_exec] APEX_BIND: short read on %s — bind skipped, boot continues\n",
+                        GSI_APEX_INFO_LIST_PATH);
+                fclose(log);
+            }
+            free(data);
+            return;
+        }
+    }
+    data[len] = '\0';
+    cur = data;
+    while (*cur) {
+        char *nl = strchr(cur, '\n');
+        size_t linelen = nl ? (size_t)(nl - cur) + 1 : strlen(cur);
+        if (linelen < GSI_APEX_LINE_MAX) {
+            char line[GSI_APEX_LINE_MAX];
+            memcpy(line, cur, linelen);
+            line[linelen] = '\0';
+            if (strstr(line, "<apex-info") != NULL) {
+                char modpath[1024];
+                if (apex_attr_value(line, "modulePath", modpath, sizeof(modpath))) {
+                    char errbuf[128];
+                    char dname[GSI_APEX_BIND_PATH_MAX];
+                    int seen = 0;
+                    if (!apex_entry_readable(modpath, errbuf, sizeof(errbuf)) &&
+                        strcmp(errbuf, "No such file or directory") == 0) {
+                        apex_dirname(modpath, dname, sizeof(dname));
+                        if (log) {
+                            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP_DIR: %s\n", dname);
+                        }
+                    }
+                    apex_dirname(modpath, dname, sizeof(dname));
+                    for (i = 0; i < ndirs; i++) {
+                        if (strcmp(dirs[i], dname) == 0) {
+                            seen = 1;
+                            break;
+                        }
+                    }
+                    if (!seen) {
+                        if (ndirs < GSI_APEX_BIND_MAX_DIRS) {
+                            snprintf(dirs[ndirs], sizeof(dirs[ndirs]), "%s", dname);
+                            ndirs++;
+                        } else {
+                            truncated = 1;
+                        }
+                    }
+                }
+            }
+        }
+        cur += linelen;
+    }
+    if (log) {
+        if (ndirs == 0) {
+            fprintf(log, "[gsi_zygote_exec] APEX_DIRS: (none)\n");
+        } else {
+            char joined[2048];
+            size_t used = 0;
+            joined[0] = '\0';
+            for (i = 0; i < ndirs; i++) {
+                size_t need = strlen(dirs[i]) + (i > 0 ? 1 : 0) + 1;
+                if (used + need > sizeof(joined)) {
+                    break;
+                }
+                if (i > 0) {
+                    joined[used++] = ' ';
+                    joined[used] = '\0';
+                }
+                strcpy(joined + used, dirs[i]);
+                used += strlen(dirs[i]);
+            }
+            fprintf(log, "[gsi_zygote_exec] APEX_DIRS: %s%s\n", joined, truncated ? " ..." : "");
+        }
+    }
+    for (i = 0; i < ndirs; i++) {
+        apex_bind_one(dirs[i], log, &bound, &skipped, &failed);
+    }
+    if (log) {
+        fprintf(log, "[gsi_zygote_exec] APEX_BIND: done bound=%d skipped=%d failed=%d dirs=%d%s\n",
+                bound, skipped, failed, ndirs, truncated ? " (dirs truncated)" : "");
+        fclose(log);
+    }
+    free(data);
+}
+
 static void log_fatal(const char *msg) {
     int fd = open("/data/zygote_stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
@@ -1029,6 +1652,15 @@ int main(int argc, char **argv) {
     sanitize_classpath("SYSTEMSERVERCLASSPATH", DEFAULT_SYSTEMSERVERCLASSPATH);
     sanitize_classpath("STANDALONE_SYSTEMSERVER_JARS", DEFAULT_STANDALONE_SYSTEMSERVER_JARS);
 
+    /* 6.16: APEX bind — make every distinct modulePath parent
+     * dir exist in the guest namespace (see apex_bind) BEFORE
+     * the sweep reads the list: the sweep's filtered view
+     * would hide the entries the bind must see, and after the
+     * bind the sweep keeps entries that are now readable.
+     * Fail-safe by construction (see apex_bind); runs before
+     * the fd sweep/dump so the FD_TABLE proves its fds closed. */
+    apex_bind();
+
     /* 6.15: APEX sweep — filter unreadable modulePaths out of
      * the guest's apex-info-list.xml before anything reads it.
      * Fail-safe by construction (see apex_sweep); runs before
@@ -1228,48 +1860,151 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* 6.17: supervisor loop (diagnostics only). The launcher used
+     * to execve below and never wait, so HOW each attempt died
+     * was visible only in the outer script's log (which
+     * truncates). Now: fork per attempt; the child dies with
+     * this process (PR_SET_PDEATHSIG, so the outer script's
+     * kill-spree still ends the guest) and execve's exactly as
+     * before; the parent records one ZYGOTE_EXIT line per
+     * attempt and retries to the existing cap with the existing
+     * backoff, then exits with the last status. All setup above
+     * (binds, sweep, sockets, stdio, fd table) is inherited
+     * unchanged by the child: the fd table the exec'd branch
+     * sees is identical to 6.16. A failed log open degrades to
+     * no line, never a boot failure. */
+    int sup_max_attempts = 5;
+    int sup_backoff0 = 2; /* seconds; sequence 2,4,8,16 */
 #ifdef GSI_ZYGOTE_TEST_TARGET
-    /* Host harness only (never defined in device builds): try a
-     * fake app_process first so the pipe capture + exit/signal
-     * reporting can be exercised on x86_64. */
+    /* Harness only (never defined in device builds): bound the
+     * loop via env so regression scenarios stay fast. Defaults
+     * are the production values. */
     {
-        char *targs[] = {
-            "zygote64", "-Xzygote", "/system/bin",
-            "--zygote", "--start-system-server", "--socket-name=zygote", NULL
-        };
-        execve(GSI_ZYGOTE_TEST_TARGET, targs, environ);
+        const char *e = getenv("GSI_TEST_MAX_ATTEMPTS");
+        if (e) { int v = atoi(e); if (v >= 1 && v <= 5) sup_max_attempts = v; }
+        e = getenv("GSI_TEST_BACKOFF0");
+        if (e) { int v = atoi(e); if (v >= 0 && v <= 16) sup_backoff0 = v; }
     }
 #endif
+    int last_status = 1;
+    for (int attempt = 1; attempt <= sup_max_attempts; attempt++) {
+        time_t t0 = time(NULL);
+        pid_t zpid = fork();
+        if (zpid == 0) {
+            /* Child: die with the parent, then exec exactly as
+             * 6.16 did. The getppid check closes the
+             * fork/prctl race: reparented to init means the
+             * parent is already gone. */
+            (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+            if (getppid() == 1) _exit(127);
+#ifdef GSI_ZYGOTE_TEST_TARGET
+            /* Host harness only (never defined in device builds):
+             * try a fake app_process first so the pipe capture +
+             * exit/signal reporting can be exercised on x86_64. */
+            {
+                char *targs[] = {
+                    "zygote64", "-Xzygote", "/system/bin",
+                    "--zygote", "--start-system-server", "--socket-name=zygote", NULL
+                };
+                execve(GSI_ZYGOTE_TEST_TARGET, targs, environ);
+            }
+#endif
 
-    char *args64_jit[] = {
-        "zygote64", "-Xzygote", "-Xforcejitzygote", "/system/bin",
-        "--zygote", "--start-system-server", "--socket-name=zygote", NULL
-    };
-    execve("/system/bin/app_process64", args64_jit, environ);
+            char *args64_jit[] = {
+                "zygote64", "-Xzygote", "-Xforcejitzygote", "/system/bin",
+                "--zygote", "--start-system-server", "--socket-name=zygote", NULL
+            };
+            execve("/system/bin/app_process64", args64_jit, environ);
 
-    char *args64_nojit[] = {
-        "zygote64", "-Xzygote", "/system/bin",
-        "--zygote", "--start-system-server", "--socket-name=zygote", NULL
-    };
-    execve("/system/bin/app_process64", args64_nojit, environ);
+            char *args64_nojit[] = {
+                "zygote64", "-Xzygote", "/system/bin",
+                "--zygote", "--start-system-server", "--socket-name=zygote", NULL
+            };
+            execve("/system/bin/app_process64", args64_nojit, environ);
 
-    char *args32_jit[] = {
-        "zygote", "-Xzygote", "-Xforcejitzygote", "/system/bin",
-        "--zygote", "--start-system-server", "--socket-name=zygote", NULL
-    };
-    execve("/system/bin/app_process", args32_jit, environ);
+            char *args32_jit[] = {
+                "zygote", "-Xzygote", "-Xforcejitzygote", "/system/bin",
+                "--zygote", "--start-system-server", "--socket-name=zygote", NULL
+            };
+            execve("/system/bin/app_process", args32_jit, environ);
 
-    char *args32_nojit[] = {
-        "zygote", "-Xzygote", "/system/bin",
-        "--zygote", "--start-system-server", "--socket-name=zygote", NULL
-    };
-    execve("/system/bin/app_process", args32_nojit, environ);
+            char *args32_nojit[] = {
+                "zygote", "-Xzygote", "/system/bin",
+                "--zygote", "--start-system-server", "--socket-name=zygote", NULL
+            };
+            execve("/system/bin/app_process", args32_nojit, environ);
 
-    int err = errno;
-    int fd = open("/data/zygote_stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        dprintf(fd, "FATAL: execve app_process failed: %s (%d)\n", strerror(err), err);
-        close(fd);
+            int err = errno;
+            int fd = open("/data/zygote_stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                dprintf(fd, "FATAL: execve app_process failed: %s (%d)\n", strerror(err), err);
+                close(fd);
+            }
+            _exit(1);
+        }
+        if (zpid < 0) {
+            FILE *lg = fopen("/data/zygote_exec.log", "a");
+            if (lg) {
+                fprintf(lg, "[gsi_zygote_exec] ZYGOTE_FORK_FAILED: attempt=%d (%s) — backing off, boot continues\n",
+                        attempt, strerror(errno));
+                fclose(lg);
+            }
+            if (attempt < sup_max_attempts) {
+                unsigned backoff = (unsigned)sup_backoff0 << (attempt - 1);
+                if (backoff > 0) sleep(backoff);
+            }
+            continue;
+        }
+        int status = 0;
+        pid_t w;
+        do {
+            w = waitpid(zpid, &status, 0);
+        } while (w < 0 && errno == EINTR);
+        time_t t1 = time(NULL);
+        long after = (long)(t1 - t0);
+        if (after < 0) after = 0;
+        if (w < 0) {
+            FILE *lg = fopen("/data/zygote_exec.log", "a");
+            if (lg) {
+                fprintf(lg, "[gsi_zygote_exec] ZYGOTE_WAIT_FAILED: attempt=%d pid=%d (%s) — boot continues, child reaped by init\n",
+                        attempt, (int)zpid, strerror(errno));
+                fclose(lg);
+            }
+            last_status = 1;
+            break;
+        }
+        /* Reap a stray already-exited child (pipe-mode writer) so
+         * no zombie lingers; the zygote child above is already
+         * reaped, so this can only collect an exited sibling. */
+        {
+            int dummy = 0;
+            (void)waitpid(-1, &dummy, WNOHANG);
+        }
+        last_status = status;
+        {
+            FILE *lg = fopen("/data/zygote_exec.log", "a");
+            if (lg) {
+                if (WIFEXITED(status)) {
+                    fprintf(lg, "[gsi_zygote_exec] ZYGOTE_EXIT: attempt=%d status=%d exit=%d after=%lds at=%lld\n",
+                            attempt, status, WEXITSTATUS(status), after, (long long)t1);
+                } else if (WIFSIGNALED(status)) {
+                    fprintf(lg, "[gsi_zygote_exec] ZYGOTE_EXIT: attempt=%d status=%d signal=%d after=%lds at=%lld\n",
+                            attempt, status, WTERMSIG(status), after, (long long)t1);
+                } else {
+                    fprintf(lg, "[gsi_zygote_exec] ZYGOTE_EXIT: attempt=%d status=%d after=%lds at=%lld\n",
+                            attempt, status, after, (long long)t1);
+                }
+                fclose(lg);
+            }
+        }
+        if (attempt < sup_max_attempts) {
+            unsigned backoff = (unsigned)sup_backoff0 << (attempt - 1);
+            if (backoff > 0) sleep(backoff);
+        }
     }
+    /* Exit with the last status, shell-style: the outer script
+     * sees the same 137 for a SIGKILLed guest it sees today. */
+    if (WIFEXITED(last_status)) return WEXITSTATUS(last_status);
+    if (WIFSIGNALED(last_status)) return 128 + WTERMSIG(last_status);
     return 1;
 }

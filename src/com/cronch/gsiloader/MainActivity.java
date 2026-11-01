@@ -1276,13 +1276,21 @@ public class MainActivity extends Activity {
             executor.execute(() -> {
                 try {
                     String[] names = {"zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log",
-                        "zygote_stdout.log", "zygote_stderr_cap.log", "logcat_cap.txt", "gsi_fdtrace.log"};
+                        "zygote_stdout.log", "zygote_stderr_cap.log", "logcat_cap.txt", "gsi_fdtrace.log",
+                        // 6.17: continuous capture + cap-time dump live
+                        // in the same slot-data family; clear them too
+                        // so a new build's logs start fresh.
+                        "logcat_continuous.txt", "logcat_cap2.txt"};
                     StringBuilder cmd = new StringBuilder();
                     for (String n : names) {
                         cmd.append("rm -f \"").append(STAGE_DIR).append("/data/").append(n).append("\" ");
                         cmd.append("rm -f \"").append(STAGE_DIR).append("/slots/*/data/").append(n).append("\" ");
                         cmd.append("rm -f \"/data/").append(n).append("\" ");
                     }
+                    // 6.17: logcat -f rotations of the continuous file.
+                    cmd.append("rm -f \"").append(STAGE_DIR).append("/data/logcat_continuous.txt.*\" ");
+                    cmd.append("rm -f \"").append(STAGE_DIR).append("/slots/*/data/logcat_continuous.txt.*\" ");
+                    cmd.append("rm -f /data/logcat_continuous.txt.* ");
                     runRootCmdDrained(cmd.toString());
                 } catch (Exception ignored) {}
             });
@@ -1387,6 +1395,13 @@ public class MainActivity extends Activity {
             {"zygote_stderr_cap.log", "/data/zygote_stderr_cap.log", "fallback"},
             {"logcat_cap.txt", slotDir + "/data/logcat_cap.txt", ""},
             {"logcat_cap.txt", "/data/logcat_cap.txt", "fallback"},
+            // 6.17: continuous capture + cap-time dump, same
+            // treatment as the other zygote logs (rotations are
+            // bundle-only; the session copy holds the live file).
+            {"logcat_continuous.txt", slotDir + "/data/logcat_continuous.txt", ""},
+            {"logcat_continuous.txt", "/data/logcat_continuous.txt", "fallback"},
+            {"logcat_cap2.txt", slotDir + "/data/logcat_cap2.txt", ""},
+            {"logcat_cap2.txt", "/data/logcat_cap2.txt", "fallback"},
             // 6.11: fd-trace log, same treatment as the other zygote logs.
             {"gsi_fdtrace.log", slotDir + "/data/gsi_fdtrace.log", ""},
             {"gsi_fdtrace.log", "/data/gsi_fdtrace.log", "fallback"},
@@ -1691,7 +1706,7 @@ public class MainActivity extends Activity {
             try {
                 String[] order = {LOG_HISTORY_OUTCOME, LOG_HISTORY_APP_LOG, "takeover_slot.log", "takeover_stage.log",
                     "inner_takeover.log", "boot_diagnostics_slot.log", "boot_diagnostics_stage.log",
-                    "zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log", "zygote_stdout.log", "zygote_stderr_cap.log", "logcat_cap.txt", "gsi_fdtrace.log"};
+                    "zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log", "zygote_stdout.log", "zygote_stderr_cap.log", "logcat_cap.txt", "logcat_continuous.txt", "logcat_cap2.txt", "gsi_fdtrace.log"};
                 StringBuilder sb = new StringBuilder();
                 sb.append("Session: ").append(logHistoryDisplayStamp(dir.getName()));
                 // 6.14: build stamp, so a shared session view
@@ -1733,6 +1748,7 @@ public class MainActivity extends Activity {
                 if (!new File(dir, "zygote_exec.log").exists() || !new File(dir, "zygote_stderr.log").exists()
                         || !new File(dir, "zygote_stdio.log").exists() || !new File(dir, "zygote_stdout.log").exists()
                         || !new File(dir, "zygote_stderr_cap.log").exists() || !new File(dir, "logcat_cap.txt").exists()
+                        || !new File(dir, "logcat_continuous.txt").exists() || !new File(dir, "logcat_cap2.txt").exists()
                         || !new File(dir, "gsi_fdtrace.log").exists()) {
                     if (rootProbeOk()) {
                         String liveSlotDir = currentSlotDir();
@@ -1748,6 +1764,10 @@ public class MainActivity extends Activity {
                             appendLiveZygoteLog(sb, "zygote_stderr_cap.log", liveSlotDir + "/data/zygote_stderr_cap.log");
                         if (!new File(dir, "logcat_cap.txt").exists())
                             appendLiveZygoteLog(sb, "logcat_cap.txt", liveSlotDir + "/data/logcat_cap.txt");
+                        if (!new File(dir, "logcat_continuous.txt").exists())
+                            appendLiveZygoteLog(sb, "logcat_continuous.txt", liveSlotDir + "/data/logcat_continuous.txt");
+                        if (!new File(dir, "logcat_cap2.txt").exists())
+                            appendLiveZygoteLog(sb, "logcat_cap2.txt", liveSlotDir + "/data/logcat_cap2.txt");
                         if (!new File(dir, "gsi_fdtrace.log").exists())
                             appendLiveZygoteLog(sb, "gsi_fdtrace.log", liveSlotDir + "/data/gsi_fdtrace.log");
                     }
@@ -3597,6 +3617,29 @@ public class MainActivity extends Activity {
                         {"zygote stderr log (zygote_stderr_cap.log, 6.12 split stdio — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stderr_cap.log\" ]; then echo \"(found: " + dir + "/data/zygote_stderr_cap.log)\"; tail -200 \"" + dir + "/data/zygote_stderr_cap.log\"; elif [ -f /data/zygote_stderr_cap.log ]; then echo \"(found: /data/zygote_stderr_cap.log)\"; tail -200 /data/zygote_stderr_cap.log; else echo \"(zygote_stderr_cap.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"cap-time logcat snapshot (logcat_cap.txt — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/logcat_cap.txt\" ]; then echo \"(found: " + dir + "/data/logcat_cap.txt)\"; tail -200 \"" + dir + "/data/logcat_cap.txt\"; elif [ -f /data/logcat_cap.txt ]; then echo \"(found: /data/logcat_cap.txt)\"; tail -200 /data/logcat_cap.txt; else echo \"(logcat_cap.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"fd-trace log (gsi_fdtrace.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/gsi_fdtrace.log\" ]; then echo \"(found: " + dir + "/data/gsi_fdtrace.log)\"; tail -200 \"" + dir + "/data/gsi_fdtrace.log\"; elif [ -f /data/gsi_fdtrace.log ]; then echo \"(found: /data/gsi_fdtrace.log)\"; tail -200 /data/gsi_fdtrace.log; else echo \"(gsi_fdtrace.log NOT FOUND in slot data or /data — trace toggle was OFF)\"; fi 2>/dev/null"},
+                        // 6.17: continuous logcat capture — current file
+                        // (last 500) + rotations (last 100 each), slot
+                        // data first, /data fallback. This is the
+                        // primary SIGKILL-killer channel: it runs from
+                        // before the boot script launches and does not
+                        // depend on the restart cap.
+                        {"continuous logcat capture (logcat_continuous.txt + rotations — slot data first, /data fallback)", "if [ -f \"" + dir + "/data/logcat_continuous.txt\" ]; then echo \"(found: " + dir + "/data/logcat_continuous.txt)\"; echo \"--- current (last 500) ---\"; tail -500 \"" + dir + "/data/logcat_continuous.txt\"; for i in 1 2 3 4; do [ -f \"" + dir + "/data/logcat_continuous.txt.$i\" ] && { echo \"--- rotation .$i (last 100) ---\"; tail -100 \"" + dir + "/data/logcat_continuous.txt.$i\"; }; done; elif [ -f /data/logcat_continuous.txt ]; then echo \"(found: /data/logcat_continuous.txt)\"; echo \"--- current (last 500) ---\"; tail -500 /data/logcat_continuous.txt; for i in 1 2 3 4; do [ -f \"/data/logcat_continuous.txt.$i\" ] && { echo \"--- rotation .$i (last 100) ---\"; tail -100 \"/data/logcat_continuous.txt.$i\"; }; done; else echo \"(logcat_continuous.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        // 6.17: second, independent cap-time artifact
+                        // (written on the return path before the
+                        // capture stops).
+                        {"cap-time logcat dump (logcat_cap2.txt — 6.17 second artifact; slot data first, /data fallback; last 500 lines)", "if [ -f \"" + dir + "/data/logcat_cap2.txt\" ]; then echo \"(found: " + dir + "/data/logcat_cap2.txt)\"; tail -500 \"" + dir + "/data/logcat_cap2.txt\"; elif [ -f /data/logcat_cap2.txt ]; then echo \"(found: /data/logcat_cap2.txt)\"; tail -500 /data/logcat_cap2.txt; else echo \"(logcat_cap2.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        // 6.17: kernel log + memory-killer harvest. The
+                        // full dmesg tail is kept (capped), not just
+                        // matches — the killer's lines may sit outside
+                        // the grep patterns.
+                        {"kernel log + memory-killer harvest (dmesg last 300 + killer/denial matches + events-buffer kill lines)", "echo \"--- dmesg (last 300 lines) ---\"; dmesg 2>/dev/null | tail -300; echo \"--- killer/denial lines (whole dmesg, last 100 matches) ---\"; dmesg 2>/dev/null | grep -iE 'lowmemorykiller|oom-killer|Killed process|avc:|softdog|watchdog.*expired' | tail -100; echo \"--- events-buffer kill lines (logcat -b events, last 500, last 100 matches) ---\"; /system/bin/logcat -b events -d -t 500 2>/dev/null | grep -iE 'lowmemorykiller|oom|kill' | tail -100; true"},
+                        // 6.17: tombstones — expected empty for SIGKILL /
+                        // Java-exit deaths; a native abort would land
+                        // here. Cheap insurance, capped.
+                        {"tombstones (listing + newest 3, head 60 lines each)", "if [ -d /data/tombstones ]; then ls -lt /data/tombstones/ 2>/dev/null | head -20; [ -z \"$(ls /data/tombstones/tombstone_* 2>/dev/null)\" ] && echo \"(no tombstone files present)\"; for f in $(ls -t /data/tombstones/tombstone_* 2>/dev/null | head -3); do echo \"== $f\"; head -60 \"$f\" 2>/dev/null; done; else echo \"(no /data/tombstones directory)\"; fi 2>/dev/null"},
+                        // 6.17: pmsg probe — unverified channel; an
+                        // empty result is a valid result.
+                        {"pstore pmsg probe (pmsg-ramoops heads + logcat -b all -L, last 200)", "ls /sys/fs/pstore/ 2>/dev/null; for f in /sys/fs/pstore/pmsg-ramoops-*; do [ -f \"$f\" ] && { echo \"== $f\"; head -100 \"$f\" 2>/dev/null; }; done; echo \"--- logcat -b all -L (last 200) ---\"; /system/bin/logcat -b all -L -d -t 200 2>/dev/null; true"},
                         {"pstore excerpt (console/dmesg ramoops, head 100 lines each — direct read, NOT pstore_check.sh)", "for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do [ -f \"$f\" ] && { echo \"== $f\"; head -100 \"$f\" 2>/dev/null; }; done"},
                     };
                     for (String[] sec : sections) {
@@ -3623,10 +3666,10 @@ public class MainActivity extends Activity {
                 final String path = out.getAbsolutePath();
                 final int bytes = sb.length();
                 final String bundleText = sb.toString();
-                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + pstore excerpt + device info). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
+                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + continuous logcat + cap-time dump + kernel/OOM harvest + tombstones + pmsg probe + pstore excerpt + device info). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
                 mainHandler.post(() -> new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Diagnostics bundle exported")
-                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, pstore excerpt and device info in one file — share it when reporting a failed boot.")
+                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, continuous logcat, cap-time dump, kernel/OOM harvest, tombstones, pmsg probe, pstore excerpt and device info in one file — share it when reporting a failed boot.")
                         .setPositiveButton("OK", null)
                         .setNeutralButton("Share", (d, w) -> shareDownloadedText(dlUri, "GSI Loader diagnostics bundle", bundleText)).show());
             } catch (Exception e) {
@@ -5552,6 +5595,96 @@ public class MainActivity extends Activity {
         }
     }
 
+    // 6.17: continuous logcat capture (diagnostics only). The
+    // 6.16 Lineage run died by outside SIGKILL with no Java fatal
+    // in any bundle file, and the cap-time snapshot was absent —
+    // most likely gated on a restart cap the run never reached.
+    // This capture starts BEFORE the boot script launches, reads
+    // the HOST logd (which serves the guest through the shared
+    // /dev bind — proven in 6.5), and writes straight to the
+    // slot data dir, so it cannot depend on the cap, the
+    // supervisor script, or any guest-side process. It runs
+    // outside the zygote, so its fds never enter the fd-table
+    // check. Rotation bounds it (-r 1024 -n 4: ~5 MB max).
+    // Never fails the boot: any failure logs one line.
+    private static final String LOGCAT_CONTINUOUS_NAME = "logcat_continuous.txt";
+    private static final String LOGCAT_CAP2_NAME = "logcat_cap2.txt";
+    // Kill pattern for the capture process. The bracket trick
+    // ([.]) means the regex matches the logcat process's literal
+    // "logcat_continuous.txt" but NEVER the shell running the
+    // kill command itself (whose command line holds "[.]"), and
+    // no guest process carries this path — so the kill cannot
+    // match anything but the capture.
+    private static final String LOGCAT_CAPTURE_KILL_PATTERN = "/system/bin/logcat.*logcat_continuous[.]txt";
+
+    private void startContinuousLogcat(String slotDir) {
+        try {
+            // Stop any straggler from a previous session first
+            // (timeout / force-restart case): one capture at a
+            // time, and a stale one would keep appending host
+            // logs into this session's file.
+            stopContinuousLogcatQuiet();
+            String dataDir = slotDir + "/data";
+            String outPath = dataDir + "/" + LOGCAT_CONTINUOUS_NAME;
+            String cmd = "mkdir -p \"" + dataDir + "\"; "
+                    + "if [ -x /system/bin/logcat ]; then "
+                    + "setsid /system/bin/logcat -b main -b system -b crash -b events -v threadtime -f \"" + outPath + "\" -r 1024 -n 4 </dev/null >/dev/null 2>&1 & "
+                    + "echo \"LOGCAT_CONTINUOUS: capture started -> " + outPath + "\"; "
+                    + "else echo \"LOGCAT_CONTINUOUS: WARNING /system/bin/logcat missing — capture unavailable, boot continues\"; fi";
+            List<String> out = new ArrayList<>();
+            int rc = runRootCmdCaptured(cmd, out);
+            for (String line : out) appendLog(line);
+            if (rc != 0) appendLog("LOGCAT_CONTINUOUS: start shell exited " + rc + " — cap-time snapshot is the fallback, boot continues");
+        } catch (Exception e) {
+            appendLog("LOGCAT_CONTINUOUS: start error (" + e.getMessage() + ") — boot continues without the capture");
+        }
+    }
+
+    // Quiet variant: no app-log output (used before a fresh
+    // start, where a "stopped" line would be noise).
+    private void stopContinuousLogcatQuiet() {
+        try {
+            // Both halves require the logcat binary path AND the
+            // output path: a shell running tail/grep over the
+            // capture file (e.g. the bundle export) carries the
+            // path but not the binary, so it can never match.
+            String cmd = "pkill -f \"" + LOGCAT_CAPTURE_KILL_PATTERN + "\" 2>/dev/null; "
+                    + "for p in /proc/[0-9]*; do if grep -qa '/system/bin/logcat' \"$p/cmdline\" 2>/dev/null && grep -qa 'logcat_continuous[.]txt' \"$p/cmdline\" 2>/dev/null; then kill \"$(basename \"$p\")\" 2>/dev/null; fi; done; true";
+            runRootCmdDrained(cmd);
+        } catch (Exception ignored) {}
+    }
+
+    private void stopContinuousLogcat() {
+        try {
+            stopContinuousLogcatQuiet();
+            appendLog("LOGCAT_CONTINUOUS: capture stopped");
+        } catch (Exception e) {
+            appendLog("LOGCAT_CONTINUOUS: stop error (" + e.getMessage() + ") — return continues");
+        }
+    }
+
+    // 6.17: second, independent cap-time artifact. Written when
+    // the session ends (return path), BEFORE the continuous
+    // capture stops, so it holds the ring buffers' view of the
+    // session even if the continuous file rotated past the kill
+    // event. Bounded (-t 3000). Never fails the return.
+    private void dumpCapTimeLogcat(String slotDir) {
+        try {
+            String dataDir = slotDir + "/data";
+            String outPath = dataDir + "/" + LOGCAT_CAP2_NAME;
+            String cmd = "mkdir -p \"" + dataDir + "\"; "
+                    + "if [ -x /system/bin/logcat ]; then "
+                    + "/system/bin/logcat -d -b main -b system -b crash -b events -v threadtime -t 3000 > \"" + outPath + "\" 2>/dev/null; "
+                    + "echo \"LOGCAT_CAP2: cap-time dump written -> " + outPath + "\"; "
+                    + "else echo \"LOGCAT_CAP2: WARNING /system/bin/logcat missing — dump unavailable\"; fi";
+            List<String> out = new ArrayList<>();
+            runRootCmdCaptured(cmd, out);
+            for (String line : out) appendLog(line);
+        } catch (Exception e) {
+            appendLog("LOGCAT_CAP2: dump error (" + e.getMessage() + ") — return continues");
+        }
+    }
+
     private void bootGsi() {
         long nowTap = System.currentTimeMillis();
         if (nowTap - lastBootTapMs < 500) return;
@@ -5648,6 +5781,11 @@ public class MainActivity extends Activity {
                 // 6.11: fd-trace staging — same position, same
                 // never-fail rule (see syncFdTraceForBoot).
                 syncFdTraceForBoot(slotDir);
+
+                // 6.17: continuous logcat capture — same position,
+                // same never-fail rule (see startContinuousLogcat).
+                // Starts BEFORE the switch script spawns.
+                startContinuousLogcat(slotDir);
 
                 String stageScript = slotDir + "/switch_to_gsi.sh";
                 // 5.9.5-APP-START: boot env vars for the scripts workstream.
@@ -5935,6 +6073,12 @@ public class MainActivity extends Activity {
                 restoreGlPreloadGate();
                 // 6.11: clear the fd-trace marker (see clearFdTraceMarker).
                 clearFdTraceMarker();
+                // 6.17: cap-time dump BEFORE stopping the capture, so
+                // the ring buffers' view of the session is saved even
+                // if the continuous file rotated past the kill event.
+                // Runs on both paths below; never fails the return.
+                dumpCapTimeLogcat(currentSlotDir());
+                stopContinuousLogcat();
                 // 5.9.13 LIGHT PATH: if no guest is actually running
                 // (liveness guard across all slots), Return must NOT
                 // run the heavy 5-step restore (killing host daemons,
@@ -6400,6 +6544,12 @@ public class MainActivity extends Activity {
                 showFuncBar(pbReboot, tvRebootProgress, "Returning to One UI + reboot…");
                 executor.execute(() -> {
                     try {
+                        // 6.17: cap-time dump + capture stop FIRST: the
+                        // reboot below kills everything, so the
+                        // session's log view must be saved before it.
+                        // Never fails the reboot.
+                        dumpCapTimeLogcat(currentSlotDir());
+                        stopContinuousLogcat();
                         // 5.9.13 LIGHT PATH (same rule as Return): if
                         // no guest is actually running, skip the full
                         // restore script and just reboot — the reboot
