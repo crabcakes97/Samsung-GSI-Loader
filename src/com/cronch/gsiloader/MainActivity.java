@@ -378,6 +378,19 @@ public class MainActivity extends Activity {
     private static final String GL_GATE_PROP = "ro.zygote.disable_gl_preload";
     private static final String GL_GATE_SNAP = "/data/local/tmp/gsi_gl_preload_snapshot";
     private static final String GL_GATE_ABSENT = "__ABSENT__";
+    // 6.11: fd-trace diagnostic (LD_PRELOAD shim). The 6.10 run proved
+    // the GL gate engages and the 'Not allowlisted (64)' abort persists
+    // identically, so the fd-64/68 opener must be PROVEN. The shim
+    // (assets/fdtrace.so, staged next to zygote_exec) is loaded only
+    // when the marker file exists in the slot data dir (guest /data);
+    // the marker is created/removed by the app from the Experimental
+    // toggle below. Default OFF. The trace file lands in the same
+    // slot data dir so the bundle/history pick it up like the other
+    // zygote logs.
+    private static final String FDTRACE_SO = "fdtrace.so";
+    private static final String FDTRACE_MARKER = "gsi_fdtrace_on";
+    private static final String FDTRACE_LOG = "gsi_fdtrace.log";
+    private static final String PREF_FDTRACE = "fdtrace_enabled";
     private static final String SYSTEM_RAW = STAGE_DIR + "/system.raw";
     // Flags file the app writes into its files dir; boot sync copies it to
     // STAGE_DIR, where master_prepare.sh sources it before binding patches.
@@ -391,6 +404,14 @@ public class MainActivity extends Activity {
     private static final int LOG_HISTORY_MAX_SESSIONS = 20;
     private static final String LOG_HISTORY_APP_LOG = "app_log.txt";
     private static final String LOG_HISTORY_OUTCOME = "outcome.txt";
+    // 6.14: per-session build stamp (version.txt) + stored last-run
+    // versionCode for the log-clear-on-update check.
+    private static final String LOG_HISTORY_VERSION_FILE = "version.txt";
+    private static final String PREF_LAST_RUN_VERSION_CODE = "last_run_version_code";
+    // 6.14: pending version-transition notice, written as the first
+    // operation-log lines after the update clear (set by
+    // maybeClearLogsOnUpdate before any session writes).
+    private String pendingLogClearNotice = null;
     private File logHistoryCurrentDir = null;
     private boolean logHistoryFinalized = false;
 
@@ -465,12 +486,20 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 6.14: log-clear-on-update FIRST, before any session write,
+        // so an updated build starts with fresh logs only.
+        maybeClearLogsOnUpdate();
         // 6.1: start this launch's log-history session BEFORE any log
         // line is written, so every appendLog line lands on disk.
         // Recovery + pruning run on the background executor so a slow
         // or missing su can never block launch.
         startLogHistorySession();
         executor.execute(() -> { recoverLogHistorySessions(); pruneLogHistory(); });
+        // 6.14: version-stamped session header — the first lines of
+        // the (possibly just-cleared) operation log, so every paste
+        // self-identifies its build.
+        appendLog("=== GSI Loader Samsung " + appVersionStamp() + " — session started " + new java.util.Date().toString() + " ===");
+        if (pendingLogClearNotice != null) appendLog(pendingLogClearNotice);
         applyTheme();
         setContentView(R.layout.activity_main);
 
@@ -478,6 +507,9 @@ public class MainActivity extends Activity {
         tvOsStatus = findViewById(R.id.tv_os_status);
         tvImageStatus = findViewById(R.id.tv_image_status);
         tvHeaderSubtitle = findViewById(R.id.tv_header_subtitle);
+        // 6.14: version visible under the title from the first frame
+        // (real values from PackageManager, via applyVersionSubtitle).
+        try { if (tvHeaderSubtitle != null) applyVersionSubtitle(tvHeaderSubtitle.getText().toString()); } catch (Exception ignored) {}
         tvDownloadDesc = findViewById(R.id.tv_download_desc);
         tvDownloadProgress = findViewById(R.id.tv_download_progress);
         pbDownload = findViewById(R.id.pb_download);
@@ -1138,6 +1170,128 @@ public class MainActivity extends Activity {
         catch (Exception e) { return String.valueOf(System.currentTimeMillis()); }
     }
 
+    // 6.14: app version, read from the real package info every time
+    // (never a hardcoded string that can drift from the manifest).
+    private String appVersionName() {
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            if (pi != null && pi.versionName != null) return pi.versionName;
+        } catch (Exception ignored) {}
+        return "?";
+    }
+
+    private long appVersionCode() {
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            if (pi != null) {
+                try { return pi.getLongVersionCode(); }
+                catch (Exception ignored) { return pi.versionCode; }
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    // "6.14 (build 47)" — the stamp used in the UI subtitle, the
+    // operation-log session header, the diagnostics bundle header,
+    // and Previous Logs session labels.
+    private String appVersionStamp() {
+        long code = appVersionCode();
+        return appVersionName() + (code > 0 ? " (build " + code + ")" : "");
+    }
+
+    private void applyVersionSubtitle(String base) {
+        try {
+            if (tvHeaderSubtitle == null || base == null) return;
+            String stamp = appVersionStamp();
+            if (base.contains(stamp)) { tvHeaderSubtitle.setText(base); return; }
+            tvHeaderSubtitle.setText(base + "  •  v" + stamp);
+        } catch (Exception ignored) {}
+    }
+
+    // 6.14: stamp the creating build into a session dir so Previous
+    // Logs labels and the session view self-identify even when the
+    // bundle header is not at hand. Metadata only — never shown
+    // as a log section.
+    private void writeSessionVersionFile(File dir) {
+        try {
+            if (dir == null) return;
+            if (!dir.exists()) dir.mkdirs();
+            try (OutputStream out = new FileOutputStream(new File(dir, LOG_HISTORY_VERSION_FILE), false)) {
+                out.write((appVersionStamp() + "\n").getBytes("UTF-8")); out.flush();
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private String sessionVersionStamp(File dir) {
+        try {
+            File f = new File(dir, LOG_HISTORY_VERSION_FILE);
+            if (!f.exists()) return null;
+            try (FileInputStream in = new FileInputStream(f)) {
+                byte[] buf = new byte[256]; int n = in.read(buf);
+                if (n > 0) { String s = new String(buf, 0, n, "UTF-8").trim(); if (!s.isEmpty()) return s; }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    // 6.14: LOG CLEAR ON APP UPDATE. Runs FIRST in onCreate, before
+    // startLogHistorySession writes anything. If the stored
+    // last-run versionCode differs from the current one (an
+    // update, or a fresh install whose log files survived without
+    // prefs), delete the app's persisted log history: the
+    // operation log file and every Previous Logs session dir —
+    // plus, best-effort through the existing root-shell path,
+    // the slot-data zygote logs (all slots + /data fallback).
+    // Logs ONLY: slots, GSI images, snapshots, backups, and the
+    // Downloads mirrors are never touched. Same versionCode =
+    // keep everything (no clear on every launch). A loud line
+    // records the transition as the first lines of the fresh
+    // operation log. Never fails boot: every step is swallowed,
+    // and the root-shell delete runs on the single-thread
+    // executor BEFORE recovery is scheduled, so recovery cannot
+    // resurrect cleared logs.
+    private void maybeClearLogsOnUpdate() {
+        try {
+            long cur = appVersionCode();
+            android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            long last = -1;
+            try { last = prefs.getInt(PREF_LAST_RUN_VERSION_CODE, -1); } catch (Exception ignored) {}
+            File opLog = new File(getFilesDir(), "operation_log.txt");
+            File histRoot = logHistoryRoot();
+            boolean logsExist = (opLog.exists() || (histRoot != null && histRoot.exists()));
+            boolean changed = (cur > 0 && last > 0 && last != cur) || (last < 0 && cur > 0 && logsExist);
+            // Record the current version on every launch, so the
+            // next launch can tell an update from a same-version
+            // restart even if this launch crashes before finishing.
+            if (cur > 0) {
+                try { prefs.edit().putInt(PREF_LAST_RUN_VERSION_CODE, (int) cur).apply(); } catch (Exception ignored) {}
+            }
+            if (!changed) return;
+            // App-owned logs: synchronous, no su needed.
+            try { if (opLog.exists()) opLog.delete(); } catch (Exception ignored) {}
+            try { if (histRoot != null && histRoot.exists()) deleteDirRecursive(histRoot); } catch (Exception ignored) {}
+            // Slot-data zygote logs: best-effort via su. Submitted
+            // first to the single-thread executor, so it runs
+            // before the recovery task scheduled later in onCreate.
+            executor.execute(() -> {
+                try {
+                    String[] names = {"zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log",
+                        "zygote_stdout.log", "zygote_stderr_cap.log", "logcat_cap.txt", "gsi_fdtrace.log"};
+                    StringBuilder cmd = new StringBuilder();
+                    for (String n : names) {
+                        cmd.append("rm -f \"").append(STAGE_DIR).append("/data/").append(n).append("\" ");
+                        cmd.append("rm -f \"").append(STAGE_DIR).append("/slots/*/data/").append(n).append("\" ");
+                        cmd.append("rm -f \"/data/").append(n).append("\" ");
+                    }
+                    runRootCmdDrained(cmd.toString());
+                } catch (Exception ignored) {}
+            });
+            String from = (last > 0) ? String.valueOf(last) : "none-recorded";
+            pendingLogClearNotice = "LOG_HISTORY_CLEARED: app updated (" + from + " -> " + cur
+                + ") — previous operation log, Previous Logs sessions, and slot-data zygote logs cleared so this build's logs start fresh. Slots, images, snapshots, backups, and Downloads copies were NOT touched.";
+        } catch (Exception ignored) {}
+    }
+
     private void startLogHistorySession() {
         try {
             File root = logHistoryRoot();
@@ -1146,6 +1300,7 @@ public class MainActivity extends Activity {
             File dir = new File(root, logHistoryStamp());
             if (dir.mkdirs() || dir.exists()) logHistoryCurrentDir = dir;
             logHistoryFinalized = false;
+            writeSessionVersionFile(dir);
         } catch (Exception ignored) {}
     }
 
@@ -1223,8 +1378,18 @@ public class MainActivity extends Activity {
             {"zygote_stderr.log", "/data/zygote_stderr.log", "fallback"},
             {"zygote_stdio.log", slotDir + "/data/zygote_stdio.log", ""},
             {"zygote_stdio.log", "/data/zygote_stdio.log", "fallback"},
+            // 6.12: split-stdio logs (file mode: stdout/stderr each
+            // have their own file; zygote_stdio.log stays for pipe
+            // mode + per-fd fallback).
+            {"zygote_stdout.log", slotDir + "/data/zygote_stdout.log", ""},
+            {"zygote_stdout.log", "/data/zygote_stdout.log", "fallback"},
+            {"zygote_stderr_cap.log", slotDir + "/data/zygote_stderr_cap.log", ""},
+            {"zygote_stderr_cap.log", "/data/zygote_stderr_cap.log", "fallback"},
             {"logcat_cap.txt", slotDir + "/data/logcat_cap.txt", ""},
             {"logcat_cap.txt", "/data/logcat_cap.txt", "fallback"},
+            // 6.11: fd-trace log, same treatment as the other zygote logs.
+            {"gsi_fdtrace.log", slotDir + "/data/gsi_fdtrace.log", ""},
+            {"gsi_fdtrace.log", "/data/gsi_fdtrace.log", "fallback"},
         };
         for (String[] c : cand) {
             if (!seen.contains(c[1])) { seen.add(c[1]); src.add(c); }
@@ -1354,6 +1519,7 @@ public class MainActivity extends Activity {
                 target = new File(root, logHistoryStamp() + "_recovered");
                 if (!target.mkdirs() && !target.exists()) return;
                 createdRecovered = true;
+                writeSessionVersionFile(target);
             }
             String slotDir = logHistoryRecoverySlotDir();
             int written = copyStageLogsInto(target, slotDir, true);
@@ -1478,7 +1644,11 @@ public class MainActivity extends Activity {
                 }
             } catch (Exception ignored) {}
             String cur = (logHistoryCurrentDir != null && dir.getAbsolutePath().equals(logHistoryCurrentDir.getAbsolutePath())) ? " (current)" : "";
-            return logHistoryDisplayStamp(dir.getName()) + cur + " — " + outcome + " — " + bytes + " bytes" + (lines > 0 ? ", " + lines + " app-log lines" : "");
+            // 6.14: build stamp from version.txt (absent = recorded
+            // before 6.14, shown without a version, honestly).
+            String ver = sessionVersionStamp(dir);
+            String verPart = (ver != null) ? " • v" + ver : "";
+            return logHistoryDisplayStamp(dir.getName()) + cur + verPart + " — " + outcome + " — " + bytes + " bytes" + (lines > 0 ? ", " + lines + " app-log lines" : "");
         } catch (Exception e) { return dir.getName(); }
     }
 
@@ -1521,9 +1691,14 @@ public class MainActivity extends Activity {
             try {
                 String[] order = {LOG_HISTORY_OUTCOME, LOG_HISTORY_APP_LOG, "takeover_slot.log", "takeover_stage.log",
                     "inner_takeover.log", "boot_diagnostics_slot.log", "boot_diagnostics_stage.log",
-                    "zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log", "logcat_cap.txt"};
+                    "zygote_exec.log", "zygote_stderr.log", "zygote_stdio.log", "zygote_stdout.log", "zygote_stderr_cap.log", "logcat_cap.txt", "gsi_fdtrace.log"};
                 StringBuilder sb = new StringBuilder();
-                sb.append("Session: ").append(logHistoryDisplayStamp(dir.getName())).append("\n");
+                sb.append("Session: ").append(logHistoryDisplayStamp(dir.getName()));
+                // 6.14: build stamp, so a shared session view
+                // self-identifies without the bundle header.
+                String sessionVer = sessionVersionStamp(dir);
+                if (sessionVer != null) sb.append("  •  v").append(sessionVer);
+                sb.append("\n");
                 sb.append("Read-only — this is a saved copy; it cannot be edited.\n");
                 for (String name : order) {
                     File f = new File(dir, name);
@@ -1538,9 +1713,11 @@ public class MainActivity extends Activity {
                     } catch (Exception e) { sb.append("(read failed: ").append(e.getMessage()).append(")\n"); }
                 }
                 // Any other files in the session dir (future-proofing).
+                // 6.14: version.txt is metadata, not a log section.
                 File[] extra = dir.listFiles();
                 if (extra != null) {
                     for (File f : extra) {
+                        if (LOG_HISTORY_VERSION_FILE.equals(f.getName())) continue;
                         boolean known = false;
                         for (String k : order) if (k.equals(f.getName())) { known = true; break; }
                         if (!known && f.isFile()) sb.append("\n===== ").append(f.getName()).append(" =====\n(present, ").append(f.length()).append(" bytes)\n");
@@ -1554,7 +1731,9 @@ public class MainActivity extends Activity {
                 // they may be from a later session than the one
                 // being viewed.
                 if (!new File(dir, "zygote_exec.log").exists() || !new File(dir, "zygote_stderr.log").exists()
-                        || !new File(dir, "zygote_stdio.log").exists() || !new File(dir, "logcat_cap.txt").exists()) {
+                        || !new File(dir, "zygote_stdio.log").exists() || !new File(dir, "zygote_stdout.log").exists()
+                        || !new File(dir, "zygote_stderr_cap.log").exists() || !new File(dir, "logcat_cap.txt").exists()
+                        || !new File(dir, "gsi_fdtrace.log").exists()) {
                     if (rootProbeOk()) {
                         String liveSlotDir = currentSlotDir();
                         if (!new File(dir, "zygote_exec.log").exists())
@@ -1563,12 +1742,20 @@ public class MainActivity extends Activity {
                             appendLiveZygoteLog(sb, "zygote_stderr.log", liveSlotDir + "/data/zygote_stderr.log");
                         if (!new File(dir, "zygote_stdio.log").exists())
                             appendLiveZygoteLog(sb, "zygote_stdio.log", liveSlotDir + "/data/zygote_stdio.log");
+                        if (!new File(dir, "zygote_stdout.log").exists())
+                            appendLiveZygoteLog(sb, "zygote_stdout.log", liveSlotDir + "/data/zygote_stdout.log");
+                        if (!new File(dir, "zygote_stderr_cap.log").exists())
+                            appendLiveZygoteLog(sb, "zygote_stderr_cap.log", liveSlotDir + "/data/zygote_stderr_cap.log");
                         if (!new File(dir, "logcat_cap.txt").exists())
                             appendLiveZygoteLog(sb, "logcat_cap.txt", liveSlotDir + "/data/logcat_cap.txt");
+                        if (!new File(dir, "gsi_fdtrace.log").exists())
+                            appendLiveZygoteLog(sb, "gsi_fdtrace.log", liveSlotDir + "/data/gsi_fdtrace.log");
                     }
                 }
                 final String text = sb.toString();
-                final String title = "Session " + logHistoryDisplayStamp(dir.getName());
+                String sessionTitleVer = sessionVersionStamp(dir);
+                final String title = "Session " + logHistoryDisplayStamp(dir.getName())
+                    + (sessionTitleVer != null ? " • v" + sessionTitleVer : "");
                 mainHandler.post(() -> {
                     try {
                         TextView tv = new TextView(MainActivity.this);
@@ -1979,13 +2166,13 @@ public class MainActivity extends Activity {
                         tvOsStatus.setText("Current Userspace: " + label);
                         tvOsStatus.setTextColor(Color.parseColor("#78D9EC"));
                         if (tvHeaderSubtitle != null) {
-                            tvHeaderSubtitle.setText("Dual Userspace Switcher • Guest GSI");
+                            applyVersionSubtitle("Dual Userspace Switcher • Guest GSI");
                         }
                     } else {
                         tvOsStatus.setText("Current Userspace: Samsung One UI (Stock)");
                         tvOsStatus.setTextColor(Color.parseColor("#FFD54F"));
                         if (tvHeaderSubtitle != null) {
-                            tvHeaderSubtitle.setText("Dual Userspace Switcher • One UI");
+                            applyVersionSubtitle("Dual Userspace Switcher • One UI");
                         }
                     }
                 });
@@ -2621,7 +2808,7 @@ public class MainActivity extends Activity {
             String[] assets = {
                 "switch_to_gsi.sh", "return_to_oneui.sh",
                 "master_prepare.sh", "master_inner.sh",
-                "zygote_exec", "clean_apex_info_list.xml",
+                "zygote_exec", "fdtrace.so", "clean_apex_info_list.xml",
                 "services_patched.jar", "framework_patched.jar",
                 "7zz", "PermissionController_patched.apk", "install_image.sh",
                 // 5.9.5-INT-START: new engine scripts + converter.
@@ -3133,6 +3320,23 @@ public class MainActivity extends Activity {
             btnExport.setOnClickListener(b -> { dlg.dismiss(); exportDiagnosticsBundle(); });
             group.addView(btnExport);
         } catch (Exception ignored) {}
+        // 6.11: fd-trace diagnostic toggle, added in code like the
+        // export button above (dialog_experimental.xml is outside
+        // this workstream's ownership). Text shows the live state;
+        // tapping flips the persisted toggle for the NEXT boot and
+        // updates the label without dismissing the dialog.
+        try {
+            android.widget.LinearLayout group2 = (android.widget.LinearLayout) ((android.widget.ScrollView) v).getChildAt(0);
+            final Button btnFdTrace = new Button(this);
+            btnFdTrace.setText(fdTraceButtonLabel());
+            btnFdTrace.setTransformationMethod(null);
+            android.widget.LinearLayout.LayoutParams lp2 = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, dp597(40));
+            lp2.topMargin = dp597(10);
+            btnFdTrace.setLayoutParams(lp2);
+            btnFdTrace.setOnClickListener(b -> { setFdTraceEnabled(!isFdTraceEnabled()); btnFdTrace.setText(fdTraceButtonLabel()); });
+            group2.addView(btnFdTrace);
+        } catch (Exception ignored) {}
         v.findViewById(R.id.exp_close).setOnClickListener(b -> dlg.dismiss());
         dlg.show();
     }
@@ -3350,6 +3554,8 @@ public class MainActivity extends Activity {
             try {
                 StringBuilder sb = new StringBuilder();
                 sb.append("GSI Loader Samsung diagnostics bundle\n");
+                // 6.14: every bundle self-identifies its build.
+                sb.append("App version: ").append(appVersionStamp()).append("\n");
                 sb.append("Exported: ").append(new java.util.Date().toString()).append("\n");
                 sb.append("Model: ").append(android.os.Build.MODEL).append("\n");
                 sb.append("Build id: ").append(android.os.Build.ID).append("\n");
@@ -3387,7 +3593,10 @@ public class MainActivity extends Activity {
                         {"zygote launcher log (zygote_exec.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_exec.log\" ]; then echo \"(found: " + dir + "/data/zygote_exec.log)\"; tail -200 \"" + dir + "/data/zygote_exec.log\"; elif [ -f /data/zygote_exec.log ]; then echo \"(found: /data/zygote_exec.log)\"; tail -200 /data/zygote_exec.log; else echo \"(zygote_exec.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"zygote launcher errors (zygote_stderr.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stderr.log\" ]; then echo \"(found: " + dir + "/data/zygote_stderr.log)\"; tail -200 \"" + dir + "/data/zygote_stderr.log\"; elif [ -f /data/zygote_stderr.log ]; then echo \"(found: /data/zygote_stderr.log)\"; tail -200 /data/zygote_stderr.log; else echo \"(zygote_stderr.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"zygote stdio capture (zygote_stdio.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stdio.log\" ]; then echo \"(found: " + dir + "/data/zygote_stdio.log)\"; tail -200 \"" + dir + "/data/zygote_stdio.log\"; elif [ -f /data/zygote_stdio.log ]; then echo \"(found: /data/zygote_stdio.log)\"; tail -200 /data/zygote_stdio.log; else echo \"(zygote_stdio.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        {"zygote stdout log (zygote_stdout.log, 6.12 split stdio — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stdout.log\" ]; then echo \"(found: " + dir + "/data/zygote_stdout.log)\"; tail -200 \"" + dir + "/data/zygote_stdout.log\"; elif [ -f /data/zygote_stdout.log ]; then echo \"(found: /data/zygote_stdout.log)\"; tail -200 /data/zygote_stdout.log; else echo \"(zygote_stdout.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        {"zygote stderr log (zygote_stderr_cap.log, 6.12 split stdio — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/zygote_stderr_cap.log\" ]; then echo \"(found: " + dir + "/data/zygote_stderr_cap.log)\"; tail -200 \"" + dir + "/data/zygote_stderr_cap.log\"; elif [ -f /data/zygote_stderr_cap.log ]; then echo \"(found: /data/zygote_stderr_cap.log)\"; tail -200 /data/zygote_stderr_cap.log; else echo \"(zygote_stderr_cap.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"cap-time logcat snapshot (logcat_cap.txt — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/logcat_cap.txt\" ]; then echo \"(found: " + dir + "/data/logcat_cap.txt)\"; tail -200 \"" + dir + "/data/logcat_cap.txt\"; elif [ -f /data/logcat_cap.txt ]; then echo \"(found: /data/logcat_cap.txt)\"; tail -200 /data/logcat_cap.txt; else echo \"(logcat_cap.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        {"fd-trace log (gsi_fdtrace.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/gsi_fdtrace.log\" ]; then echo \"(found: " + dir + "/data/gsi_fdtrace.log)\"; tail -200 \"" + dir + "/data/gsi_fdtrace.log\"; elif [ -f /data/gsi_fdtrace.log ]; then echo \"(found: /data/gsi_fdtrace.log)\"; tail -200 /data/gsi_fdtrace.log; else echo \"(gsi_fdtrace.log NOT FOUND in slot data or /data — trace toggle was OFF)\"; fi 2>/dev/null"},
                         {"pstore excerpt (console/dmesg ramoops, head 100 lines each — direct read, NOT pstore_check.sh)", "for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do [ -f \"$f\" ] && { echo \"== $f\"; head -100 \"$f\" 2>/dev/null; }; done"},
                     };
                     for (String[] sec : sections) {
@@ -3414,10 +3623,10 @@ public class MainActivity extends Activity {
                 final String path = out.getAbsolutePath();
                 final int bytes = sb.length();
                 final String bundleText = sb.toString();
-                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + pstore excerpt + device info). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
+                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + pstore excerpt + device info). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
                 mainHandler.post(() -> new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Diagnostics bundle exported")
-                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, pstore excerpt and device info in one file — share it when reporting a failed boot.")
+                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, pstore excerpt and device info in one file — share it when reporting a failed boot.")
                         .setPositiveButton("OK", null)
                         .setNeutralButton("Share", (d, w) -> shareDownloadedText(dlUri, "GSI Loader diagnostics bundle", bundleText)).show());
             } catch (Exception e) {
@@ -4369,14 +4578,14 @@ public class MainActivity extends Activity {
                     + "hashf() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; elif command -v busybox >/dev/null 2>&1; then busybox sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; fi; }; "
                     + "mkdir -p " + STAGE_DIR + "; "
                     + "for f in " + files + "/*; do base=$(basename \"$f\"); "
-                    + "case \"$base\" in *.jar|*.apk|7zz|simg2img|zygote_exec) "
+                    + "case \"$base\" in *.jar|*.apk|7zz|simg2img|zygote_exec|fdtrace.so) "
                     + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(hashf \"$f\"); d=$(hashf \"" + STAGE_DIR + "/$base\"); [ -n \"$s\" ] && [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
                     + "cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; done; "
                     + "echo \"$VER\" > " + STAGE_DIR + "/.sync_version 2>/dev/null; "
                     + "cp -f " + files + "/7zz /data/local/tmp/7zz 2>/dev/null; "
-                    + "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz " + STAGE_DIR + "/simg2img /data/local/tmp/7zz 2>/dev/null; "
+                    + "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/fdtrace.so " + STAGE_DIR + "/7zz " + STAGE_DIR + "/simg2img /data/local/tmp/7zz 2>/dev/null; "
                     + "echo \"# version $VER\" > " + STAGE_DIR + "/.engine_hashes 2>/dev/null; "
-                    + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec; do [ -f \"" + STAGE_DIR + "/$b\" ] && h=$(hashf \"" + STAGE_DIR + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + STAGE_DIR + "/.engine_hashes 2>/dev/null; done; true";
+                    + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec fdtrace.so; do [ -f \"" + STAGE_DIR + "/$b\" ] && h=$(hashf \"" + STAGE_DIR + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + STAGE_DIR + "/.engine_hashes 2>/dev/null; done; true";
             Runtime.getRuntime().exec(new String[]{suBinary, "-c", cmd}).waitFor();
         } catch (Exception ignored) {}
     }
@@ -5279,6 +5488,70 @@ public class MainActivity extends Activity {
         }
     }
 
+    // 6.11: fd-trace diagnostic toggle (persisted, default OFF) +
+    // staging. The 6.10 run proved the GL gate engages and the
+    // 'Not allowlisted (64)' abort persists identically, so the
+    // fd-64/68 opener must be PROVEN: the shim records every
+    // open/openat/dup/dup2/dup3/fcntl-dup in the guest zygote.
+    private boolean isFdTraceEnabled() {
+        try { return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_FDTRACE, false); } catch (Exception e) { return false; }
+    }
+
+    private String fdTraceButtonLabel() {
+        return "FD trace: " + (isFdTraceEnabled() ? "ON (records fd opens next boot)" : "OFF (tap to trace the fd-64/68 opener)");
+    }
+
+    private void setFdTraceEnabled(boolean on) {
+        try { getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_FDTRACE, on).apply(); } catch (Exception ignored) {}
+        appendLog("FDTRACE: fd-trace diagnostic " + (on ? "ON — next boot records every open/dup in the guest zygote to gsi_fdtrace.log (send the bundle after)" : "OFF — next boot runs without the trace shim"));
+    }
+
+    // 6.11: stage the shim + marker for this boot. Runs synchronously
+    // in bootGsi's executor, after the boot sync and next to the GL
+    // gate, BEFORE the switch script spawns. When the toggle is ON:
+    // copy the shim into the slot data dir (guest /data) and create
+    // the marker zygote_exec checks. When OFF: remove any stale
+    // marker so a previous diagnostic session can never leak into
+    // a normal boot. Never fails the boot.
+    private void syncFdTraceForBoot(String slotDir) {
+        try {
+            String dataDir = slotDir + "/data";
+            if (isFdTraceEnabled()) {
+                String cmd = "mkdir -p \"" + dataDir + "\"; "
+                        + "if [ -f \"" + slotDir + "/" + FDTRACE_SO + "\" ]; then cp -f \"" + slotDir + "/" + FDTRACE_SO + "\" \"" + dataDir + "/" + FDTRACE_SO + "\"; chmod 755 \"" + dataDir + "/" + FDTRACE_SO + "\"; echo \"FDTRACE: staged " + FDTRACE_SO + " into slot data\"; "
+                        + "else echo \"FDTRACE: WARNING " + FDTRACE_SO + " missing in slot dir — trace will not arm\"; fi; "
+                        + "touch \"" + dataDir + "/" + FDTRACE_MARKER + "\"; "
+                        + "echo \"FDTRACE: marker created, trace ON for this boot\"";
+                List<String> out = new ArrayList<>();
+                runRootCmdCaptured(cmd, out);
+                for (String line : out) appendLog(line);
+            } else {
+                String cmd = "rm -f \"" + dataDir + "/" + FDTRACE_MARKER + "\"; echo \"FDTRACE: marker removed, trace OFF for this boot\"";
+                List<String> out = new ArrayList<>();
+                runRootCmdCaptured(cmd, out);
+                for (String line : out) appendLog(line);
+            }
+        } catch (Exception e) {
+            appendLog("FDTRACE: staging error (" + e.getMessage() + ") — boot continues without the trace");
+        }
+    }
+
+    // 6.11: return-path cleanup — remove the marker from the current
+    // slot and the stage dir so a diagnostic session never leaks
+    // into a later manual run. The boot path is authoritative (it
+    // recreates the marker when the toggle is ON); this is
+    // belt-and-braces. Never fails the return.
+    private void clearFdTraceMarker() {
+        try {
+            String cmd = "rm -f \"" + currentSlotDir() + "/data/" + FDTRACE_MARKER + "\" \"" + STAGE_DIR + "/data/" + FDTRACE_MARKER + "\" 2>/dev/null; echo \"FDTRACE: marker cleared on return\"";
+            List<String> out = new ArrayList<>();
+            runRootCmdCaptured(cmd, out);
+            for (String line : out) appendLog(line);
+        } catch (Exception e) {
+            appendLog("FDTRACE: marker clear error (" + e.getMessage() + ") — return continues");
+        }
+    }
+
     private void bootGsi() {
         long nowTap = System.currentTimeMillis();
         if (nowTap - lastBootTapMs < 500) return;
@@ -5342,11 +5615,11 @@ public class MainActivity extends Activity {
                         + "hashf() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; elif command -v busybox >/dev/null 2>&1; then busybox sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1; fi; }; "
                         + "mkdir -p " + slotDir + "; for f in " + filesDir.getAbsolutePath() + "/*; do "
                         + "base=$(basename \"$f\"); "
-                        + "case \"$base\" in *.jar|*.apk|7zz|simg2img|zygote_exec) "
+                        + "case \"$base\" in *.jar|*.apk|7zz|simg2img|zygote_exec|fdtrace.so) "
                         + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(hashf \"$f\"); d=$(hashf \"" + slotDir + "/$base\"); [ -n \"$s\" ] && [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
                         + "cp -f \"$f\" \"" + slotDir + "/$base\"; done; "
                         + "echo \"$VER\" > " + slotDir + "/.sync_version 2>/dev/null; "
-                        + "chmod 755 " + slotDir + "/*.sh " + slotDir + "/zygote_exec " + slotDir + "/7zz " + slotDir + "/simg2img";
+                        + "chmod 755 " + slotDir + "/*.sh " + slotDir + "/zygote_exec " + slotDir + "/fdtrace.so " + slotDir + "/7zz " + slotDir + "/simg2img";
                 // Defense in depth: even if a stale patched file from an
                 // earlier Lineage install is sitting in STAGE_DIR, a
                 // disabled toggle must not leave it where master_prepare.sh
@@ -5358,7 +5631,7 @@ public class MainActivity extends Activity {
                     syncCmd += " ; rm -f " + slotDir + "/PermissionController_patched.apk";
                 }
                 syncCmd += " ; echo \"# version $VER\" > " + slotDir + "/.engine_hashes 2>/dev/null; "
-                        + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec; do [ -f \"" + slotDir + "/$b\" ] && h=$(hashf \"" + slotDir + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + slotDir + "/.engine_hashes 2>/dev/null; done; true";
+                        + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec fdtrace.so; do [ -f \"" + slotDir + "/$b\" ] && h=$(hashf \"" + slotDir + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + slotDir + "/.engine_hashes 2>/dev/null; done; true";
                 Runtime.getRuntime().exec(new String[]{suBinary, "-c", syncCmd}).waitFor();
                 // 5.9.5-INT-START: persist detected framework version for scripts.
                 if (detectedFrameworkVersion != null && !detectedFrameworkVersion.isEmpty() && !detectedFrameworkVersion.equals("unknown")) {
@@ -5371,6 +5644,10 @@ public class MainActivity extends Activity {
                 // is in place before the guest zygote starts. Never
                 // fails the boot (see applyGlPreloadGate).
                 applyGlPreloadGate();
+
+                // 6.11: fd-trace staging — same position, same
+                // never-fail rule (see syncFdTraceForBoot).
+                syncFdTraceForBoot(slotDir);
 
                 String stageScript = slotDir + "/switch_to_gsi.sh";
                 // 5.9.5-APP-START: boot env vars for the scripts workstream.
@@ -5656,6 +5933,8 @@ public class MainActivity extends Activity {
                 // snapshot from a crashed session) and the heavy path
                 // below. Never fails the return (see restoreGlPreloadGate).
                 restoreGlPreloadGate();
+                // 6.11: clear the fd-trace marker (see clearFdTraceMarker).
+                clearFdTraceMarker();
                 // 5.9.13 LIGHT PATH: if no guest is actually running
                 // (liveness guard across all slots), Return must NOT
                 // run the heavy 5-step restore (killing host daemons,

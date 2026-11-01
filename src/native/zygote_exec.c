@@ -79,6 +79,75 @@
  *    app-process HAL preload — both vendor code). The mode is
  *    logged (ZYGOTE_STDIO_MODE) in both modes; the fd sweep and
  *    FD_TABLE dump run identically in both.
+ *  - 6.11: fd-trace diagnostic arming. The 6.10 on-device run proved
+ *    the GL-preload gate engages and changes nothing (GL preload
+ *    exonerated as the fd-64/68 opener), so the opener must be
+ *    PROVEN. When the marker file /data/gsi_fdtrace_on exists (app
+ *    Experimental toggle, default OFF) and /data/fdtrace.so is
+ *    readable, this launcher sets LD_PRELOAD to the shim before
+ *    exec: this binary is statically linked so the shim is ignored
+ *    here and loads only in the dynamic app_process, with no
+ *    re-exec. An exec-boundary line is appended to the trace file
+ *    just before the execve fallbacks (the pid is shared across
+ *    execve, so the boundary separates the phases). Marker absent
+ *    or shim unreadable: loud log line, behavior exactly 6.10.
+ *  - 6.12: SPLIT STDIO (Claude's experiment 1). File mode used to
+ *    point fds 0/1/2 at the single /data/zygote_stdio.log. The
+ *    6.9–6.11 on-device aborts name that path at a dup'd fd 64/68
+ *    — and nothing in AOSP knows the path, so the fd is almost
+ *    certainly a DUP of fd 0, 1 or 2 made post-exec. Splitting
+ *    the targets (0 -> /dev/null RDONLY, 1 -> zygote_stdout.log,
+ *    2 -> zygote_stderr_cap.log) makes the abort name WHICH stdio
+ *    fd was duped; if fd 0 was the one, the wall vanishes
+ *    outright (/dev/null is allowlisted). Per-fd fallback to the
+ *    6.11 single-file behavior, loud line, never fatal. Pipe
+ *    mode is UNCHANGED (all three fds -> the pipe) for A/B.
+ *  - 6.13: STDOUT TO /dev/null (stepwise discriminator after the
+ *    6.12 run). The 6.12 on-device abort named
+ *    /data/zygote_stdout.log at fd 65 — fd 1 (stdout) is the
+ *    duped handle, and the ascending scan stops at the first
+ *    failure, so a duped fd 2 could still hide behind it. File
+ *    mode now points fd 1 at /dev/null O_WRONLY as well (fd 0
+ *    stays /dev/null RDONLY, fd 2 stays the stderr log). If the
+ *    wall falls, fd 1 was the only culprit; if the next abort
+ *    names the stderr log, fd 2 is duped too.
+ *  - 6.14: ALL STDIO TO /dev/null (the discriminator's last
+ *    step). The 6.13 on-device abort named
+ *    /data/zygote_stderr_cap.log at fd 66 — fd 2 (stderr) is
+ *    duped too, now that fd 1 is neutralized. File mode now
+ *    points ALL THREE stdio fds at /dev/null (0 RDONLY, 1/2
+ *    O_WRONLY) and opens NO capture file at all; the split-log
+ *    path strings are gone from this binary. This SACRIFICES
+ *    all zygote stdio capture on purpose: if the wall clears,
+ *    the dup case is closed and the only job left is finding
+ *    an allowlisted home for capture; if it still aborts
+ *    identically, the dup theory is wrong. Pipe mode is
+ *    UNCHANGED (capture pipe + writer child) for A/B. The fd
+ *    sweep (to 1024) and FD_TABLE dump are unchanged and run
+ *    identically in both modes; a failed /dev/null open falls
+ *    back loudly, never silently, never to a capture file.
+ *  - 6.15: APEX sweep (the fd wall is closed — see below).
+ *    The 6.14 on-device run proved all-/dev/null works: zygote
+ *    started, forked system_server, and system_server ran Java —
+ *    then died ~2s in, identically on all 6 attempts, in
+ *    PackageManagerService.scanApexPackages: "Unable to parse:
+ *    /product/apex/com.google.android.gmssystem.prodvic.apex",
+ *    IOException "Failed to load asset path" at
+ *    ApkAssets.nativeLoad. One unreadable APEX file is fatal to
+ *    PMS. The guest image is vanilla Lineage (no Google APEXes);
+ *    the host's apex-info-list.xml is copied into the guest's
+ *    /apex at prepare time, so the host's gmssystem entry leaks
+ *    in with a modulePath the guest cannot open. Before exec,
+ *    this launcher now reads /apex/apex-info-list.xml in the
+ *    guest's own mount namespace, test-opens (open + first
+ *    read) every modulePath, and bind-mounts a filtered copy
+ *    over the list with the unreadable entries removed — so
+ *    PMS never sees them. Readable entries are NEVER removed.
+ *    Any sweep failure (no list, oversize list, scratch write
+ *    or bind failure) logs loudly and continues the boot with
+ *    the list untouched: the sweep can never block booting.
+ *    Idempotent across supervisor-loop retries: a filtered
+ *    list re-reads clean and the sweep no-ops.
  *  - Four exec fallbacks in order: 64-bit with forced JIT zygote,
  *    64-bit without it, 32-bit with it, 32-bit without it. If all
  *    fail, the errno is logged and the process exits 1 so the
@@ -102,6 +171,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mount.h>
 
 extern char **environ;
 
@@ -111,6 +181,34 @@ extern char **environ;
  * staged slot data dir, so the file survives the session). */
 #ifndef GSI_ZYGOTE_STDIO_LOG_PATH
 #define GSI_ZYGOTE_STDIO_LOG_PATH "/data/zygote_stdio.log"
+#endif
+
+/* 6.14: the split-stdio log paths are GONE. File mode opens no
+ * capture file at all — all three stdio fds go to /dev/null
+ * (see setup_null_stdio_fd). The defines below existed for
+ * 6.12/6.13 only and were deleted so the strings cannot reach
+ * the device binary. Pipe mode still drains into
+ * GSI_ZYGOTE_STDIO_LOG_PATH via the writer child, unchanged.
+ * GSI_DEVNULL_PATH is overridable at compile time for the host
+ * harness only; device builds always use /dev/null. */
+#ifndef GSI_DEVNULL_PATH
+#define GSI_DEVNULL_PATH "/dev/null"
+#endif
+
+/* 6.11: fd-trace diagnostic paths. Overridable at compile time for
+ * the host harness only; device builds always use the /data paths
+ * (guest /data = the staged slot data dir). The marker file is
+ * created/removed by the app (Experimental toggle, default OFF);
+ * the shim .so is staged next to this binary by the same Java sync
+ * that stages zygote_exec itself. */
+#ifndef GSI_FDTRACE_MARKER_PATH
+#define GSI_FDTRACE_MARKER_PATH "/data/gsi_fdtrace_on"
+#endif
+#ifndef GSI_FDTRACE_SHIM_PATH
+#define GSI_FDTRACE_SHIM_PATH "/data/fdtrace.so"
+#endif
+#ifndef GSI_FDTRACE_LOG_PATH
+#define GSI_FDTRACE_LOG_PATH "/data/gsi_fdtrace.log"
 #endif
 
 /* OUR 23.2-era defaults, verbatim from the 5.9.18 binary's strings. */
@@ -351,6 +449,295 @@ static void sanitize_classpath(const char *env_var, const char *default_val) {
     free(copy);
 }
 
+/* 6.15: APEX sweep paths. Overridable at compile time for the
+ * host harness only; device builds always use the /apex + /data
+ * paths (guest /apex is the staged list, guest /data is the slot
+ * data dir). GSI_ZYGOTE_LOG_PATH is used ONLY by the sweep; the
+ * rest of this file keeps its literal /data/zygote_exec.log. */
+#ifndef GSI_APEX_INFO_LIST_PATH
+#define GSI_APEX_INFO_LIST_PATH "/apex/apex-info-list.xml"
+#endif
+#ifndef GSI_APEX_SWEEP_SCRATCH_PATH
+#define GSI_APEX_SWEEP_SCRATCH_PATH "/data/.apex-info-list.sweep"
+#endif
+#ifndef GSI_ZYGOTE_LOG_PATH
+#define GSI_ZYGOTE_LOG_PATH "/data/zygote_exec.log"
+#endif
+
+/* Cap on the list size the sweep will rewrite. The host list is
+ * tens of entries; anything above the cap means something is
+ * very wrong, and the sweep skips rather than risk truncating
+ * the guest's view of active APEXes. */
+#define GSI_APEX_LIST_MAX 262144
+/* Lines longer than this are kept verbatim without parsing:
+ * never drop an entry the parser cannot see whole. */
+#define GSI_APEX_LINE_MAX 8192
+
+/* Extract the value of attr="..." from one XML line. Returns 1
+ * on success, 0 when the attribute is absent or unterminated. */
+static int apex_attr_value(const char *line, const char *attr,
+                           char *out, size_t out_sz) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "%s=\"", attr);
+    const char *p = strstr(line, pat);
+    if (!p) {
+        return 0;
+    }
+    p += strlen(pat);
+    const char *q = strchr(p, '"');
+    if (!q) {
+        return 0;
+    }
+    size_t n = (size_t)(q - p);
+    if (n >= out_sz) {
+        n = out_sz - 1;
+    }
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 1;
+}
+
+/* Probe one modulePath the way PMS will meet it: open + first
+ * read, in this process's (guest) mount namespace. Returns 1
+ * when at least one byte reads. On failure fills errbuf with a
+ * short reason (errno string, or "empty file" for a 0-byte
+ * read) so the on-device bundle discriminates ENOENT vs EIO vs
+ * anything else. O_NONBLOCK: a FIFO at the path must never
+ * wedge the launcher. */
+static int apex_entry_readable(const char *path, char *errbuf, size_t errbuf_sz) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(errbuf, errbuf_sz, "%s", strerror(errno));
+        return 0;
+    }
+    char buf[512];
+    ssize_t n;
+    do {
+        n = read(fd, buf, sizeof(buf));
+    } while (n < 0 && errno == EINTR);
+    int saved_errno = errno;
+    close(fd);
+    if (n <= 0) {
+        snprintf(errbuf, errbuf_sz, "%s",
+                 n == 0 ? "empty file" : strerror(saved_errno));
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * 6.15 APEX sweep. Reads /apex/apex-info-list.xml (the host
+ * list copied into the guest at prepare time), test-opens every
+ * modulePath in the guest's own mount namespace, and — only
+ * when at least one entry is unreadable — bind-mounts a
+ * filtered copy over the list with the unreadable entries
+ * removed, so PackageManagerService never sees them. Readable
+ * entries are NEVER removed. Any failure (no list, unreadable
+ * or oversize list, scratch write or bind failure) logs loudly
+ * and leaves the list untouched: the sweep can never block
+ * booting. Runs before the fd sweep/dump, so its own fds are
+ * proven closed by the FD_TABLE dump that follows.
+ */
+static void apex_sweep(void) {
+    FILE *log = fopen(GSI_ZYGOTE_LOG_PATH, "a");
+    int fd = open(GSI_APEX_INFO_LIST_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: no list at %s (%s) — nothing to filter\n",
+                    GSI_APEX_INFO_LIST_PATH, strerror(errno));
+            fclose(log);
+        }
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > GSI_APEX_LIST_MAX) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: list at %s unreadable or out of range — sweep skipped, list unchanged\n",
+                    GSI_APEX_INFO_LIST_PATH);
+            fclose(log);
+        }
+        close(fd);
+        return;
+    }
+    size_t len = (size_t)st.st_size;
+    char *data = malloc(len + 1);
+    if (!data) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: out of memory — sweep skipped, list unchanged\n");
+            fclose(log);
+        }
+        close(fd);
+        return;
+    }
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, data + got, len - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    close(fd);
+    if (got != len) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: short read on %s — sweep skipped, list unchanged\n",
+                    GSI_APEX_INFO_LIST_PATH);
+            fclose(log);
+        }
+        free(data);
+        return;
+    }
+    data[len] = '\0';
+
+    char *out = malloc(len + 1);
+    if (!out) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: out of memory — sweep skipped, list unchanged\n");
+            fclose(log);
+        }
+        free(data);
+        return;
+    }
+    size_t out_len = 0;
+    int kept = 0, hidden = 0;
+    char *cur = data;
+    while (*cur) {
+        char *nl = strchr(cur, '\n');
+        size_t linelen = nl ? (size_t)(nl - cur) + 1 : strlen(cur);
+        int drop = 0;
+        if (linelen < GSI_APEX_LINE_MAX) {
+            char line[GSI_APEX_LINE_MAX];
+            memcpy(line, cur, linelen);
+            line[linelen] = '\0';
+            if (strstr(line, "<apex-info") != NULL) {
+                char modpath[1024];
+                if (apex_attr_value(line, "modulePath", modpath, sizeof(modpath))) {
+                    char errbuf[128];
+                    if (!apex_entry_readable(modpath, errbuf, sizeof(errbuf))) {
+                        char modname[256];
+                        if (!apex_attr_value(line, "moduleName", modname, sizeof(modname))) {
+                            size_t mlen = strlen(modpath);
+                            if (mlen >= sizeof(modname)) {
+                                mlen = sizeof(modname) - 1;
+                            }
+                            memcpy(modname, modpath, mlen);
+                            modname[mlen] = '\0';
+                        }
+                        if (log) {
+                            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: %s HIDDEN reason=%s path=%s\n",
+                                    modname, errbuf, modpath);
+                        }
+                        hidden++;
+                        drop = 1;
+                    } else {
+                        kept++;
+                    }
+                }
+            }
+        }
+        if (!drop) {
+            memcpy(out + out_len, cur, linelen);
+            out_len += linelen;
+        }
+        cur += linelen;
+    }
+    out[out_len] = '\0';
+
+    if (hidden == 0) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: kept=%d hidden=0 — list unchanged\n", kept);
+            fclose(log);
+        }
+        free(out);
+        free(data);
+        return;
+    }
+
+    /* Write the filtered list to a scratch file, then bind it
+     * over the list path. Scratch lives next to the list when
+     * that directory is writable (guest /apex is a fresh
+     * tmpfs), else the slot data dir. The original file is
+     * never modified: only the guest's view of the path
+     * changes, and only inside this mount namespace. */
+    char scratch[1024];
+    const char *slash = strrchr(GSI_APEX_INFO_LIST_PATH, '/');
+    if (slash && (size_t)(slash - GSI_APEX_INFO_LIST_PATH) < sizeof(scratch) - 32) {
+        size_t dlen = (size_t)(slash - GSI_APEX_INFO_LIST_PATH);
+        if (dlen == 0) {
+            dlen = 1;
+        }
+        memcpy(scratch, GSI_APEX_INFO_LIST_PATH, dlen);
+        strcpy(scratch + dlen, "/.apex-info-list.sweep");
+    } else {
+        snprintf(scratch, sizeof(scratch), "%s", GSI_APEX_SWEEP_SCRATCH_PATH);
+    }
+    int wrote = 0;
+    const char *written_path = NULL;
+    for (int attempt = 0; attempt < 2 && !wrote; attempt++) {
+        const char *path = attempt == 0 ? scratch : GSI_APEX_SWEEP_SCRATCH_PATH;
+        int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (wfd < 0) {
+            continue;
+        }
+        size_t off = 0;
+        int werr = 0;
+        while (off < out_len) {
+            ssize_t w = write(wfd, out + off, out_len - off);
+            if (w < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                werr = 1;
+                break;
+            }
+            off += (size_t)w;
+        }
+        close(wfd);
+        if (!werr) {
+            /* NOTE: never snprintf(scratch, "%s", path) here —
+             * on attempt 0 path IS scratch, and snprintf with
+             * overlapping src/dst is UB that empties the buffer
+             * (found by strace: mount("") -> EINVAL). */
+            written_path = path;
+            wrote = 1;
+        }
+    }
+    if (!wrote) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: kept=%d hidden=%d — scratch write failed, list unchanged\n",
+                    kept, hidden);
+            fclose(log);
+        }
+        free(out);
+        free(data);
+        return;
+    }
+    if (mount(written_path, GSI_APEX_INFO_LIST_PATH, NULL, MS_BIND, NULL) != 0) {
+        if (log) {
+            fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: kept=%d hidden=%d — bind over %s failed (%s), list unchanged\n",
+                    kept, hidden, GSI_APEX_INFO_LIST_PATH, strerror(errno));
+            fclose(log);
+        }
+        unlink(written_path);
+        free(out);
+        free(data);
+        return;
+    }
+    if (log) {
+        fprintf(log, "[gsi_zygote_exec] APEX_SWEEP: kept=%d hidden=%d — filtered list bound over %s (scratch %s)\n",
+                kept, hidden, GSI_APEX_INFO_LIST_PATH, written_path);
+        fclose(log);
+    }
+    free(out);
+    free(data);
+}
+
 static void log_fatal(const char *msg) {
     int fd = open("/data/zygote_stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
@@ -441,6 +828,35 @@ static void dump_fd_table(void) {
     }
     fprintf(log, "[gsi_zygote_exec] FD_TABLE_END: %d fds (post-sweep, pre-exec)\n", n);
     fclose(log);
+}
+
+/*
+ * 6.14: set up ONE stdio fd at /dev/null. Opens GSI_DEVNULL_PATH
+ * with `flags`, dup2s it onto target_fd, closes the original
+ * (unless open returned target_fd itself). On open failure,
+ * logs LOUDLY and returns -1 so the caller can retry that fd
+ * with a fresh /dev/null open — NEVER silently, NEVER to a
+ * capture file: in 6.14 file mode no capture file exists to
+ * fall back to, by design. Returns 1 on success, -1 on
+ * failure. Never fatal.
+ */
+static int setup_null_stdio_fd(int flags, int target_fd, const char *label) {
+    int fd = open(GSI_DEVNULL_PATH, flags);
+    if (fd >= 0) {
+        if (fd != target_fd) {
+            dup2(fd, target_fd);
+            close(fd);
+        }
+        return 1;
+    }
+    int saved_errno = errno;
+    FILE *lg = fopen("/data/zygote_exec.log", "a");
+    if (lg) {
+        fprintf(lg, "[gsi_zygote_exec] ZYGOTE_STDIO_NULL_FAILED: %s (/dev/null) open failed (%s) — fd %d left for the /dev/null retry below; no capture file is opened\n",
+                label, strerror(saved_errno), target_fd);
+        fclose(lg);
+    }
+    return -1;
 }
 
 /*
@@ -558,6 +974,42 @@ static int setup_socket(const char *path, int target_fd) {
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    /* 6.11: fd-trace arming — FIRST, before any other work. This
+     * binary is statically linked, so LD_PRELOAD is ignored for
+     * this process itself and only takes effect in the dynamic
+     * app_process it execs: no re-exec is needed, the environment
+     * is inherited across execve. The shim is armed only when the
+     * marker file exists AND the .so is present and readable;
+     * anything else logs loudly and proceeds exactly as 6.10. */
+    int fdtrace_active = 0;
+    {
+        if (access(GSI_FDTRACE_MARKER_PATH, F_OK) == 0) {
+            if (access(GSI_FDTRACE_SHIM_PATH, R_OK) == 0) {
+                const char *old = getenv("LD_PRELOAD");
+                char buf[2048];
+                if (old && *old) {
+                    snprintf(buf, sizeof(buf), "%s:%s", GSI_FDTRACE_SHIM_PATH, old);
+                } else {
+                    snprintf(buf, sizeof(buf), "%s", GSI_FDTRACE_SHIM_PATH);
+                }
+                setenv("LD_PRELOAD", buf, 1);
+                setenv("GSI_FDTRACE_ACTIVE", "1", 1);
+                fdtrace_active = 1;
+                FILE *lg = fopen("/data/zygote_exec.log", "a");
+                if (lg) {
+                    fprintf(lg, "[gsi_zygote_exec] FDTRACE_ARMED: marker present, LD_PRELOAD=%s\n", buf);
+                    fclose(lg);
+                }
+            } else {
+                FILE *lg = fopen("/data/zygote_exec.log", "a");
+                if (lg) {
+                    fprintf(lg, "[gsi_zygote_exec] FDTRACE_SHIM_MISSING: marker present but %s unreadable — proceeding WITHOUT the fd-trace shim\n",
+                            GSI_FDTRACE_SHIM_PATH);
+                    fclose(lg);
+                }
+            }
+        }
+    }
     setpgid(0, 0);
 
     /* Android system environment roots (same set as the 5.9.18 binary). */
@@ -576,6 +1028,12 @@ int main(int argc, char **argv) {
     sanitize_classpath("DEX2OATBOOTCLASSPATH", DEFAULT_DEX2OATBOOTCLASSPATH);
     sanitize_classpath("SYSTEMSERVERCLASSPATH", DEFAULT_SYSTEMSERVERCLASSPATH);
     sanitize_classpath("STANDALONE_SYSTEMSERVER_JARS", DEFAULT_STANDALONE_SYSTEMSERVER_JARS);
+
+    /* 6.15: APEX sweep — filter unreadable modulePaths out of
+     * the guest's apex-info-list.xml before anything reads it.
+     * Fail-safe by construction (see apex_sweep); runs before
+     * the fd sweep/dump so the FD_TABLE proves its fds closed. */
+    apex_sweep();
 
     /* Dalvik-cache dirs (required by app_main's cache setup). */
     mkdir("/data/dalvik-cache", 0711);
@@ -605,14 +1063,17 @@ int main(int argc, char **argv) {
      * flip). Mode is selected by the GSI_ZYGOTE_STDIO_MODE
      * environment variable, set from the shell side by
      * master_inner.sh (default FILE; pipe when the var is
-     * "pipe"): pipe mode forks a writer child and gives zygote
-     * opens /data/zygote_stdio.log directly as a regular file on
-     * 0/1/2 with no pipe and no writer child. File mode is the
+     * "pipe"): pipe mode forks a writer child and gives zygote a
+     * pipe for fds 0/1/2; file mode (6.14) points all three fds
+     * at /dev/null (0 RDONLY, 1/2 WRONLY) and opens NO capture
+     * file at all, with no pipe and no writer child.
+     * File mode is the
      * decisive experiment for the unproven "zygote aborts if
      * stdio is a regular file" claim — it must be selectable
      * without a rebuild so both modes can be run on-device.
-     * Either mode's failure falls back to /dev/null with a loud
-     * line in the launcher log. Then close stray fds >= 5 so
+     * A failed /dev/null open in file mode falls back loudly
+     * (log line + retry), never silently, never to a capture
+     * file. Then close stray fds >= 5 so
      * nothing leaks into app_process. (The pipe fds are >= 5:
      * fds 3/4 are the zygote sockets, set up above; the write
      * end is dup2'd onto 0/1/2 and its original closed before
@@ -644,25 +1105,56 @@ int main(int argc, char **argv) {
     int cap_ok = 0;
     int cap_err_logged = 0;
     if (stdio_mode_file) {
-        /* 6.8 file mode: stdio straight onto the log file. */
-        int logfd = open(GSI_ZYGOTE_STDIO_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (logfd >= 0) {
-            dup2(logfd, 0);
-            dup2(logfd, 1);
-            dup2(logfd, 2);
-            if (logfd > 2) {
-                close(logfd);
-            }
-            cap_ok = 1;
-        } else {
+        /* 6.14 all stdio to /dev/null (last discriminator step:
+         * the 6.13 run proved fd 2 is duped too). fd 0 ->
+         * /dev/null (RDONLY), fd 1 -> /dev/null (WRONLY), fd 2
+         * -> /dev/null (WRONLY). NO capture file is opened in
+         * file mode — zygote stdio is discarded on purpose, so
+         * a cleared wall proves the dup case and the only job
+         * left is finding an allowlisted home for capture. A
+         * failed /dev/null open on any fd is logged loudly by
+         * setup_null_stdio_fd and retried below with a fresh
+         * open; it NEVER falls back to a capture file. The
+         * FD_TABLE dump below is the arbiter: it must show
+         * 0/1/2 -> /dev/null. Pipe mode below is unchanged. */
+        int r0 = setup_null_stdio_fd(O_RDONLY, 0, "stdin");
+        int r1 = setup_null_stdio_fd(O_WRONLY, 1, "stdout");
+        int r2 = setup_null_stdio_fd(O_WRONLY, 2, "stderr");
+        {
             FILE *lg = fopen("/data/zygote_exec.log", "a");
             if (lg) {
-                fprintf(lg, "[gsi_zygote_exec] ZYGOTE_STDIO_CAPTURE_FAILED: cannot open %s (%s) — stdio to /dev/null\n",
-                        GSI_ZYGOTE_STDIO_LOG_PATH, strerror(errno));
+                fprintf(lg, "[gsi_zygote_exec] ZYGOTE_STDIO_NULL: stdin=%s stdout=%s stderr=%s (6.14: all stdio to /dev/null, no capture file)\n",
+                        r0 > 0 ? "null" : "FAILED",
+                        r1 > 0 ? "null" : "FAILED",
+                        r2 > 0 ? "null" : "FAILED");
                 fclose(lg);
             }
-            cap_err_logged = 1;
         }
+        if (r0 < 0 || r1 < 0 || r2 < 0) {
+            int nfd = open(GSI_DEVNULL_PATH, O_RDWR);
+            if (nfd >= 0) {
+                if (r0 < 0) {
+                    dup2(nfd, 0);
+                }
+                if (r1 < 0) {
+                    dup2(nfd, 1);
+                }
+                if (r2 < 0) {
+                    dup2(nfd, 2);
+                }
+                if (nfd > 2) {
+                    close(nfd);
+                }
+            } else {
+                FILE *lg = fopen("/data/zygote_exec.log", "a");
+                if (lg) {
+                    fprintf(lg, "[gsi_zygote_exec] ZYGOTE_STDIO_NULL_RETRY_FAILED: /dev/null retry open failed (%s) — failed stdio fds left as-is, loudly\n",
+                            strerror(errno));
+                    fclose(lg);
+                }
+            }
+        }
+        cap_ok = 1;
     } else {
         int cap_pipe[2];
         if (pipe(cap_pipe) == 0) {
@@ -710,6 +1202,31 @@ int main(int argc, char **argv) {
     close_stray_fds();
     dump_fd_table();
     close_stray_fds();
+
+    /* 6.11: exec-boundary marker in the trace file. Everything the
+     * shim logs after this line is app_process (the pid is shared
+     * across execve, so the boundary — not the pid — separates the
+     * phases). Written with open-write-close, like the shim
+     * itself, so no fd survives into app_process. */
+    if (fdtrace_active) {
+        int tfd = open(GSI_FDTRACE_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (tfd >= 0) {
+            const char *b = "=== FDTRACE exec boundary: app_process next ===\n";
+            size_t bl = strlen(b);
+            size_t off = 0;
+            while (off < bl) {
+                ssize_t w = write(tfd, b + off, bl - off);
+                if (w < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                off += (size_t)w;
+            }
+            close(tfd);
+        }
+    }
 
 #ifdef GSI_ZYGOTE_TEST_TARGET
     /* Host harness only (never defined in device builds): try a
