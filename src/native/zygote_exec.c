@@ -203,6 +203,26 @@
  *    poll loop so diagnostics stay serviced while the zygote
  *    runs and during backoffs. All 6.17 levers intact; every
  *    new path is fail-soft and can never break the boot.
+ *  - 6.19: NAME THE SENDER (Claude's 6.19 design). The 6.18
+ *    tracer produced nothing usable: signal_deliver records
+ *    receiver-side fields only and cannot name a sender, the
+ *    code treated it as the required event while
+ *    signal_generate (the sender-naming event) was best-effort
+ *    and never verified, no filters were set, and the trace
+ *    was read late without switching tracing off. 6.19 enables
+ *    ONLY signal_generate with filter sig==9 (+ best-effort
+ *    sched_process_exit), verifies every write by read-back,
+ *    re-asserts events/filter/tracing_on every heartbeat tick,
+ *    drains trace_pipe through a separate reader child into a
+ *    /data file with per-chunk syncs, writes tracing_on=0
+ *    FIRST at death, and puts the entries-in-buffer header in
+ *    every snapshot. The child sets oom_score_adj=-1000 before
+ *    execve (lmkd/OOM test); snapshots record the oom_kill
+ *    counter, memory pressure, cgroups, a vold-ownership probe,
+ *    and a self-classification (VOLD_CE_FATAL vs SIGKILL vs
+ *    other); pidfds + CLOCK_BOOTTIME log the order of death;
+ *    GSI_SUP log markers anchor the windowed extract; kills
+ *    are PID-targeted with caller+time logging. All fail-soft.
  *  - Four exec fallbacks in order: 64-bit with forced JIT zygote,
  *    64-bit without it, 32-bit with it, 32-bit without it. If all
  *    fail, the errno is logged and the process exits 1 so the
@@ -232,6 +252,8 @@
 #include <signal.h>
 #include <time.h>
 #include <stdarg.h>
+#include <poll.h>
+#include <sys/syscall.h>
 
 extern char **environ;
 
@@ -541,6 +563,15 @@ static void sanitize_classpath(const char *env_var, const char *default_val) {
 #endif
 #ifndef GSI_SNAP_DMESG_BIN
 #define GSI_SNAP_DMESG_BIN "/system/bin/dmesg"
+#endif
+#ifndef GSI_SNAP_DUMPSYS_BIN
+#define GSI_SNAP_DUMPSYS_BIN "/system/bin/dumpsys"
+#endif
+#ifndef GSI_SNAP_SERVICE_BIN
+#define GSI_SNAP_SERVICE_BIN "/system/bin/service"
+#endif
+#ifndef GSI_SNAP_LOG_BIN
+#define GSI_SNAP_LOG_BIN "/system/bin/log"
 #endif
 
 /* Cap on the list size the sweep will rewrite. The host list is
@@ -1650,6 +1681,73 @@ static time_t gsi18_cap_last_try = 0;
 static time_t gsi18_t_first = 0;
 static time_t gsi18_last_beat = 0;
 static int gsi18_stuck_done = 0;
+/* 6.19: tracer verification state (read-backs, not hopes). */
+static int gsi18_trace_generate_ok = 0;
+static int gsi18_trace_filter_ok = 0;
+static int gsi18_trace_tracing_on_ok = 0;
+static int gsi18_trace_sched_ok = 0;
+static char gsi18_trace_pipe_path[1024];
+static pid_t gsi18_tracepipe_pid = -1;
+static time_t gsi18_tracepipe_last_try = 0;
+/* 6.19: order-of-death + cgroup records. */
+static char gsi18_zygote_cgroup[512];
+static char gsi18_ss_cgroup[512];
+static pid_t gsi18_ss_pid = -1;
+static int gsi18_ss_pidfd = -1;
+static int gsi18_z_pidfd = -1;
+static int gsi18_ss_done = 0;
+static long long gsi18_z_exit_bt = -1;
+static long long gsi18_ss_exit_bt = -1;
+
+/* Forward declaration: defined below the tracer (snapshot
+ * section uses the tail-copy helper). */
+static void gsi18_copy_tail(FILE *out, const char *path, int keep);
+
+/* Read a small pseudo-file into buf (NUL-terminated, trailing
+ * whitespace trimmed). Returns 1 on success, 0 on failure. */
+static int gsi18_read_small_file(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    ssize_t n;
+    size_t len;
+    if (fd < 0) return 0;
+    n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n < 0) return 0;
+    len = (size_t)n;
+    buf[len] = '\0';
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+                       buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+        buf[--len] = '\0';
+    }
+    return 1;
+}
+
+/* Record /proc/<pid>/cgroup (newlines folded to ';') into buf. */
+static void gsi18_read_proc_cgroup(pid_t pid, char *buf, size_t cap) {
+    char path[128];
+    int fd;
+    ssize_t n;
+    size_t i;
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", (int)pid);
+    buf[0] = '\0';
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n <= 0) {
+        buf[0] = '\0';
+        return;
+    }
+    buf[n] = '\0';
+    for (i = 0; buf[i]; i++) {
+        if (buf[i] == '\n') buf[i] = ';';
+    }
+    /* Drop a trailing ';' from the final newline. */
+    {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len - 1] == ';') buf[len - 1] = '\0';
+    }
+}
 
 static void gsi18_sup_log(const char *fmt, ...) {
     FILE *lg = fopen(GSI_SUP_LOG_PATH, "a");
@@ -1711,10 +1809,22 @@ static int gsi18_write_small_file(const char *path, const char *content) {
     return (w == (ssize_t)n) ? 0 : -1;
 }
 
-/* Enable signal trace events best-effort. Returns 1 when the
- * signal_deliver event is enabled (the killer-naming channel:
- * it records sender pid/comm + signal). Logs nothing itself;
- * the caller logs the outcome. */
+/* 6.19: enable ONLY the killer-naming event. signal_generate
+ * is the event that names the sender: the task prefix on the
+ * line is the sender, and its comm=/pid= fields are the
+ * victim. signal_deliver records receiver-side fields only
+ * (sig/errno/code/handler/flags) and CANNOT name a sender —
+ * the 6.18 comment claiming otherwise was wrong, and 6.18
+ * treated signal_deliver as the required event while
+ * signal_generate was best-effort and never verified, yet
+ * logged TRACEFS_OK anyway. 6.19 verifies every write by
+ * read-back: signal_generate enable == 1, filter contains
+ * sig==9, tracing_on == 1. sched_process_exit is best-effort
+ * (exit events for the order-of-death cross-check).
+ * signal_deliver is explicitly DISABLED so a stale enable
+ * from an earlier run cannot flood the buffer with
+ * receiver-side noise. Logs nothing itself; the caller logs
+ * the outcome + read-backs. */
 static int gsi18_enable_tracefs(void) {
     const char *roots[3];
     int nroots = 0;
@@ -1727,69 +1837,234 @@ static int gsi18_enable_tracefs(void) {
 #endif
     roots[nroots++] = "/sys/kernel/debug/tracing";
     roots[nroots++] = "/sys/kernel/tracing";
+    gsi18_trace_generate_ok = 0;
+    gsi18_trace_filter_ok = 0;
+    gsi18_trace_tracing_on_ok = 0;
+    gsi18_trace_sched_ok = 0;
+    gsi18_trace_root[0] = '\0';
+    gsi18_trace_ok = 0;
     for (i = 0; i < nroots; i++) {
         char p[1120];
-        int ok = 0;
+        char rb[256];
+        /* Silence the receiver-side event first. */
         snprintf(p, sizeof(p), "%s/events/signal/signal_deliver/enable", roots[i]);
         if (access(p, W_OK) != 0) continue;
-        if (gsi18_write_small_file(p, "1") == 0) ok = 1;
+        (void)gsi18_write_small_file(p, "0");
         snprintf(p, sizeof(p), "%s/events/signal/signal_generate/enable", roots[i]);
-        (void)gsi18_write_small_file(p, "1");
-        snprintf(p, sizeof(p), "%s/tracing_on", roots[i]);
-        (void)gsi18_write_small_file(p, "1");
-        if (ok) {
-            snprintf(gsi18_trace_root, sizeof(gsi18_trace_root), "%s", roots[i]);
-            gsi18_trace_ok = 1;
-            return 1;
+        if (gsi18_write_small_file(p, "1") != 0) continue;
+        if (!gsi18_read_small_file(p, rb, sizeof(rb)) || strcmp(rb, "1") != 0) continue;
+        gsi18_trace_generate_ok = 1;
+        snprintf(p, sizeof(p), "%s/events/signal/signal_generate/filter", roots[i]);
+        /* Exact match (read-back is whitespace-trimmed): on real
+         * tracefs a filter write REPLACES the filter, so a stale
+         * tail would mean the write did not take. A substring
+         * check would pass "sig==9<stale>" — the harness fake
+         * (a regular file, no replace-on-write) caught this. */
+        if (gsi18_write_small_file(p, "sig==9") == 0 &&
+            gsi18_read_small_file(p, rb, sizeof(rb)) && strcmp(rb, "sig==9") == 0) {
+            gsi18_trace_filter_ok = 1;
         }
+        snprintf(p, sizeof(p), "%s/events/sched/sched_process_exit/enable", roots[i]);
+        if (gsi18_write_small_file(p, "1") == 0 &&
+            gsi18_read_small_file(p, rb, sizeof(rb)) && strcmp(rb, "1") == 0) {
+            gsi18_trace_sched_ok = 1;
+        }
+        snprintf(p, sizeof(p), "%s/tracing_on", roots[i]);
+        if (gsi18_write_small_file(p, "1") == 0 &&
+            gsi18_read_small_file(p, rb, sizeof(rb)) && strcmp(rb, "1") == 0) {
+            gsi18_trace_tracing_on_ok = 1;
+        }
+        snprintf(gsi18_trace_root, sizeof(gsi18_trace_root), "%s", roots[i]);
+        gsi18_trace_ok = (gsi18_trace_generate_ok && gsi18_trace_filter_ok &&
+                          gsi18_trace_tracing_on_ok) ? 1 : 0;
+        return gsi18_trace_ok;
     }
     return 0;
 }
 
-/* Copy the last keep_lines lines of <root>/trace into out.
- * Bounded: only the tail is kept, the whole buffer is never
- * copied. Missing/unreadable trace is one line, never fatal. */
+/* 6.19: re-assert the tracer every heartbeat tick. Other
+ * tracers (Perfetto, Samsung) can reset tracefs events and
+ * tracing_on mid-run; re-running the enable sequence is
+ * cheap and idempotent. Logs the read-back values every tick,
+ * so the bundle proves whether events were recording. */
+static void gsi18_reassert_tracefs(void) {
+    int ok = gsi18_enable_tracefs();
+    gsi18_sup_log("[gsi_zygote_exec] TRACEFS_REASSERT ok=%d generate=%d filter=%d sched=%d tracing_on=%d root=%s\n",
+                  ok, gsi18_trace_generate_ok, gsi18_trace_filter_ok,
+                  gsi18_trace_sched_ok, gsi18_trace_tracing_on_ok,
+                  gsi18_trace_root[0] ? gsi18_trace_root : "(none)");
+}
+
+/* 6.19: separate trace_pipe reader child. It blocks on
+ * <root>/trace_pipe and appends every chunk to the /data pipe
+ * log with a per-chunk fsync, so a kill record survives even
+ * if the supervisor dies. Exits on EOF (tracing off + drained)
+ * or via PR_SET_PDEATHSIG when the supervisor dies. */
+static pid_t gsi18_start_tracepipe(void) {
+    pid_t c;
+    if (!gsi18_trace_root[0]) return -1;
+    c = fork();
+    if (c == 0) {
+        char tp[1120];
+        int tfd, ofd;
+        (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() == 1) _exit(127);
+        snprintf(tp, sizeof(tp), "%s/trace_pipe", gsi18_trace_root);
+        tfd = open(tp, O_RDONLY);
+        if (tfd < 0) _exit(127);
+        ofd = open(gsi18_trace_pipe_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (ofd < 0) _exit(127);
+        for (;;) {
+            char buf[4096];
+            ssize_t n = read(tfd, buf, sizeof(buf));
+            ssize_t off;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (n == 0) break;
+            off = 0;
+            while (off < n) {
+                ssize_t w = write(ofd, buf + off, (size_t)(n - off));
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                off += w;
+            }
+            (void)fsync(ofd);
+        }
+        (void)fsync(ofd);
+        close(ofd);
+        close(tfd);
+        _exit(0);
+    }
+    if (c < 0) return -1;
+    gsi18_sup_log("[gsi_zygote_exec] TRACEPIPE_STARTED: pid=%d path=%s\n",
+                  (int)c, gsi18_trace_pipe_path);
+    return c;
+}
+
+/* 6.19: at death, tracing goes off FIRST — before any read —
+ * so the kill record cannot be overwritten between the death
+ * and the snapshot. Waits briefly for the reader to drain +
+ * exit on EOF, then stops it if it is stuck. */
+static void gsi18_trace_off_first(void) {
+    char p[1120];
+    char rb[64];
+    if (!gsi18_trace_root[0]) return;
+    snprintf(p, sizeof(p), "%s/tracing_on", gsi18_trace_root);
+    (void)gsi18_write_small_file(p, "0");
+    gsi18_msleep(250);
+    if (gsi18_tracepipe_pid > 0) {
+        int st = 0;
+        pid_t w = waitpid(gsi18_tracepipe_pid, &st, WNOHANG);
+        if (w == 0) {
+            gsi18_sup_log("[gsi_zygote_exec] KILL_PID caller=tracepipe_stop pid=%d time=%lld\n",
+                          (int)gsi18_tracepipe_pid, (long long)time(NULL));
+            (void)kill(gsi18_tracepipe_pid, SIGKILL);
+            (void)waitpid(gsi18_tracepipe_pid, &st, 0);
+        }
+        gsi18_tracepipe_pid = -1;
+    }
+    /* Logged unconditionally (not only when a reader was
+     * alive): the read-back is the evidence tracing went off
+     * before the snapshot read. */
+    if (gsi18_read_small_file(p, rb, sizeof(rb))) {
+        gsi18_sup_log("[gsi_zygote_exec] TRACE_OFF: tracing_on=%s (written 0 first, reader stopped)\n", rb);
+    } else {
+        gsi18_sup_log("[gsi_zygote_exec] TRACE_OFF: tracing_on=(unreadable after write)\n");
+    }
+}
+
+/* 6.19: snapshot trace evidence. The 6.18 tail-100 of
+ * <root>/trace was unfiltered receiver-side noise read late
+ * without ever switching tracing off. Now: the trace header
+ * line (entries-in-buffer/entries-written — proves whether
+ * events recorded at all) + the tail of the trace_pipe
+ * reader log (signal_generate sig==9 sender lines). The
+ * parent writes tracing_on=0 BEFORE forking the snapshot, so
+ * the buffer cannot be overwritten between death and read. */
 static void gsi18_dump_trace_tail(FILE *out) {
     char p[1120];
     FILE *f;
-    char **ring;
     char buf[1024];
-    int keep = 100, idx = 0, total = 0, i;
-    if (!gsi18_trace_ok) {
-        fprintf(out, "(tracer not enabled)\n");
+    int found = 0;
+    int lines = 0;
+    if (!gsi18_trace_root[0]) {
+        fprintf(out, "(tracer not enabled — no tracing root)\n");
         return;
     }
+    fprintf(out, "--- trace header (entries-in-buffer/entries-written) ---\n");
     snprintf(p, sizeof(p), "%s/trace", gsi18_trace_root);
     f = fopen(p, "r");
-    if (!f) {
-        fprintf(out, "(trace unreadable: %s)\n", strerror(errno));
-        return;
-    }
-    ring = (char **)calloc((size_t)keep, sizeof(char *));
-    if (!ring) {
-        fclose(f);
-        fprintf(out, "(out of memory)\n");
-        return;
-    }
-    while (fgets(buf, sizeof(buf), f)) {
-        size_t len = strlen(buf);
-        char *copy = (char *)malloc(len + 1);
-        if (!copy) break;
-        memcpy(copy, buf, len + 1);
-        free(ring[idx % keep]);
-        ring[idx % keep] = copy;
-        idx++;
-        total++;
-    }
-    fclose(f);
-    {
-        int start = total > keep ? total - keep : 0;
-        for (i = start; i < total; i++) {
-            if (ring[i % keep]) fputs(ring[i % keep], out);
+    if (f) {
+        while (fgets(buf, sizeof(buf), f) && lines < 12) {
+            lines++;
+            if (strstr(buf, "entries-in-buffer") != NULL) {
+                fputs(buf, out);
+                found = 1;
+                break;
+            }
         }
+        if (!found) {
+            fprintf(out, "(no entries-in-buffer header in first 12 lines — tracing may be off or the buffer empty)\n");
+        }
+        fclose(f);
+    } else {
+        fprintf(out, "(trace unreadable: %s)\n", strerror(errno));
     }
-    for (i = 0; i < keep; i++) free(ring[i]);
-    free(ring);
+    fprintf(out, "--- trace_pipe log (signal_generate sig==9, last 100) ---\n");
+    if (gsi18_trace_pipe_path[0]) {
+        gsi18_copy_tail(out, gsi18_trace_pipe_path, 100);
+    } else {
+        fprintf(out, "(no trace_pipe log — reader never started)\n");
+    }
+}
+
+/* 6.19: memory-killer state at death. The oom_kill counter in
+ * /proc/vmstat + /proc/pressure/memory + MemAvailable: if the
+ * oom_kill counter did not move and pressure is low, neither
+ * the kernel OOM killer nor lmkd pressure explains the death.
+ * Direct reads, no tools, never fatal. */
+static void gsi18_dump_memkiller(FILE *out) {
+    FILE *f;
+    char buf[512];
+    fprintf(out, "--- oom_kill counter (/proc/vmstat) ---\n");
+    f = fopen("/proc/vmstat", "r");
+    if (f) {
+        while (fgets(buf, sizeof(buf), f)) {
+            if (strncmp(buf, "oom_kill", 8) == 0) {
+                fputs(buf, out);
+                break;
+            }
+        }
+        fclose(f);
+    } else {
+        fprintf(out, "(vmstat unreadable: %s)\n", strerror(errno));
+    }
+    fprintf(out, "--- memory pressure (/proc/pressure/memory) ---\n");
+    f = fopen("/proc/pressure/memory", "r");
+    if (f) {
+        while (fgets(buf, sizeof(buf), f)) fputs(buf, out);
+        fclose(f);
+    } else {
+        fprintf(out, "(pressure unreadable: %s)\n", strerror(errno));
+    }
+    fprintf(out, "--- MemAvailable (/proc/meminfo) ---\n");
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(buf, sizeof(buf), f)) {
+            if (strncmp(buf, "MemTotal:", 9) == 0 ||
+                strncmp(buf, "MemFree:", 8) == 0 ||
+                strncmp(buf, "MemAvailable:", 13) == 0) {
+                fputs(buf, out);
+            }
+        }
+        fclose(f);
+    } else {
+        fprintf(out, "(meminfo unreadable: %s)\n", strerror(errno));
+    }
 }
 
 /* Find system_server by scanning /proc: cmdline first token,
@@ -1912,6 +2187,10 @@ static int gsi18_wait_timeout(pid_t pid, int *status, unsigned timeout_ms) {
             return -1;
         }
         if (waited >= timeout_ms) {
+            /* 6.19: PID-targeted by construction (tracked pid);
+             * log caller + time on every kill. */
+            gsi18_sup_log("[gsi_zygote_exec] KILL_PID caller=wait_timeout pid=%d time=%lld\n",
+                          (int)pid, (long long)time(NULL));
             (void)kill(pid, SIGKILL);
             {
                 pid_t w2;
@@ -2008,6 +2287,103 @@ static void gsi18_run_tool_to_file(FILE *out, const char *bin,
     unlink(tmp_path);
 }
 
+/* 6.19: vold ownership probe. The guest system_server died
+ * at least once by its own Java crash in the vold CE-key path
+ * (LockSettingsService.setCeStorageProtection <- vold
+ * ServiceSpecificException), and the two-vold hypothesis says
+ * the guest talks to the HOST vold through the shared
+ * servicemanager. This probe names the vold instances alive
+ * at death (pid + ppid + argv[0]) and records what the
+ * servicemanager answers for the `vold` name, so the next
+ * bundle shows which instance owns it. Classification only;
+ * no vold fix is attempted here. HARD RULE (Claude #3):
+ * nothing in this file forces, bypasses, retry-spoofs, or
+ * patches around setCeStorageProtection or the CE-key
+ * migration in any way — guest user 0 == host user 0 and
+ * both volds share the `vold` binder name, so a forced
+ * success could re-wrap the REAL CE key or touch
+ * gatekeeper/weaver state. vold refusing may be what
+ * protects the phone. This probe only READS. NOTE: whether this build's
+ * dumpsys accepts `--pid` is unverified on-device; if it
+ * does not, its usage error is itself diagnostic and is
+ * captured below. */
+static void gsi18_dump_vold_probe(FILE *out) {
+    DIR *d;
+    struct dirent *de;
+    char plist[256];
+    size_t plen = 0;
+    int any = 0;
+    fprintf(out, "--- vold processes (comm==vold) ---\n");
+    plist[0] = '\0';
+    d = opendir("/proc");
+    if (d) {
+        while ((de = readdir(d)) != NULL) {
+            pid_t pid;
+            char spath[128];
+            FILE *f;
+            char sbuf[512];
+            char *lp, *rp;
+            int ppid = -1;
+            char cmd[160];
+            int cfd;
+            ssize_t cn;
+            if (!isdigit((unsigned char)de->d_name[0])) continue;
+            pid = (pid_t)atoi(de->d_name);
+            if (pid <= 1 || pid == getpid()) continue;
+            snprintf(spath, sizeof(spath), "/proc/%d/stat", (int)pid);
+            f = fopen(spath, "r");
+            if (!f) continue;
+            if (!fgets(sbuf, sizeof(sbuf), f)) {
+                fclose(f);
+                continue;
+            }
+            fclose(f);
+            lp = strchr(sbuf, '(');
+            rp = strrchr(sbuf, ')');
+            if (!lp || !rp || rp <= lp) continue;
+            if ((rp - lp - 1) != 4 || memcmp(lp + 1, "vold", 4) != 0) continue;
+            if (sscanf(rp + 1, " %*c %d", &ppid) != 1) ppid = -1;
+            cmd[0] = '\0';
+            snprintf(spath, sizeof(spath), "/proc/%d/cmdline", (int)pid);
+            cfd = open(spath, O_RDONLY);
+            if (cfd >= 0) {
+                cn = read(cfd, cmd, sizeof(cmd) - 1);
+                close(cfd);
+                if (cn > 0) {
+                    cmd[cn] = '\0';
+                } else {
+                    cmd[0] = '\0';
+                }
+            }
+            fprintf(out, "VOLD_PID pid=%d ppid=%d argv0=%s\n",
+                    (int)pid, ppid, cmd[0] ? cmd : "(empty)");
+            if (plen + 16 < sizeof(plist)) {
+                plen += (size_t)snprintf(plist + plen, sizeof(plist) - plen,
+                                         "%d ", (int)pid);
+            }
+            any = 1;
+        }
+        closedir(d);
+    }
+    fprintf(out, "VOLD_PIDS: %s\n", any ? plist : "(none)");
+    fprintf(out, "--- dumpsys --pid vold (which process owns the vold binder name?) ---\n");
+    fflush(out);
+    {
+        char tmp[1120];
+        char *args[] = {"dumpsys", "--pid", "vold", NULL};
+        snprintf(tmp, sizeof(tmp), "%s/.gsi_snap_dumpsys.tmp", GSI_DIAG_DIR);
+        gsi18_run_tool_to_file(out, GSI_SNAP_DUMPSYS_BIN, args, tmp, 4000, 20);
+    }
+    fprintf(out, "--- service check vold ---\n");
+    fflush(out);
+    {
+        char tmp[1120];
+        char *args[] = {"service", "check", "vold", NULL};
+        snprintf(tmp, sizeof(tmp), "%s/.gsi_snap_svc.tmp", GSI_DIAG_DIR);
+        gsi18_run_tool_to_file(out, GSI_SNAP_SERVICE_BIN, args, tmp, 2000, 5);
+    }
+}
+
 /* Snapshot child: dumps logcat -d, dmesg, and the tracefs tail
  * into snap_path, then exits. Runs in its own fork so a stuck
  * tool can never stall the supervisor. */
@@ -2042,11 +2418,104 @@ static void gsi18_snapshot_child(const char *snap_path) {
         snprintf(tmp, sizeof(tmp), "%s/.gsi_snap_dmesg.tmp", GSI_DIAG_DIR);
         gsi18_run_tool_to_file(out, GSI_SNAP_DMESG_BIN, args, tmp, 8000, 300);
     }
-    fprintf(out, "=== tracefs trace (last 100) ===\n");
+    fprintf(out, "=== tracefs evidence (6.19: header + trace_pipe) ===\n");
     fflush(out);
     gsi18_dump_trace_tail(out);
+    fprintf(out, "=== memory-killer state (6.19) ===\n");
+    fflush(out);
+    gsi18_dump_memkiller(out);
+    fprintf(out, "=== cgroup (6.19) ===\n");
+    fflush(out);
+    fprintf(out, "zygote: %s\n", gsi18_zygote_cgroup[0] ? gsi18_zygote_cgroup : "(not recorded)");
+    fprintf(out, "system_server: %s\n", gsi18_ss_cgroup[0] ? gsi18_ss_cgroup : "(not recorded)");
+    fprintf(out, "=== vold ownership probe (6.19) ===\n");
+    fflush(out);
+    gsi18_dump_vold_probe(out);
     fclose(out);
     _exit(0);
+}
+
+/* 6.19: order-of-death wording shared by the wait loop log
+ * and the classification section. */
+static const char *gsi18_order_str(void) {
+    long long zd = gsi18_z_exit_bt;
+    long long sd = gsi18_ss_exit_bt;
+    if (zd < 0 || sd < 0) return "UNKNOWN";
+    if (zd - sd > 500) return "SS_FIRST";
+    if (sd - zd > 500) return "ZYGOTE_FIRST";
+    return "TOGETHER";
+}
+
+/* 6.19: death classification. The snapshot child already
+ * wrote logcat + dmesg + trace + probe sections; the parent
+ * scans the finished file and appends the verdict, so the
+ * next bundle tells us HOW MANY deaths are vold-fatals vs
+ * true SIGKILLs without re-reading raw logs. Precedence is
+ * deliberate: a CE-key Java fatal is the CAUSE even when the
+ * file also holds SIGKILL report lines (zygote reporting its
+ * dead system_server); a file with SIGKILL lines and no Java
+ * fatal is a true SIGKILL. Classification only — no vold
+ * fix is attempted in 6.19. HARD RULE (Claude #3): this
+ * function only READS log lines. It never forces, bypasses,
+ * or patches the CE-key path — a forced setCeStorageProtection
+ * success could re-wrap the host's real CE key. */
+static void gsi18_append_death_meta(const char *path, int attempt) {
+    FILE *f = fopen(path, "r");
+    char line[1024];
+    int sawCe = 0, sawFatal = 0, sawSig9 = 0;
+    char firstFatal[320];
+    char voldPids[256];
+    const char *cls;
+    FILE *out;
+    firstFatal[0] = '\0';
+    voldPids[0] = '\0';
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "Failed to protect CE key for user 0") != NULL) sawCe = 1;
+            if (strstr(line, "FATAL EXCEPTION") != NULL) sawFatal = 1;
+            if (strstr(line, "exited due to signal 9") != NULL ||
+                strstr(line, "signal 9 (Killed)") != NULL ||
+                strstr(line, "Fatal signal 9") != NULL) sawSig9 = 1;
+            if (!firstFatal[0] &&
+                (strstr(line, "FATAL EXCEPTION") != NULL ||
+                 strstr(line, "Fatal signal") != NULL ||
+                 strstr(line, "exited due to signal") != NULL)) {
+                size_t n = strlen(line);
+                while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+                if (n > (int)sizeof(firstFatal) - 1) n = sizeof(firstFatal) - 1;
+                memcpy(firstFatal, line, n);
+                firstFatal[n] = '\0';
+            }
+            if (!voldPids[0] && strncmp(line, "VOLD_PIDS:", 10) == 0) {
+                size_t n = strlen(line);
+                while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+                if (n > (int)sizeof(voldPids) - 1) n = sizeof(voldPids) - 1;
+                memcpy(voldPids, line, n);
+                voldPids[n] = '\0';
+            }
+        }
+        fclose(f);
+    }
+    if (sawCe && sawFatal) cls = "VOLD_CE_FATAL";
+    else if (sawSig9) cls = "SIGKILL";
+    else if (sawFatal) cls = "JAVA_FATAL";
+    else cls = "OTHER";
+    out = fopen(path, "a");
+    if (out) {
+        fprintf(out, "=== 6.19 death classification ===\n");
+        fprintf(out, "DEATH_CLASS=%s\n", cls);
+        fprintf(out, "DEATH_FIRST_FATAL=%s\n",
+                firstFatal[0] ? firstFatal : "(no fatal line in snapshot)");
+        fprintf(out, "DEATH_ORDER order=%s zygote_bt_ms=%lld system_server_bt_ms=%lld\n",
+                gsi18_order_str(), gsi18_z_exit_bt, gsi18_ss_exit_bt);
+        fprintf(out, "TRACE_STATE generate=%d filter=%d sched=%d tracing_on=%d (last heartbeat reassert read-backs)\n",
+                gsi18_trace_generate_ok, gsi18_trace_filter_ok,
+                gsi18_trace_sched_ok, gsi18_trace_tracing_on_ok);
+        if (voldPids[0]) fprintf(out, "%s\n", voldPids);
+        fclose(out);
+    }
+    gsi18_sup_log("[gsi_zygote_exec] DEATH_CLASS attempt=%d class=%s order=%s\n",
+                  attempt, cls, gsi18_order_str());
 }
 
 /* Death snapshot: fork the snapshot child, wait up to 25 s,
@@ -2071,6 +2540,11 @@ static void gsi18_take_death_snapshot(int attempt, long long epoch) {
         return;
     }
     r = gsi18_wait_timeout(c, &status, 25000);
+    /* 6.19: classify + annotate before measuring, so the logged
+     * byte count covers the finished file. */
+    if (stat(path, &st) == 0 && st.st_size > 0) {
+        gsi18_append_death_meta(path, attempt);
+    }
     if (stat(path, &st) == 0) sz = (long)st.st_size;
     if (r == 1) {
         gsi18_sup_log("[gsi_zygote_exec] SNAPSHOT_OK: attempt=%d path=%s bytes=%ld\n",
@@ -2120,7 +2594,12 @@ static pid_t gsi18_start_capture(void) {
         {
             char *args[] = {"logcat", "-b", "main", "-b", "system", "-b", "crash",
                             "-b", "events", "-v", "threadtime", "-f", gsi18_cap_path,
-                            "-r", "1024", "-n", "4", NULL};
+                            "-r", "1024", "-n", "4",
+                            /* 6.19: name the low-memory killer in the
+                             * capture. Unlisted tags still default to
+                             * verbose; these specs pin the two killer
+                             * tags visible at V. */
+                            "lowmemorykiller:V", "lmkd:V", NULL};
             execv(GSI_SNAP_LOGCAT_BIN, args);
         }
         _exit(127);
@@ -2128,6 +2607,131 @@ static pid_t gsi18_start_capture(void) {
     if (c < 0) return -1;
     gsi18_cap_last_try = time(NULL);
     return c;
+}
+
+/* 6.19: pidfd + CLOCK_BOOTTIME order-of-death support. */
+static long long gsi18_boottime_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return -1;
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
+}
+
+static int gsi18_pidfd_open(pid_t pid) {
+#ifdef SYS_pidfd_open
+    return (int)syscall(SYS_pidfd_open, pid, 0);
+#else
+    (void)pid;
+    return -1;
+#endif
+}
+
+/* Find the system_server whose parent is ppid_want — the
+ * GUEST system_server forked by this attempt's zygote, not
+ * the host's restarted one (same name, different parent). */
+static pid_t gsi18_find_system_server_child(pid_t ppid_want) {
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+    pid_t self = getpid();
+    pid_t found = -1;
+    if (!d) return -1;
+    while ((de = readdir(d)) != NULL) {
+        pid_t pid;
+        char path[128];
+        FILE *f;
+        char sbuf[512];
+        char *lp, *rp;
+        int ppid = -1;
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+        pid = (pid_t)atoi(de->d_name);
+        if (pid <= 1 || pid == self) continue;
+        snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+        f = fopen(path, "r");
+        if (!f) continue;
+        if (!fgets(sbuf, sizeof(sbuf), f)) {
+            fclose(f);
+            continue;
+        }
+        fclose(f);
+        lp = strchr(sbuf, '(');
+        rp = strrchr(sbuf, ')');
+        if (!lp || !rp || rp <= lp) continue;
+        if ((rp - lp - 1) != 13 || memcmp(lp + 1, "system_server", 13) != 0) continue;
+        if (sscanf(rp + 1, " %*c %d", &ppid) != 1) continue;
+        if (ppid == (int)ppid_want) {
+            found = pid;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* One poll round over the death pidfds: stamp CLOCK_BOOTTIME
+ * at each exit. Safe to call repeatedly; first stamp wins. */
+static void gsi18_poll_deaths_once(void) {
+    struct pollfd pfds[2];
+    int nfds = 0;
+    int zi = -1, si = -1;
+    if (gsi18_z_pidfd >= 0) {
+        zi = nfds;
+        pfds[nfds].fd = gsi18_z_pidfd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    if (gsi18_ss_pidfd >= 0) {
+        si = nfds;
+        pfds[nfds].fd = gsi18_ss_pidfd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    if (nfds <= 0) return;
+    if (poll(pfds, (nfds_t)nfds, 0) <= 0) return;
+    if (zi >= 0 && (pfds[zi].revents & POLLIN) && gsi18_z_exit_bt < 0) {
+        gsi18_z_exit_bt = gsi18_boottime_ms();
+        gsi18_sup_log("[gsi_zygote_exec] ORDER_EVT who=zygote bt_ms=%lld\n", gsi18_z_exit_bt);
+    }
+    if (si >= 0 && (pfds[si].revents & POLLIN) && gsi18_ss_exit_bt < 0) {
+        gsi18_ss_exit_bt = gsi18_boottime_ms();
+        gsi18_ss_done = 1;
+        gsi18_sup_log("[gsi_zygote_exec] ORDER_EVT who=system_server bt_ms=%lld\n", gsi18_ss_exit_bt);
+    }
+}
+
+/* 6.19: GSI_SUP log markers. The windowed extract anchors
+ * between these instead of converting timestamps (the 6.18
+ * conversion emptied 19 of 20 windows). Double-fork: the
+ * middle child is reaped here by pid, the grandchild is
+ * reparented to init — no waitpid(-1) anywhere. */
+static void gsi18_log_marker(const char *msg) {
+    pid_t c = fork();
+    if (c == 0) {
+        pid_t g = fork();
+        if (g == 0) {
+            int dn;
+            /* NOTE: no PR_SET_PDEATHSIG here — the middle child
+             * is MEANT to exit immediately, and a death-signal
+             * would race-kill the grandchild before execl
+             * (lost the first marker in the harness). The
+             * grandchild execs /system/bin/log and exits on
+             * its own in milliseconds. */
+            dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) {
+                (void)dup2(dn, 0);
+                (void)dup2(dn, 1);
+                (void)dup2(dn, 2);
+                if (dn > 2) close(dn);
+            }
+            execl(GSI_SNAP_LOG_BIN, "log", "-t", "GSI_SUP", msg, (char *)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    if (c > 0) {
+        int st = 0;
+        (void)waitpid(c, &st, 0);
+    }
 }
 
 /* Per-tick service: capture supervision (death + throttled
@@ -2178,7 +2782,33 @@ static void gsi18_service(int zygote_alive) {
             }
         }
     }
+    /* 6.19: trace_pipe reader supervision — reap a dead
+     * reader (EOF after tracing off, or PDEATHSIG) so the
+     * restart below can replace it. */
+    if (gsi18_tracepipe_pid > 0) {
+        int st = 0;
+        pid_t w = waitpid(gsi18_tracepipe_pid, &st, WNOHANG);
+        if (w == gsi18_tracepipe_pid) {
+            gsi18_sup_log("[gsi_zygote_exec] TRACEPIPE_DIED: pid=%d\n",
+                          (int)gsi18_tracepipe_pid);
+            gsi18_tracepipe_pid = -1;
+        } else if (w < 0 && errno == ECHILD) {
+            gsi18_tracepipe_pid = -1;
+        }
+    }
     if (gsi18_last_beat == 0 || now - gsi18_last_beat >= (time_t)gsi18_heartbeat_secs()) {
+        /* 6.19: re-assert the tracer every heartbeat tick and
+         * restart the pipe reader (throttled) when tracing is
+         * verified on, so the next attempt is traced even if
+         * another tracer reset tracefs between attempts. */
+        gsi18_reassert_tracefs();
+        if (gsi18_trace_ok && gsi18_tracepipe_pid < 0 &&
+            now - gsi18_tracepipe_last_try >= 2) {
+            pid_t tp;
+            gsi18_tracepipe_last_try = now;
+            tp = gsi18_start_tracepipe();
+            if (tp > 0) gsi18_tracepipe_pid = tp;
+        }
         pid_t ss = gsi18_find_system_server();
         FILE *hb = fopen(gsi18_hb_path, "a");
         gsi18_last_beat = now;
@@ -2539,11 +3169,19 @@ int main(int argc, char **argv) {
             fclose(hb);
         }
     }
+    snprintf(gsi18_trace_pipe_path, sizeof(gsi18_trace_pipe_path), "%s/gsi_trace_pipe.log", GSI_DIAG_DIR);
     if (gsi18_enable_tracefs()) {
-        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_OK: root=%s (signal_deliver/signal_generate enabled)\n",
-                      gsi18_trace_root);
+        pid_t tp;
+        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_OK: root=%s generate=%d filter=%d sched=%d tracing_on=%d (signal_generate sig==9 only)\n",
+                      gsi18_trace_root, gsi18_trace_generate_ok, gsi18_trace_filter_ok,
+                      gsi18_trace_sched_ok, gsi18_trace_tracing_on_ok);
+        tp = gsi18_start_tracepipe();
+        if (tp > 0) gsi18_tracepipe_pid = tp;
     } else {
-        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_UNAVAILABLE: no writable tracing root — signal tracer off, boot continues\n");
+        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_UNAVAILABLE: generate=%d filter=%d sched=%d tracing_on=%d root=%s — signal tracer off, boot continues\n",
+                      gsi18_trace_generate_ok, gsi18_trace_filter_ok,
+                      gsi18_trace_sched_ok, gsi18_trace_tracing_on_ok,
+                      gsi18_trace_root[0] ? gsi18_trace_root : "(none)");
     }
     {
         pid_t cp = gsi18_start_capture();
@@ -2567,6 +3205,46 @@ int main(int argc, char **argv) {
              * parent is already gone. */
             (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
             if (getppid() == 1) _exit(127);
+            /* 6.19: lmkd/OOM test — pin this child (and the
+             * system_server it forks) out of the killer's
+             * reach BEFORE execve. If deaths persist at the
+             * same timing with adj -1000, lmkd and the kernel
+             * OOM killer are both cleared. The read-back is
+             * the witness; the parent logs its own read-back
+             * in the wait loop. Loud failure, never fatal. */
+            {
+                int ofd = open("/proc/self/oom_score_adj", O_WRONLY);
+                char rb[32];
+                int ok = 0;
+                rb[0] = '\0';
+                if (ofd >= 0) {
+                    if (write(ofd, "-1000", 5) == 5) {
+                        int rfd = open("/proc/self/oom_score_adj", O_RDONLY);
+                        if (rfd >= 0) {
+                            ssize_t n = read(rfd, rb, sizeof(rb) - 1);
+                            if (n > 0) {
+                                size_t L = (size_t)n;
+                                rb[L] = '\0';
+                                while (L > 0 && (rb[L - 1] == '\n' || rb[L - 1] == ' ')) rb[--L] = '\0';
+                                ok = (strcmp(rb, "-1000") == 0);
+                            }
+                            close(rfd);
+                        }
+                    }
+                    close(ofd);
+                }
+                {
+                    char op[1120];
+                    int lfd;
+                    snprintf(op, sizeof(op), "%s/oom_adj.log", GSI_DIAG_DIR);
+                    lfd = open(op, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                    if (lfd >= 0) {
+                        dprintf(lfd, "OOM_ADJ_SET attempt=%d pid=%d requested=-1000 readback=%s ok=%d\n",
+                                attempt, (int)getpid(), rb[0] ? rb : "(unreadable)", ok);
+                        close(lfd);
+                    }
+                }
+            }
 #ifdef GSI_ZYGOTE_TEST_TARGET
             /* Host harness only (never defined in device builds):
              * try a fake app_process first so the pipe capture +
@@ -2625,9 +3303,28 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        /* 6.19: GSI_SUP start marker (windowed extract
+         * anchors between markers, not timestamps). */
+        {
+            char mbuf[160];
+            snprintf(mbuf, sizeof(mbuf), "ZYGOTE_START n=%d pid=%d at=%lld",
+                     attempt, (int)zpid, (long long)time(NULL));
+            gsi18_log_marker(mbuf);
+        }
+        /* 6.19: order-of-death tracking state for this attempt. */
+        gsi18_z_pidfd = gsi18_pidfd_open(zpid);
+        gsi18_z_exit_bt = -1;
+        gsi18_ss_exit_bt = -1;
+        gsi18_ss_pid = -1;
+        gsi18_ss_pidfd = -1;
+        gsi18_ss_done = 0;
+        gsi18_zygote_cgroup[0] = '\0';
+        gsi18_ss_cgroup[0] = '\0';
+        gsi18_read_proc_cgroup(zpid, gsi18_zygote_cgroup, sizeof(gsi18_zygote_cgroup));
         int status = 0;
         pid_t w = -1;
         int wait_failed = 0;
+        int oom_logged = 0;
         /* 6.18: poll-wait so diagnostics stay serviced while the
          * zygote runs: capture supervision, heartbeat, and the
          * stuck-boot snapshot all happen in gsi18_service().
@@ -2637,6 +3334,34 @@ int main(int argc, char **argv) {
          * exactly that reason; a pipe-mode writer zombie is
          * reaped when this process exits). */
         for (;;) {
+            /* 6.19: per-tick death-order + shield checks, before
+             * waitpid so an exit is stamped even if waitpid
+             * reaps first. */
+            if (!oom_logged) {
+                char op[128];
+                char rb[64];
+                oom_logged = 1;
+                snprintf(op, sizeof(op), "/proc/%d/oom_score_adj", (int)zpid);
+                if (gsi18_read_small_file(op, rb, sizeof(rb))) {
+                    gsi18_sup_log("[gsi_zygote_exec] OOM_ADJ_READBACK attempt=%d pid=%d adj=%s (want -1000)\n",
+                                  attempt, (int)zpid, rb);
+                } else {
+                    gsi18_sup_log("[gsi_zygote_exec] OOM_ADJ_READBACK attempt=%d pid=%d adj=(unreadable)\n",
+                                  attempt, (int)zpid);
+                }
+            }
+            if (gsi18_ss_pid < 0 && !gsi18_ss_done) {
+                pid_t ss = gsi18_find_system_server_child(zpid);
+                if (ss > 0) {
+                    gsi18_ss_pid = ss;
+                    gsi18_ss_pidfd = gsi18_pidfd_open(ss);
+                    gsi18_read_proc_cgroup(ss, gsi18_ss_cgroup, sizeof(gsi18_ss_cgroup));
+                    gsi18_sup_log("[gsi_zygote_exec] SS_FOUND attempt=%d system_server=%d cgroup=%s\n",
+                                  attempt, (int)ss,
+                                  gsi18_ss_cgroup[0] ? gsi18_ss_cgroup : "(none)");
+                }
+            }
+            gsi18_poll_deaths_once();
             w = waitpid(zpid, &status, WNOHANG);
             if (w == zpid) break;
             if (w < 0) {
@@ -2647,6 +3372,22 @@ int main(int argc, char **argv) {
             gsi18_msleep(gsi18_poll_ms());
             gsi18_service(1);
         }
+        /* 6.19: final exit poll (an exit between the last tick
+         * and the reap still stamps), then close the pidfds. */
+        gsi18_poll_deaths_once();
+        if (!wait_failed && w == zpid && gsi18_z_exit_bt < 0) {
+            gsi18_z_exit_bt = gsi18_boottime_ms();
+        }
+        if (gsi18_z_pidfd >= 0) {
+            close(gsi18_z_pidfd);
+            gsi18_z_pidfd = -1;
+        }
+        if (gsi18_ss_pidfd >= 0) {
+            close(gsi18_ss_pidfd);
+            gsi18_ss_pidfd = -1;
+        }
+        gsi18_sup_log("[gsi_zygote_exec] DEATH_ORDER attempt=%d order=%s zygote_bt_ms=%lld system_server_bt_ms=%lld\n",
+                      attempt, gsi18_order_str(), gsi18_z_exit_bt, gsi18_ss_exit_bt);
         time_t t1 = time(NULL);
         long after = (long)(t1 - t0);
         if (after < 0) after = 0;
@@ -2677,6 +3418,24 @@ int main(int argc, char **argv) {
                 fclose(lg);
             }
         }
+        /* 6.19: GSI_SUP exit marker, then tracing off FIRST
+         * so the snapshot reads a frozen buffer + drained
+         * pipe log. */
+        {
+            char mbuf[192];
+            if (WIFSIGNALED(status)) {
+                snprintf(mbuf, sizeof(mbuf), "ZYGOTE_EXIT n=%d sig=%d at=%lld",
+                         attempt, WTERMSIG(status), (long long)t1);
+            } else if (WIFEXITED(status)) {
+                snprintf(mbuf, sizeof(mbuf), "ZYGOTE_EXIT n=%d exit=%d at=%lld",
+                         attempt, WEXITSTATUS(status), (long long)t1);
+            } else {
+                snprintf(mbuf, sizeof(mbuf), "ZYGOTE_EXIT n=%d at=%lld",
+                         attempt, (long long)t1);
+            }
+            gsi18_log_marker(mbuf);
+        }
+        gsi18_trace_off_first();
         /* 6.18: death snapshot while the evidence is fresh —
          * logcat -d + dmesg + tracefs tail, no shell, 25 s cap.
          * Runs for every death, including signal 9. */
@@ -2692,6 +3451,10 @@ int main(int argc, char **argv) {
      * writing forever). The capture file stays on disk for the
      * Java bundle, which collects it after the return. */
     if (gsi18_cap_pid > 0) {
+        /* 6.19: PID-targeted by construction (tracked pid);
+         * log caller + time on every kill. */
+        gsi18_sup_log("[gsi_zygote_exec] KILL_PID caller=supervisor_exit pid=%d time=%lld\n",
+                      (int)gsi18_cap_pid, (long long)time(NULL));
         (void)kill(gsi18_cap_pid, SIGKILL);
         {
             int dummy = 0;
@@ -2708,6 +3471,9 @@ int main(int argc, char **argv) {
             fclose(hb);
         }
     }
+    /* 6.19: leave tracing off at supervisor exit (no-op if a
+     * death already switched it off). */
+    gsi18_trace_off_first();
     /* Exit with the last status, shell-style: the outer script
      * sees the same 137 for a SIGKILLed guest it sees today. */
     if (WIFEXITED(last_status)) return WEXITSTATUS(last_status);

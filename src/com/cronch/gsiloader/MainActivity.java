@@ -126,6 +126,8 @@ public class MainActivity extends Activity {
     private CheckBox cbPatchFramework;
     private CheckBox cbPatchPermission;
     private CheckBox cbPatchApexList;
+    private CheckBox cbGuestIsolation;
+    private CheckBox cbSkipGuestDataDirs;
 
     private Button btnInstallGsi;
     private Button btnGuestShell;
@@ -358,6 +360,9 @@ public class MainActivity extends Activity {
     private boolean patchFramework = false;
     private boolean patchPermissionController = false;
     private boolean patchApexList = false;
+    // 6.20: guest service isolation + skip-data-dirs (default OFF, see prefs).
+    private boolean guestIsolation = false;
+    private boolean skipGuestDataDirs = false;
 
     // NOTE: the directory name is historical (kept so existing installs keep
     // working); it holds ANY GSI's system.raw, not just LineageOS.
@@ -442,6 +447,12 @@ public class MainActivity extends Activity {
     private static final String PREF_PATCH_FRAMEWORK = "patch_framework";
     private static final String PREF_PATCH_PERMISSION = "patch_permission";
     private static final String PREF_PATCH_APEX_LIST = "patch_apex_list";
+    // 6.20: guest service isolation (own vold name + lock/secret guards)
+    // and the diagnostic skip of pre-created guest data dirs. Both
+    // default OFF, are never auto-enabled (not even for Lineage presets),
+    // and are gated to the 23.2 patched set like the other patch toggles.
+    private static final String PREF_GUEST_ISOLATION = "guest_isolation";
+    private static final String PREF_SKIP_GUEST_DATA_DIRS = "skip_guest_data_dirs";
     private static final String PREF_SLOT = "selected_slot";
     // 5.9.11: wipe-guest-userdata-after-install toggle (persisted,
     // default off so it never surprises anyone).
@@ -568,6 +579,8 @@ public class MainActivity extends Activity {
         cbPatchFramework = findViewById(R.id.cb_patch_framework);
         cbPatchPermission = findViewById(R.id.cb_patch_permission);
         cbPatchApexList = findViewById(R.id.cb_patch_apex_list);
+        cbGuestIsolation = findViewById(R.id.cb_guest_isolation);
+        cbSkipGuestDataDirs = findViewById(R.id.cb_skip_guest_data_dirs);
 
         btnInstallGsi = findViewById(R.id.btn_install_gsi);
         btnGuestShell = findViewById(R.id.btn_guest_shell);
@@ -839,6 +852,16 @@ public class MainActivity extends Activity {
             saveGsiPrefs();
             writeGsiFlagsFile();
         });
+        cbGuestIsolation.setOnCheckedChangeListener((v, checked) -> {
+            guestIsolation = checked;
+            saveGsiPrefs();
+            writeGsiFlagsFile();
+        });
+        cbSkipGuestDataDirs.setOnCheckedChangeListener((v, checked) -> {
+            skipGuestDataDirs = checked;
+            saveGsiPrefs();
+            writeGsiFlagsFile();
+        });
 
         // Apply the restored source without clobbering restored toggles.
         selectSource(selectedSource, false);
@@ -947,6 +970,8 @@ public class MainActivity extends Activity {
         if (cbPatchFramework != null) cbPatchFramework.setChecked(patchFramework);
         if (cbPatchPermission != null) cbPatchPermission.setChecked(patchPermissionController);
         if (cbPatchApexList != null) cbPatchApexList.setChecked(patchApexList);
+        if (cbGuestIsolation != null) cbGuestIsolation.setChecked(guestIsolation);
+        if (cbSkipGuestDataDirs != null) cbSkipGuestDataDirs.setChecked(skipGuestDataDirs);
     }
 
     private void restoreGsiPrefs() {
@@ -974,6 +999,9 @@ public class MainActivity extends Activity {
             patchFramework = prefs.getBoolean(PREF_PATCH_FRAMEWORK, false);
             patchPermissionController = prefs.getBoolean(PREF_PATCH_PERMISSION, false);
             patchApexList = prefs.getBoolean(PREF_PATCH_APEX_LIST, false);
+            // 6.20: isolation flags default OFF and are never auto-enabled.
+            guestIsolation = prefs.getBoolean(PREF_GUEST_ISOLATION, false);
+            skipGuestDataDirs = prefs.getBoolean(PREF_SKIP_GUEST_DATA_DIRS, false);
             // 5.9.5-APP-START
             batteryGuardEnabled = prefs.getBoolean(PREF_BATTERY_GUARD, true);
             logAutoScroll = prefs.getBoolean(PREF_LOG_AUTOSCROLL, true);
@@ -1012,6 +1040,8 @@ public class MainActivity extends Activity {
                     .putBoolean(PREF_PATCH_FRAMEWORK, patchFramework)
                     .putBoolean(PREF_PATCH_PERMISSION, patchPermissionController)
                     .putBoolean(PREF_PATCH_APEX_LIST, patchApexList)
+                    .putBoolean(PREF_GUEST_ISOLATION, guestIsolation)
+                    .putBoolean(PREF_SKIP_GUEST_DATA_DIRS, skipGuestDataDirs)
                     .putBoolean(PREF_WIPE_AFTER_INSTALL, wipeAfterInstall)
                     .putString(PREF_SLOT, selectedSlot)
                     .apply();
@@ -1031,6 +1061,13 @@ public class MainActivity extends Activity {
             String content = "PATCH_FRAMEWORK=" + (patchFramework ? "1" : "0") + "\n"
                     + "PATCH_PERMISSION_CONTROLLER=" + (patchPermissionController ? "1" : "0") + "\n"
                     + "USE_LINEAGE_APEX_LIST=" + (patchApexList ? "1" : "0") + "\n"
+                    // 6.20: GUEST_OWN_VOLD mirrors GUEST_ISOLATION — the
+                    // framework half (gvld lookup) cannot work without the
+                    // daemon half (guest vold registering gvld), and the
+                    // script refuses to stage one without the other.
+                    + "GUEST_ISOLATION=" + (guestIsolation ? "1" : "0") + "\n"
+                    + "GUEST_OWN_VOLD=" + (guestIsolation ? "1" : "0") + "\n"
+                    + "SKIP_GUEST_DATA_DIRS=" + (skipGuestDataDirs ? "1" : "0") + "\n"
                     + "DENSITY_DPI=" + densityForSlot(selectedSlot) + "\n"
                     + "SHARE_FOLDER=" + (shareForSlot(selectedSlot) ? "1" : "0") + "\n"
                     + "FRAMEWORK_VERSION=" + detectedFrameworkVersion + "\n"
@@ -2835,6 +2872,10 @@ public class MainActivity extends Activity {
                 "master_prepare.sh", "master_inner.sh",
                 "zygote_exec", "fdtrace.so", "clean_apex_info_list.xml",
                 "services_patched.jar", "framework_patched.jar",
+                // 6.20: isolated services jar + vold-name patcher binary.
+                // Inert on disk until master_prepare.sh binds them under
+                // GUEST_ISOLATION / GUEST_OWN_VOLD (see writeGsiFlagsFile).
+                "services_isolated.jar", "gvld_patch",
                 "7zz", "PermissionController_patched.apk", "install_image.sh",
                 // 5.9.5-INT-START: new engine scripts + converter.
                 "guards.sh", "snapshot_slot.sh", "rollback_slot.sh",
@@ -3591,11 +3632,13 @@ public class MainActivity extends Activity {
             java.util.regex.Pattern deathPat = java.util.regex.Pattern.compile("ZYGOTE_EXIT: attempt=(\\d+) .*?(?:signal=(\\d+)|exit=(\\d+)).*?at=(\\d+)");
             java.util.ArrayList<Long> epochs = new java.util.ArrayList<>();
             java.util.ArrayList<String> descs = new java.util.ArrayList<>();
+            java.util.ArrayList<Integer> attempts = new java.util.ArrayList<>();
             for (String l : logLines) {
                 java.util.regex.Matcher m = deathPat.matcher(l);
                 if (m.find()) {
                     try {
                         epochs.add(Long.parseLong(m.group(4)));
+                        attempts.add(Integer.parseInt(m.group(1)));
                         descs.add("attempt=" + m.group(1) + " " + (m.group(2) != null ? "signal=" + m.group(2) : "exit=" + m.group(3)) + " at=" + m.group(4));
                     } catch (Exception ignored) {}
                 }
@@ -3620,20 +3663,55 @@ public class MainActivity extends Activity {
             java.util.regex.Pattern tsPat = java.util.regex.Pattern.compile("^(\\d\\d)-(\\d\\d) (\\d\\d):(\\d\\d):(\\d\\d)\\.(\\d\\d\\d)\\s");
             int year = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
             long nowSec = System.currentTimeMillis() / 1000L;
+            // 6.19: GSI_SUP markers (written by the supervisor via
+            // /system/bin/log into this same capture) anchor the
+            // windows: lines from the same-n ZYGOTE_START marker
+            // through the ZYGOTE_EXIT marker + 60 following lines.
+            // The old timestamp conversion emptied 19 of 20 windows.
+            // Falls back to the ±60s timestamp window when a death's
+            // markers are missing; says so explicitly when no markers
+            // exist at all. The death list/descriptions above still
+            // come from the supervisor log (ZYGOTE_EXIT lines).
+            java.util.regex.Pattern markerPat = java.util.regex.Pattern.compile("GSI_SUP:?\\s+ZYGOTE_(START|EXIT) n=(\\d+)");
+            java.util.HashMap<Integer, Integer> startIdx = new java.util.HashMap<>();
+            java.util.HashMap<Integer, Integer> exitIdx = new java.util.HashMap<>();
+            boolean anyMarker = false;
+            for (int i = 0; i < cap.size(); i++) {
+                java.util.regex.Matcher mm = markerPat.matcher(cap.get(i));
+                if (!mm.find()) continue;
+                anyMarker = true;
+                int n;
+                try { n = Integer.parseInt(mm.group(2)); } catch (Exception ignored) { continue; }
+                if (mm.group(1).equals("START")) { if (!startIdx.containsKey(n)) startIdx.put(n, i); }
+                else { if (!exitIdx.containsKey(n)) exitIdx.put(n, i); }
+            }
+            if (!anyMarker) {
+                out.append("(no GSI_SUP markers in the capture at all — supervisor markers need /system/bin/log; falling back to timestamp windows below)\n");
+            }
             for (int d = 0; d < epochs.size(); d++) {
                 long epoch = epochs.get(d);
-                out.append("--- window ").append(descs.get(d)).append(" ±60s ---\n");
+                int attemptNo = attempts.get(d);
+                out.append("--- window ").append(descs.get(d)).append(" ---\n");
                 java.util.ArrayList<String> matches = new java.util.ArrayList<>();
-                for (String line : cap) {
-                    java.util.regex.Matcher tm = tsPat.matcher(line);
-                    if (!tm.find()) continue;
-                    try {
-                        String stamp = year + "-" + tm.group(1) + "-" + tm.group(2) + " "
-                                + tm.group(3) + ":" + tm.group(4) + ":" + tm.group(5) + "." + tm.group(6);
-                        long t = fmt.parse(stamp).getTime() / 1000L;
-                        if (t > nowSec + 86400L) t -= 31536000L;
-                        if (Math.abs(t - epoch) <= 60) matches.add(line);
-                    } catch (Exception ignored) {}
+                Integer s = startIdx.get(attemptNo);
+                Integer e = exitIdx.get(attemptNo);
+                if (s != null && e != null && e >= s) {
+                    out.append("[marker-anchored: ZYGOTE_START n=").append(attemptNo).append(" through ZYGOTE_EXIT n=").append(attemptNo).append(" + 60 lines]\n");
+                    int end = Math.min(e + 60, cap.size() - 1);
+                    for (int i = s; i <= end; i++) matches.add(cap.get(i));
+                } else {
+                    out.append("[marker fallback: no complete GSI_SUP marker pair for n=").append(attemptNo).append(" — ±60s timestamp window]\n");
+                    for (String line : cap) {
+                        java.util.regex.Matcher tm = tsPat.matcher(line);
+                        if (!tm.find()) continue;
+                        try {
+                            String stamp = year + "-" + tm.group(1) + "-" + tm.group(2) + " "
+                                    + tm.group(3) + ":" + tm.group(4) + ":" + tm.group(5) + "." + tm.group(6);
+                            long t = fmt.parse(stamp).getTime() / 1000L;
+                            if (t > nowSec + 86400L) t -= 31536000L;
+                            if (Math.abs(t - epoch) <= 60) matches.add(line);
+                        } catch (Exception ignored) {}
+                    }
                 }
                 if (matches.isEmpty()) {
                     out.append("(no capture lines in this window — capture may have died before the death or rotated past it)\n");
@@ -3728,7 +3806,7 @@ public class MainActivity extends Activity {
                         // --time-style=full-iso check: it shows
                         // whether the capture file died mid-run
                         // without anyone running a shell command.
-                        {"6.18 slot data dir listing with full mtimes (did the capture die mid-run?)", "ls -l --time-style=full-iso \"" + dir + "/data\" 2>/dev/null; echo \"--- /data 6.18 files ---\"; ls -l --time-style=full-iso /data/gsi_heartbeat.log /data/gsi_death_*.log /data/gsi_stuck_*.log /data/zygote_exec.log 2>/dev/null; true"},
+                        {"6.18 slot data dir listing with full mtimes (did the capture die mid-run?)", "ls -l --time-style=full-iso \"" + dir + "/data\" 2>/dev/null; echo \"--- /data 6.18/6.19 files ---\"; ls -l --time-style=full-iso /data/gsi_heartbeat.log /data/gsi_death_*.log /data/gsi_stuck_*.log /data/zygote_exec.log /data/gsi_trace_pipe.log /data/gsi_host_pids_*.log /data/oom_adj.log 2>/dev/null; true"},
                         // 6.18: death snapshots — logcat -d + dmesg +
                         // trace tail taken by the supervisor right
                         // after each waitpid. Newest 2, capped.
@@ -3741,6 +3819,34 @@ public class MainActivity extends Activity {
                         // capped. Empty when the run never reached 60 s
                         // or system_server never appeared.
                         {"6.18 stuck-boot stack snapshot (newest, head 12000 bytes)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_stuck_*.log /data/gsi_stuck_*.log 2>/dev/null | head -1); do n=1; echo \"== $f\"; head -c 12000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no stuck snapshot — run never reached 60s or no system_server)\"; true"},
+                        // 6.19: trace_pipe log — the separate reader
+                        // child's signal_generate output. Newest one,
+                        // capped. Absent when the tracer never
+                        // verified or the reader never started.
+                        {"6.19 trace_pipe log (signal_generate sig==9 reader output; newest, head 20000 bytes)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_trace_pipe.log /data/gsi_trace_pipe.log 2>/dev/null | head -1); do n=1; echo \"== $f\"; head -c 20000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no trace_pipe log — tracer never verified or reader never started)\"; true"},
+                        // 6.19: oom_adj witness log — the child's
+                        // oom_score_adj writes + the parent's
+                        // read-backs. Proves whether the -1000 shield
+                        // actually landed.
+                        {"6.19 oom_adj witness log (oom_score_adj writes + read-backs; last 100 lines)", "if [ -f \"" + dir + "/data/oom_adj.log\" ]; then echo \"(found: " + dir + "/data/oom_adj.log)\"; tail -100 \"" + dir + "/data/oom_adj.log\"; elif [ -f /data/oom_adj.log ]; then echo \"(found: /data/oom_adj.log)\"; tail -100 /data/oom_adj.log; else echo \"(oom_adj.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        // 6.19: host PID snapshot — the pre-launch
+                        // census. Newest one, capped.
+                        {"6.19 host PID snapshot (pre-launch host PIDs; newest, head 8000 bytes)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_host_pids_*.log /data/gsi_host_pids_*.log 2>/dev/null | head -1); do n=1; echo \"== $f\"; head -c 8000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no host PID snapshot — pre-launch snapshot did not run)\"; true"},
+                        // 6.19: guest vold's own log — vold's voice.
+                        // The guest vold writes /data/vold.log
+                        // (guest-visible = slot data dir on the host).
+                        // Full content up to 100 KB: a single boot's
+                        // vold log is far smaller, the cap only guards
+                        // a pathological loop. Absence is logged
+                        // explicitly with the paths checked — the 6.18
+                        // bundle had ZERO vold.log content.
+                        {"6.19 guest vold log (vold.log — vold's own stdout/stderr; full content, head 100000 bytes)", "V=\"" + dir + "/data/vold.log\"; [ -f \"$V\" ] || V=/data/vold.log; if [ -f \"$V\" ]; then echo \"(found: $V size: $(stat -c%s \"$V\" 2>/dev/null) bytes)\"; head -c 100000 \"$V\" 2>/dev/null; echo; else echo \"(vold.log NOT FOUND — checked: " + dir + "/data/vold.log and /data/vold.log)\"; fi; true"},
+                        // 6.19: ALL vold-tagged logcat lines, FULL
+                        // window (capture + rotations + restarts).
+                        // Tag-shaped match on the threadtime tag field
+                        // (vold, Vold, vold_*). Count first, then dump
+                        // capped at 5000 lines.
+                        {"6.19 vold-tagged logcat lines (ALL vold tags, full window; capture + rotations + restarts)", "if [ -f \"" + dir + "/data/logcat_continuous.txt\" ]; then B=\"" + dir + "/data\"; elif [ -f /data/logcat_continuous.txt ]; then B=/data; else B=\"\"; fi; if [ -n \"$B\" ]; then N=$(for f in \"$B\"/logcat_continuous.txt.4 \"$B\"/logcat_continuous.txt.3 \"$B\"/logcat_continuous.txt.2 \"$B\"/logcat_continuous.txt.1 \"$B\"/logcat_continuous.txt.restart1 \"$B\"/logcat_continuous.txt.restart2 \"$B\"/logcat_continuous.txt; do [ -f \"$f\" ] && cat \"$f\"; done 2>/dev/null | grep -aE ' [Vv]old[a-zA-Z_]*: ' | wc -l); echo \"(vold-tagged lines in full window: $N; showing first 5000)\"; for f in \"$B\"/logcat_continuous.txt.4 \"$B\"/logcat_continuous.txt.3 \"$B\"/logcat_continuous.txt.2 \"$B\"/logcat_continuous.txt.1 \"$B\"/logcat_continuous.txt.restart1 \"$B\"/logcat_continuous.txt.restart2 \"$B\"/logcat_continuous.txt; do [ -f \"$f\" ] && cat \"$f\"; done 2>/dev/null | grep -aE ' [Vv]old[a-zA-Z_]*: ' | head -5000; else echo \"(logcat_continuous.txt NOT FOUND in slot data or /data — vold tag extract unavailable)\"; fi; true"},
                         // 6.17: kernel log + memory-killer harvest. The
                         // full dmesg tail is kept (capped), not just
                         // matches — the killer's lines may sit outside
@@ -3768,7 +3874,7 @@ public class MainActivity extends Activity {
                     // files. Computed here (not shell) so the window
                     // math stays in one place and the bundle never
                     // runs a second logcat over the capture file.
-                    sb.append("\n===== 6.18 windowed logcat extract (±60s around each ZYGOTE_EXIT death; capture + rotations + restarts) =====\n");
+                    sb.append("\n===== 6.19 windowed logcat extract (GSI_SUP marker-anchored, ±60s timestamp fallback; capture + rotations + restarts) =====\n");
                     sb.append(windowedLogcatExtract(dir));
                 } else {
                     sb.append("\n===== root sections skipped (no temp root) =====\n");
@@ -3790,10 +3896,10 @@ public class MainActivity extends Activity {
                 // 6.18: the capture stops only NOW — after the
                 // bundle file is written. See stopContinuousLogcat.
                 stopContinuousLogcatAfterExport();
-                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + continuous logcat + cap-time dump + kernel/OOM harvest + tombstones + pmsg probe + pstore excerpt + device info + 6.18 windowed extract + boot-id/uptime + mtime listing + death snapshots + heartbeat + stuck snapshot). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
+                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + continuous logcat + cap-time dump + kernel/OOM harvest + tombstones + pmsg probe + pstore excerpt + device info + 6.19 windowed extract (marker-anchored) + boot-id/uptime + mtime listing + death snapshots + heartbeat + stuck snapshot + trace_pipe log + oom_adj log + host PID snapshot + guest vold log + vold-tag extract). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
                 mainHandler.post(() -> new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Diagnostics bundle exported")
-                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, continuous logcat, cap-time dump, kernel/OOM harvest, tombstones, pmsg probe, pstore excerpt and device info in one file, plus 6.18 extras (windowed extract, death snapshots, heartbeat, stuck snapshot) — share it when reporting a failed boot.")
+                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, continuous logcat, cap-time dump, kernel/OOM harvest, tombstones, pmsg probe, pstore excerpt and device info in one file, plus 6.19 extras (marker-anchored windowed extract, death snapshots, heartbeat, stuck snapshot, trace_pipe log, oom_adj log, host PID snapshot, guest vold log, vold-tag extract) — share it when reporting a failed boot.")
                         .setPositiveButton("OK", null)
                         .setNeutralButton("Share", (d, w) -> shareDownloadedText(dlUri, "GSI Loader diagnostics bundle", bundleText)).show());
             } catch (Exception e) {
@@ -4750,9 +4856,9 @@ public class MainActivity extends Activity {
                     + "cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; done; "
                     + "echo \"$VER\" > " + STAGE_DIR + "/.sync_version 2>/dev/null; "
                     + "cp -f " + files + "/7zz /data/local/tmp/7zz 2>/dev/null; "
-                    + "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/fdtrace.so " + STAGE_DIR + "/7zz " + STAGE_DIR + "/simg2img /data/local/tmp/7zz 2>/dev/null; "
+                    + "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/fdtrace.so " + STAGE_DIR + "/7zz " + STAGE_DIR + "/simg2img " + STAGE_DIR + "/gvld_patch /data/local/tmp/7zz 2>/dev/null; "
                     + "echo \"# version $VER\" > " + STAGE_DIR + "/.engine_hashes 2>/dev/null; "
-                    + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec fdtrace.so; do [ -f \"" + STAGE_DIR + "/$b\" ] && h=$(hashf \"" + STAGE_DIR + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + STAGE_DIR + "/.engine_hashes 2>/dev/null; done; true";
+                    + "for b in services_patched.jar services_isolated.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec fdtrace.so gvld_patch; do [ -f \"" + STAGE_DIR + "/$b\" ] && h=$(hashf \"" + STAGE_DIR + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + STAGE_DIR + "/.engine_hashes 2>/dev/null; done; true";
             Runtime.getRuntime().exec(new String[]{suBinary, "-c", cmd}).waitFor();
         } catch (Exception ignored) {}
     }
@@ -4789,7 +4895,15 @@ public class MainActivity extends Activity {
                 }
                 // Stop stray session daemons first so nothing recreates
                 // files or fires a return mid-wipe.
-                runRootCmdDrained("pkill -9 -f \"boot_watchdog.sh\" 2>/dev/null; pkill -9 -f \"adb_watchdog.sh\" 2>/dev/null; pkill -9 -f \"ims_watchdog.sh\" 2>/dev/null; pkill -9 -f \"ui_activator\" 2>/dev/null; true");
+                // 6.19: PID-targeted (killPidsSnapshot) instead of
+                // pkill -f: same targets, only resolved PIDs, each
+                // logged with caller + time.
+                killPidsSnapshot("cleanSlate", new String[][]{
+                    {"boot_watchdog.sh"},
+                    {"adb_watchdog.sh"},
+                    {"ims_watchdog.sh"},
+                    {"ui_activator"},
+                });
                 // 5.9.12: unmount any stale mounts under the stage dir
                 // FIRST (a leftover loop/bind mount from a hung guest
                 // session makes rm fail and used to yield PARTIAL).
@@ -5470,36 +5584,97 @@ public class MainActivity extends Activity {
             .show();
     }
 
+    // 6.19: PID-targeted kills. Name-based kills (pkill -f)
+    // can match the HOST's own daemons when a guest is not
+    // actually running, or a host process whose cmdline happens
+    // to contain the pattern. This helper lists /proc ONCE in
+    // a single root call, matches in Java, logs every kill with
+    // caller + time, and kills ONLY the explicit PIDs it
+    // resolved. A pattern set is ANDed: every pattern in the set
+    // must match the same process (a "comm:NAME" pattern matches
+    // the comm exactly; any other pattern is a cmdline
+    // substring). PID 1 is never killed. matched=none is logged,
+    // never silent. The snapshot is static: processes forked
+    // after it are not killed — that is the point.
+    private void killPidsSnapshot(String caller, String[][] patternSets) {
+        try {
+            List<String> proc = new ArrayList<>();
+            runRootCmdCaptured("for p in /proc/[0-9]*; do pid=${p#/proc/}; c=$(cat \"$p/comm\" 2>/dev/null); cmd=$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null | head -c 400); echo \"$pid|$c|$cmd\"; done 2>/dev/null", proc);
+            long now = System.currentTimeMillis() / 1000L;
+            java.util.Set<String> killed = new java.util.HashSet<>();
+            for (String[] set : patternSets) {
+                for (String line : proc) {
+                    int bar1 = line.indexOf('|');
+                    if (bar1 < 0) continue;
+                    int bar2 = line.indexOf('|', bar1 + 1);
+                    if (bar2 < 0) continue;
+                    String pidStr = line.substring(0, bar1);
+                    String comm = line.substring(bar1 + 1, bar2);
+                    String cmdline = line.substring(bar2 + 1);
+                    boolean all = true;
+                    for (String pat : set) {
+                        if (pat.startsWith("comm:")) {
+                            if (!comm.equals(pat.substring(5))) { all = false; break; }
+                        } else if (cmdline.indexOf(pat) < 0) { all = false; break; }
+                    }
+                    if (!all) continue;
+                    if (pidStr.equals("1") || killed.contains(pidStr)) continue;
+                    try { if (Integer.parseInt(pidStr) <= 0) continue; } catch (Exception ignored) { continue; }
+                    killed.add(pidStr);
+                    appendLog("KILL_PID caller=" + caller + " time=" + now + " pid=" + pidStr + " comm=" + comm);
+                    runRootCmdDrained("kill -9 " + pidStr + " 2>/dev/null; true");
+                }
+            }
+            if (killed.isEmpty()) appendLog("KILL_PID caller=" + caller + " time=" + now + " matched=none");
+        } catch (Exception e) {
+            appendLog("KILL_PID caller=" + caller + " error (" + e.getMessage() + ") — no kill attempted beyond the snapshot");
+        }
+    }
+
     private void deleteGsi() {
         // 5.9.11: own colorful bar (slot ops share one bar).
         runBarTask(pbSlot, tvSlotProgress, "Deleting guest files…", () -> {
             setLogStatus("Cleaning…");
             appendLog("\n[CLEANUP] Stopping running container processes & unmounting...");
             try {
-                // Only kill zygote64/surfaceflinger/vold/system_server by name if the
-                // guest container's rootfs is actually mounted. If it isn't (e.g.
-                // we're sitting on stock One UI with no switch in progress), those
-                // pidof lookups resolve to the HOST's own real daemons - killing them
-                // crashes/reboots the device instead of cleaning up a container.
+                // Only kill zygote64/surfaceflinger/vold/system_server
+                // if the guest container's rootfs is actually mounted.
+                // If it isn't (e.g. we're sitting on stock One UI with
+                // no switch in progress), those lookups resolve to the
+                // HOST's own real daemons - killing them crashes/reboots
+                // the device instead of cleaning up a container.
+                // 6.19: PID-targeted (killPidsSnapshot) instead of the
+                // old pkill/pidof lines: same targets, but only the
+                // PIDs resolved from one /proc snapshot, each logged
+                // with caller + time. The system_server pattern still
+                // matches both instances when the guard passes, exactly
+                // as the old pkill did — the mount guard is the
+                // protection, unchanged.
+                List<String> mountProbe = new ArrayList<>();
+                runRootCmdCaptured("mount | grep -q '" + currentRootfs() + " ' && echo MOUNTED 2>/dev/null; true", mountProbe);
+                if (mountProbe.contains("MOUNTED")) {
+                    killPidsSnapshot("deleteGsi", new String[][]{
+                        {"ctl.stop zygote"},
+                        {"ui_activator"},
+                        {"zygote_exec"},
+                        // No guest-brand process kills here: killing system_server
+                        // takes the whole guest userspace with it, and a
+                        // brand-specific pattern (previously org.lineageos) would
+                        // miss every other GSI anyway.
+                        {"system_server"},
+                        {"comm:zygote64"},
+                        {"comm:surfaceflinger"},
+                        {"comm:bootanimation"},
+                        // Matched by the container's distinctive vold launch flags, never
+                        // "pidof vold" bare - that would kill the HOST's real vold too if
+                        // both happened to be alive, crashing the device (confirmed live).
+                        {"blkid_context=u:r:blkid:s0"},
+                    });
+                    try { Thread.sleep(300); } catch (Exception ignored) {}
+                } else {
+                    appendLog("KILL_PID caller=deleteGsi matched=none (guest rootfs not mounted — host daemons left alone)");
+                }
                 String cleanupCmd =
-                    "if mount | grep -q '" + currentRootfs() + " '; then " +
-                    "  pkill -9 -f 'ctl.stop zygote' 2>/dev/null || true; " +
-                    "  pkill -9 -f 'ui_activator' 2>/dev/null || true; " +
-                    "  pkill -9 -f 'zygote_exec' 2>/dev/null || true; " +
-                    "  pkill -9 -f 'system_server' 2>/dev/null || true; " +
-                    // No guest-brand process kills here: killing system_server
-                    // above takes the whole guest userspace with it, and a
-                    // brand-specific pattern (previously org.lineageos) would
-                    // miss every other GSI anyway.
-                    "  pkill -9 -x zygote64 2>/dev/null || true; " +
-                    "  kill -9 $(pidof surfaceflinger) 2>/dev/null || true; " +
-                    "  kill -9 $(pidof bootanimation) 2>/dev/null || true; " +
-                    // Matched by the container's distinctive vold launch flags, never
-                    // "pidof vold" bare - that would kill the HOST's real vold too if
-                    // both happened to be alive, crashing the device (confirmed live).
-                    "  pkill -9 -f 'blkid_context=u:r:blkid:s0' 2>/dev/null || true; " +
-                    "  sleep 0.3; " +
-                    "fi; " +
                     containerUnmountCmd(currentSlotDir()) + "; " +
                     // If a loop device is still stuck busy (namespace teardown lagging),
                     // truncating frees the backing blocks immediately even though rm -f
@@ -5735,13 +5910,6 @@ public class MainActivity extends Activity {
     // Java only hands off — see startContinuousLogcat.
     private static final String LOGCAT_CONTINUOUS_NAME = "logcat_continuous.txt";
     private static final String LOGCAT_CAP2_NAME = "logcat_cap2.txt";
-    // Kill pattern for the capture process. The bracket trick
-    // ([.]) means the regex matches the logcat process's literal
-    // "logcat_continuous.txt" but NEVER the shell running the
-    // kill command itself (whose command line holds "[.]"), and
-    // no guest process carries this path — so the kill cannot
-    // match anything but the capture.
-    private static final String LOGCAT_CAPTURE_KILL_PATTERN = "/system/bin/logcat.*logcat_continuous[.]txt";
 
     // 6.18: boot-id + uptime, read straight from /proc
     // (world-readable, no root needed). Never fails the launch.
@@ -5799,17 +5967,64 @@ public class MainActivity extends Activity {
         }
     }
 
+    // 6.19: snapshot the host PIDs for the KILL_CENSUS names
+    // before launch. Diagnostic only — nothing is killed here.
+    // One root call lists /proc; matching is in the shell (comm
+    // exact or cmdline substring); the same lines are tee'd into
+    // the slot data dir (bundle section) and appended to the app
+    // log. Includes vold (diagnostic only, never a kill target:
+    // the snapshot names PIDs, it does not act on them).
+    private void snapshotHostPids(String slotDir) {
+        try {
+            List<String> out = new ArrayList<>();
+            String dataDir = slotDir + "/data";
+            String cmd = "mkdir -p \"" + dataDir + "\"; OUT=\"" + dataDir + "/gsi_host_pids_$(date +%s).log\"; "
+                    + "{ echo \"# host PID snapshot caller=preLaunch time=$(date +%s)\"; "
+                    + "for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r \"$p/comm\" ] || continue; "
+                    + "comm=$(cat \"$p/comm\" 2>/dev/null); cmdline=$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null | head -c 300); "
+                    + "case \"$comm\" in zygote64|system_server|surfaceflinger|bootanimation|wificond|media.codec|mediaswcodec|mediaextractor|vold|zygote_exec) echo \"pid=$pid comm=$comm cmd=$cmdline\";; "
+                    + "*) case \"$cmdline\" in *app_process64*|*zygote_exec*|*system_server*|*surfaceflinger*|*wificond*|*media.codec*|*mediaswcodec*|*mediaextractor*|*bootanimation*) echo \"pid=$pid comm=$comm cmd=$cmdline\";; esac;; esac; done; } | tee \"$OUT\" 2>/dev/null; true";
+            runRootCmdCaptured(cmd, out);
+            for (String l : out) appendLog("HOST_PIDS: " + l);
+        } catch (Exception e) {
+            appendLog("HOST_PIDS: snapshot error (" + e.getMessage() + ") — boot continues");
+        }
+    }
+
+    // 6.19: LOG-ONLY staging check. Records existence + mtimes
+    // of the three guest-visible data dirs BEFORE vold and
+    // system_server run. Changes nothing: no mkdir, no touch,
+    // no creation behavior altered. Hypothesis under test:
+    // pre-created dirs break vold's fscrypt setup. The paths
+    // are the slot data dir (host side), which the guest sees
+    // as /data.
+    private void logGuestDataStaging(String slotDir) {
+        try {
+            List<String> out = new ArrayList<>();
+            String dataDir = slotDir + "/data";
+            String cmd = "for d in \"" + dataDir + "/user/0\" \"" + dataDir + "/user_de/0\" \"" + dataDir + "/misc/vold\"; do "
+                    + "if [ -e \"$d\" ]; then ls -lad \"$d\" 2>/dev/null; else echo \"MISSING $d\"; fi; done; true";
+            runRootCmdCaptured(cmd, out);
+            for (String l : out) appendLog("STAGING_CHECK: " + l);
+        } catch (Exception e) {
+            appendLog("STAGING_CHECK: error (" + e.getMessage() + ") — boot continues");
+        }
+    }
+
     // Quiet variant: no app-log output (used before a fresh
-    // start, where a "stopped" line would be noise).
+    // start, where a "stopped" line would be noise). The
+    // KILL_PID diagnostic lines from the helper are the one
+    // exception: every kill is logged with caller + time.
     private void stopContinuousLogcatQuiet() {
         try {
-            // Both halves require the logcat binary path AND the
-            // output path: a shell running tail/grep over the
-            // capture file (e.g. the bundle export) carries the
-            // path but not the binary, so it can never match.
-            String cmd = "pkill -f \"" + LOGCAT_CAPTURE_KILL_PATTERN + "\" 2>/dev/null; "
-                    + "for p in /proc/[0-9]*; do if grep -qa '/system/bin/logcat' \"$p/cmdline\" 2>/dev/null && grep -qa 'logcat_continuous[.]txt' \"$p/cmdline\" 2>/dev/null; then kill \"$(basename \"$p\")\" 2>/dev/null; fi; done; true";
-            runRootCmdDrained(cmd);
+            // 6.19: PID-targeted only — the pkill half is gone.
+            // Both patterns must match the same process's cmdline:
+            // a shell running tail/grep over the capture file
+            // carries the path but not the binary, so it can never
+            // match.
+            killPidsSnapshot("stopCapture", new String[][]{
+                {"/system/bin/logcat", "logcat_continuous.txt"},
+            });
         } catch (Exception ignored) {}
     }
 
@@ -5925,7 +6140,7 @@ public class MainActivity extends Activity {
                         + "if [ \"$SLOTVER\" = \"$VER\" ]; then s=$(hashf \"$f\"); d=$(hashf \"" + slotDir + "/$base\"); [ -n \"$s\" ] && [ \"$s\" = \"$d\" ] && continue; fi;; esac; "
                         + "cp -f \"$f\" \"" + slotDir + "/$base\"; done; "
                         + "echo \"$VER\" > " + slotDir + "/.sync_version 2>/dev/null; "
-                        + "chmod 755 " + slotDir + "/*.sh " + slotDir + "/zygote_exec " + slotDir + "/fdtrace.so " + slotDir + "/7zz " + slotDir + "/simg2img";
+                        + "chmod 755 " + slotDir + "/*.sh " + slotDir + "/zygote_exec " + slotDir + "/fdtrace.so " + slotDir + "/7zz " + slotDir + "/simg2img " + slotDir + "/gvld_patch";
                 // Defense in depth: even if a stale patched file from an
                 // earlier Lineage install is sitting in STAGE_DIR, a
                 // disabled toggle must not leave it where master_prepare.sh
@@ -5933,11 +6148,17 @@ public class MainActivity extends Activity {
                 if (!patchFramework) {
                     syncCmd += " ; rm -f " + slotDir + "/services_patched.jar " + slotDir + "/framework_patched.jar";
                 }
+                // 6.20: same defense in depth for the isolated jar — a
+                // stale copy must never sit where master_prepare.sh could
+                // bind it when isolation is off (the script also checks).
+                if (!guestIsolation) {
+                    syncCmd += " ; rm -f " + slotDir + "/services_isolated.jar";
+                }
                 if (!patchPermissionController) {
                     syncCmd += " ; rm -f " + slotDir + "/PermissionController_patched.apk";
                 }
                 syncCmd += " ; echo \"# version $VER\" > " + slotDir + "/.engine_hashes 2>/dev/null; "
-                        + "for b in services_patched.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec fdtrace.so; do [ -f \"" + slotDir + "/$b\" ] && h=$(hashf \"" + slotDir + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + slotDir + "/.engine_hashes 2>/dev/null; done; true";
+                        + "for b in services_patched.jar services_isolated.jar framework_patched.jar PermissionController_patched.apk 7zz simg2img zygote_exec fdtrace.so gvld_patch; do [ -f \"" + slotDir + "/$b\" ] && h=$(hashf \"" + slotDir + "/$b\") && [ -n \"$h\" ] && echo \"$h $b\" >> " + slotDir + "/.engine_hashes 2>/dev/null; done; true";
                 Runtime.getRuntime().exec(new String[]{suBinary, "-c", syncCmd}).waitFor();
                 // 5.9.5-INT-START: persist detected framework version for scripts.
                 if (detectedFrameworkVersion != null && !detectedFrameworkVersion.isEmpty() && !detectedFrameworkVersion.equals("unknown")) {
@@ -5959,6 +6180,16 @@ public class MainActivity extends Activity {
                 // never-fail rule (see startContinuousLogcat).
                 // The launcher starts the capture itself.
                 startContinuousLogcat(slotDir);
+
+                // 6.19: host PID snapshot + guest-data staging
+                // check — same position, same never-fail rule.
+                // The snapshot names the host PIDs alive BEFORE
+                // launch (diagnostic only, NOT a kill list): any
+                // later name-based kill can be checked against it.
+                // The staging check is LOG-ONLY (see
+                // logGuestDataStaging). Neither may fail the boot.
+                snapshotHostPids(slotDir);
+                logGuestDataStaging(slotDir);
 
                 String stageScript = slotDir + "/switch_to_gsi.sh";
                 // 5.9.5-APP-START: boot env vars for the scripts workstream.
@@ -7039,14 +7270,21 @@ public class MainActivity extends Activity {
                         appendLog("Framework gate: guest is NOT LineageOS 23.2 (" + label + ") — 23.2 patch toggles disabled; guest will boot unpatched. 23.2 jars are never silently applied to a non-23.2 guest.");
                     }
                     setPatchToggles(false, false, false);
+                    // 6.20: isolation is 23.2-only too — force off + disable.
+                    guestIsolation = false;
+                    skipGuestDataDirs = false;
                     if (cbPatchFramework != null) cbPatchFramework.setEnabled(false);
                     if (cbPatchPermission != null) cbPatchPermission.setEnabled(false);
                     if (cbPatchApexList != null) cbPatchApexList.setEnabled(false);
+                    if (cbGuestIsolation != null) { cbGuestIsolation.setChecked(false); cbGuestIsolation.setEnabled(false); }
+                    if (cbSkipGuestDataDirs != null) { cbSkipGuestDataDirs.setChecked(false); cbSkipGuestDataDirs.setEnabled(false); }
                 } else if (known && patched) {
                     lastGatedFramework = detectedFrameworkVersion;
                     if (cbPatchFramework != null) cbPatchFramework.setEnabled(true);
                     if (cbPatchPermission != null) cbPatchPermission.setEnabled(true);
                     if (cbPatchApexList != null) cbPatchApexList.setEnabled(true);
+                    if (cbGuestIsolation != null) cbGuestIsolation.setEnabled(true);
+                    if (cbSkipGuestDataDirs != null) cbSkipGuestDataDirs.setEnabled(true);
                 }
                 writeGsiFlagsFile();
             });

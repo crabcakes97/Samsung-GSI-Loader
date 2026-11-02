@@ -1,0 +1,50 @@
+== classes.dex: 18 edits
+  T1: Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;.prepareStorageDirs(ILjava/util/Set;Ljava/lang/String;)Z: 'vold' lookup -> ServiceManager.getServiceOrThrow
+  T1: Lcom/android/server/StorageManagerService;.connectVold()V: 'vold' lookup -> ServiceManager.getService
+  T1: string data 'vold' -> 'gvld' at file offset 9798598
+  T2: IVold key calls dropped: createUserStorageKeys x1, destroyUserStorageKeys x1, setCeStorageProtection x0, unlockCeStorage x1, lockCeStorage x1
+  T3: Lcom/android/server/locksettings/LockSettingsService;.setLockCredentialInternal not in this dex, skipped
+  T3: Lcom/android/server/locksettings/LockSettingsService;.setLockCredentialWithTokenInternalLocked not in this dex, skipped
+  T3: gatekeeper sites dropped: enroll x0, clearSecureUserId x0, reportDeviceSetupComplete x0
+  T4: Lcom/android/server/locksettings/SyntheticPasswordManager;.getWeaverService not in this dex, skipped
+  T5: Lcom/android/server/recoverysystem/RecoverySystemService;.deleteSecrets not in this dex, skipped
+  T5: no ISecretkeeper.deleteAll / IVold destroy* / erase_secure_element outside deleteSecrets()
+  T7: storage calls dropped (12 total): Landroid/os/IVold;.abortChanges x1, Landroid/os/IVold;.destroyUserStorage x1, Landroid/os/IVold;.forgetPartition x1, Landroid/os/IVold;.format x1, Landroid/os/IVold;.moveStorage x1, Landroid/os/IVold;.onUserRemoved x1, Landroid/os/IVold;.partition x3, Landroid/os/IVold;.prepareUserStorage x1, Landroid/os/IVold;.shutdown x1, Landroid/os/IVold;.startCheckpoint x1
+  T7: Lcom/android/server/pm/UserDataPreparer;.destroyUserDataLI not in this dex, skipped
+  T7: UserDataPreparer.destroyUserDataLI returns at entry; wipe call nopped (x0)
+  T7b: isCeStorageUnlocked(I)Z returns at entry, 2-unit overwrite, no interior branch targets
+  T7c: Lcom/android/server/usage/StorageStatsService;.isQuotaSupported not in this dex, skipped
+  T2: setCeStorageProtection: 0 client call sites; intermediary Lcom/android/server/StorageManagerService$StorageManagerInternalImpl; verified already neutered in the prebuilt blob (return-void at entry, no IVold call)
+  header signature/checksum recomputed
+== classes2.dex: 44 edits
+  T1: Lcom/android/server/stats/pull/StatsPullAtomService;.getIVoldService()Landroid/os/IVold;: 'vold' lookup -> ServiceManager.getService
+  T1: string data 'vold' -> 'gvld' at file offset 4035324
+  T2: IVold key calls dropped: createUserStorageKeys x0, destroyUserStorageKeys x0, setCeStorageProtection x0, unlockCeStorage x0, lockCeStorage x0
+  T3: setLockCredentialInternal(Lcom/android/internal/widget/LockscreenCredential;Lcom/android/internal/widget/LockscreenCredential;IZ)Z returns at entry, 3-unit overwrite, no interior branch targets
+  T3: setLockCredentialWithTokenInternalLocked(Lcom/android/internal/widget/LockscreenCredential;J[BI)Z returns at entry, 3-unit overwrite, no interior branch targets
+  T3: gatekeeper sites dropped: enroll x4, clearSecureUserId x3, reportDeviceSetupComplete x1
+  T4: getWeaverService()Landroid/hardware/weaver/IWeaver; returns at entry, 3-unit overwrite, no interior branch targets; try-range bound(s) [1] inside (harmless: replacement cannot throw)
+  T5: deleteSecrets()V returns at entry, 2-unit overwrite, no interior branch targets
+  T5: no ISecretkeeper.deleteAll / IVold destroy* / erase_secure_element outside deleteSecrets()
+  T7: storage calls dropped (22 total): AndroidKeyStoreMaintenance.clearNamespace x3, AndroidKeyStoreMaintenance.deleteAllKeys x1, AndroidKeyStoreMaintenance.initUserSuperKeys x1, AndroidKeyStoreMaintenance.migrateKeyNamespace x1, AndroidKeyStoreMaintenance.onUserAdded x1, AndroidKeyStoreMaintenance.onUserLskfRemoved x1, AndroidKeyStoreMaintenance.onUserRemoved x1, Landroid/os/IInstalld;.cleanupInvalidPackageDirs x1, Landroid/os/IInstalld;.clearAppData x1, Landroid/os/IInstalld;.destroyAppData x1, Landroid/os/IInstalld;.destroyAppDataSnapshot x1, Landroid/os/IInstalld;.destroyCeSnapshotsNotSpecified x1, Landroid/os/IInstalld;.destroyUserData x1, Landroid/os/IInstalld;.freeCache x1, Landroid/os/IInstalld;.migrateAppData x1, Landroid/os/IInstalld;.moveCompleteApp x1, Landroid/os/IInstalld;.onPrivateVolumeRemoved x1, Landroid/os/IInstalld;.reconcileSdkData x1, Landroid/os/IInstalld;.restoreAppDataSnapshot x1, Landroid/os/IInstalld;.rmPackageDir x1
+  T7: destroyUserDataLI(Ljava/lang/String;II)V returns at entry, 3-unit overwrite, no interior branch targets
+  T7: UserDataPreparer.destroyUserDataLI returns at entry; wipe call nopped (x1)
+  T7b: Lcom/android/server/StorageManagerService;.isCeStorageUnlocked not in this dex, skipped
+  T7c: isQuotaSupported(Ljava/lang/String;Ljava/lang/String;)Z returns at entry, 2-unit overwrite, no interior branch targets
+  header signature/checksum recomputed
+== classes3.dex: 0 edits
+  T1: no 'vold' string in this dex
+  T2: IVold key calls dropped: createUserStorageKeys x0, destroyUserStorageKeys x0, setCeStorageProtection x0, unlockCeStorage x0, lockCeStorage x0
+  T3: Lcom/android/server/locksettings/LockSettingsService;.setLockCredentialInternal not in this dex, skipped
+  T3: Lcom/android/server/locksettings/LockSettingsService;.setLockCredentialWithTokenInternalLocked not in this dex, skipped
+  T3: gatekeeper sites dropped: enroll x0, clearSecureUserId x0, reportDeviceSetupComplete x0
+  T4: Lcom/android/server/locksettings/SyntheticPasswordManager;.getWeaverService not in this dex, skipped
+  T5: Lcom/android/server/recoverysystem/RecoverySystemService;.deleteSecrets not in this dex, skipped
+  T5: no ISecretkeeper.deleteAll / IVold destroy* / erase_secure_element outside deleteSecrets()
+  T7: storage calls dropped (0 total): 
+  T7: Lcom/android/server/pm/UserDataPreparer;.destroyUserDataLI not in this dex, skipped
+  T7: UserDataPreparer.destroyUserDataLI returns at entry; wipe call nopped (x0)
+  T7b: Lcom/android/server/StorageManagerService;.isCeStorageUnlocked not in this dex, skipped
+  T7c: Lcom/android/server/usage/StorageStatsService;.isQuotaSupported not in this dex, skipped
+  header signature/checksum recomputed
+global counts: ce_neuter_verified=1, ce_unlocked_guard=1, gk_clear=3, gk_enroll=4, gk_guard_setlock=1, gk_guard_token=1, gk_report=1, gvld_patched=2, gvld_sites=3, preparer_guard=1, quota_guard=1, t7_AndroidKeyStoreMaintenance.clearNamespace=3, t7_Landroid/os/IInstalld;.destroyUserData=1, t7_Landroid/os/IVold;.destroyUserStorage=1, t7_Landroid/os/IVold;.prepareUserStorage=1, voldkey_createUserStorageKeys=1, voldkey_destroyUserStorageKeys=1, voldkey_lockCeStorage=1, voldkey_setCeStorageProtection=0, voldkey_unlockCeStorage=1, weaver_guard=1, wipe_calls=1, wipe_guard=1

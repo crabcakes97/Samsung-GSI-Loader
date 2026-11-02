@@ -74,10 +74,16 @@ gsi_resolve_rootfs_dir() {
 PATCH_FRAMEWORK=0
 PATCH_PERMISSION_CONTROLLER=0
 USE_LINEAGE_APEX_LIST=0
+# 6.20: guest service isolation + skip-data-dirs. Defaults 0 (off); the
+# flags file may set them. GUEST_OWN_VOLD mirrors GUEST_ISOLATION (the
+# app writes both); the script requires PATCH_FRAMEWORK=1 alongside.
+GUEST_ISOLATION=0
+GUEST_OWN_VOLD=0
+SKIP_GUEST_DATA_DIRS=0
 if [ -f "$STAGE/gsi_flags.conf" ]; then
     . "$STAGE/gsi_flags.conf"
 fi
-echo "Patch flags: PATCH_FRAMEWORK=$PATCH_FRAMEWORK PATCH_PERMISSION_CONTROLLER=$PATCH_PERMISSION_CONTROLLER USE_LINEAGE_APEX_LIST=$USE_LINEAGE_APEX_LIST"
+echo "Patch flags: PATCH_FRAMEWORK=$PATCH_FRAMEWORK PATCH_PERMISSION_CONTROLLER=$PATCH_PERMISSION_CONTROLLER USE_LINEAGE_APEX_LIST=$USE_LINEAGE_APEX_LIST GUEST_ISOLATION=$GUEST_ISOLATION GUEST_OWN_VOLD=$GUEST_OWN_VOLD SKIP_GUEST_DATA_DIRS=$SKIP_GUEST_DATA_DIRS"
 
 echo "=== 1. Watchdog feeder (deferred — NOT started here) ==="
 # 5.9.16: the host watchdog feeder is NO LONGER started here. Starting it
@@ -382,7 +388,20 @@ fi
 # PermissionController bind below stays warning-only: it is a second
 # pass whose absence degrades permission dialogs, not boot itself.)
 if [ "$PATCH_FRAMEWORK" = "1" ]; then
-    if [ -f "$STAGE/services_patched.jar" ]; then
+    # 6.20: guest service isolation replaces services_patched.jar with
+    # services_isolated.jar (own vold name + guards, DEX-patched by
+    # tools/dex_patch.py; see PATCHES.md). Same target, same fatal bind.
+    # No silent fallback: isolation on + jar missing = abort.
+    if [ "$GUEST_ISOLATION" = "1" ]; then
+        if [ -f "$STAGE/services_isolated.jar" ]; then
+            $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+            $BB mount --bind "$STAGE/services_isolated.jar" "$ROOTFS/system/framework/services.jar" || { echo "!!! PATCH_BIND_FAILED: services_isolated.jar -> $ROOTFS/system/framework/services.jar (aborting — a half-patched framework crashes the guest)"; exit 1; }
+            echo "Bound services_isolated.jar -> $ROOTFS/system/framework/services.jar (GUEST_ISOLATION=1)"
+        else
+            echo "!!! ISOLATION_JAR_MISSING: GUEST_ISOLATION=1 but $STAGE/services_isolated.jar is absent (aborting — never silently fall back to the non-isolated jar)"
+            exit 1
+        fi
+    elif [ -f "$STAGE/services_patched.jar" ]; then
         $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
         $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar" || { echo "!!! PATCH_BIND_FAILED: services_patched.jar -> $ROOTFS/system/framework/services.jar (aborting — a half-patched framework crashes the guest)"; exit 1; }
         echo "Bound services_patched.jar -> $ROOTFS/system/framework/services.jar"
@@ -409,6 +428,66 @@ if [ "$PATCH_FRAMEWORK" = "1" ]; then
     fi
 else
     echo "Framework patches DISABLED by gsi_flags.conf (generic GSI mode): using the GSI's own framework untouched"
+fi
+# 6.20: guest own-vold-name (GUEST_OWN_VOLD, mirrors GUEST_ISOLATION).
+# The image is mounted read-only, so patch a COPY of the guest vold
+# binary and bind-mount it over the original; the image is never
+# modified. gvld_patch (src/native/gvld_patch.c) is fail-closed: with
+# no SHA-pinned offsets it patches only a uniquely-identified UTF-16
+# "vold" service-name string, and anything else aborts staging with a
+# learn log — never boot half-isolated (framework asking for "gvld"
+# that nothing owns). The AIDL registration is NOT patched (no pins;
+# see PATCHES.md). Candidates in order: the vold binary, then libvold
+# (VoldNativeService may live in either file depending on the build).
+if [ "$GUEST_OWN_VOLD" = "1" ]; then
+    if [ "$PATCH_FRAMEWORK" != "1" ]; then
+        echo "!!! GUEST_OWN_VOLD requires PATCH_FRAMEWORK=1 (the gvld framework half); aborting"
+        exit 1
+    fi
+    if [ ! -x "$STAGE/gvld_patch" ]; then
+        echo "!!! GVLD_PATCH_MISSING: GUEST_OWN_VOLD=1 but $STAGE/gvld_patch is absent; aborting"
+        exit 1
+    fi
+    _GVLD_PATCHED=""
+    for _GVLD_CAND in "$ROOTFS/system/bin/vold" "$ROOTFS/system/lib64/libvold.so"; do
+        if [ ! -f "$_GVLD_CAND" ]; then
+            echo "gvld: candidate absent, skipping: $_GVLD_CAND"
+            continue
+        fi
+        _GVLD_OUT="$STAGE/vold_gvld_$(basename "$_GVLD_CAND")"
+        echo "gvld: trying $_GVLD_CAND"
+        if "$STAGE/gvld_patch" "$_GVLD_CAND" "$_GVLD_OUT" 2>&1; then
+            chmod 755 "$_GVLD_OUT" 2>/dev/null || true
+            $BB umount -l "$_GVLD_CAND" 2>/dev/null || true
+            $BB mount --bind "$_GVLD_OUT" "$_GVLD_CAND" || { echo "!!! GVLD_BIND_FAILED: $_GVLD_OUT -> $_GVLD_CAND (aborting)"; exit 1; }
+            echo "gvld: bound patched $_GVLD_OUT -> $_GVLD_CAND (guest vold registers gvld)"
+            _GVLD_PATCHED="$_GVLD_CAND"
+            break
+        else
+            _GVLD_RC=$?
+            echo "gvld: patcher declined $_GVLD_CAND (exit $_GVLD_RC; see lines above — learn mode, no output written)"
+        fi
+    done
+    if [ -z "$_GVLD_PATCHED" ]; then
+        echo "!!! GVLD_UNPINNED: no candidate vold binary could be patched (learn mode above; no SHA pins exist for this GSI's vold). Aborting rather than booting half-isolated. Send the staging log: it carries the learn offsets for a future pin table."
+        exit 1
+    fi
+    # Best-effort only: service.incremental.so carries the same string in
+    # OneOS's account; if present and patchable, bind it too, but never
+    # abort on it (auxiliary; the load-bearing patch is the vold binary).
+    for _INC_CAND in "$ROOTFS/system/lib64/service.incremental.so" "$ROOTFS/system/lib/service.incremental.so"; do
+        if [ -f "$_INC_CAND" ]; then
+            _INC_OUT="$STAGE/incremental_gvld.so"
+            if "$STAGE/gvld_patch" "$_INC_CAND" "$_INC_OUT" 2>&1; then
+                chmod 755 "$_INC_OUT" 2>/dev/null || true
+                $BB umount -l "$_INC_CAND" 2>/dev/null || true
+                $BB mount --bind "$_INC_OUT" "$_INC_CAND" 2>/dev/null && echo "gvld: bound patched incremental lib (best-effort)" || echo "gvld: incremental bind failed (best-effort, continuing)"
+            else
+                echo "gvld: incremental lib not patched (best-effort, continuing)"
+            fi
+            break
+        fi
+    done
 fi
 # 6.0 (P6): Android 17 services-patch branch — SHIPPED DISABLED.
 # The candidate jar (services_android17_patched.jar) is binary-only
@@ -512,30 +591,43 @@ if [ -f "$STAGE/zygote_exec" ]; then
     cp -f "$STAGE/zygote_exec" "$STAGE/data/zygote_exec"
     chmod 755 "$STAGE/data/zygote_exec"
 fi
-mkdir -p "$STAGE/data/user/0" "$STAGE/data/user_de/0"
+# 6.20: SKIP_GUEST_DATA_DIRS=1 skips pre-creating the guest-visible
+# /data/user/0 + /data/user_de/0 trees so vold's own fscrypt setup
+# creates them (diagnostic hypothesis for the CE-key crash: pre-created
+# dirs may make vold skip its own setup). The per-package loop is
+# inside the same gate: its mkdir -p would recreate the parents.
+# Default 0 = current behavior. No /data/misc/vold pre-creation exists
+# in this script (verified by grep), so there is nothing to skip there.
+# The system/misc/anr dirs below are NOT gated (vold does not own them).
+if [ "$SKIP_GUEST_DATA_DIRS" = "1" ]; then
+    echo "GUEST_DATA_DIRS: SKIP mode — /data/user/0 + /data/user_de/0 NOT pre-created (vold creates them)"
+else
+    echo "GUEST_DATA_DIRS: pre-create mode (default) — creating /data/user/0 + /data/user_de/0"
+    mkdir -p "$STAGE/data/user/0" "$STAGE/data/user_de/0"
+
+    for pkg in com.android.providers.settings \
+               com.android.providers.telephony \
+               com.android.phone \
+               com.android.systemui \
+               com.android.settings \
+               com.android.launcher3 \
+               com.android.inputmethod.latin \
+               com.android.providers.media \
+               com.android.providers.downloads \
+               com.android.providers.contacts \
+               com.android.providers.calendar \
+               com.cronch.gsiloader; do
+        mkdir -p "$STAGE/data/user_de/0/$pkg/databases" \
+                 "$STAGE/data/user_de/0/$pkg/shared_prefs" \
+                 "$STAGE/data/user_de/0/$pkg/files/datastore/education" \
+                 "$STAGE/data/user/0/$pkg/databases" \
+                 "$STAGE/data/user/0/$pkg/shared_prefs" \
+                 "$STAGE/data/user/0/$pkg/files"
+    done
+fi
 mkdir -p "$STAGE/data/system/users/0" "$STAGE/data/system_de/0/spblob" "$STAGE/data/system_ce/0"
 mkdir -p "$STAGE/data/misc/user/0" "$STAGE/data/misc_de/0" "$STAGE/data/misc_ce/0"
 mkdir -p "$STAGE/data/anr" "$STAGE/data/app" "$STAGE/data/rollback" "$STAGE/data/incremental"
-
-for pkg in com.android.providers.settings \
-           com.android.providers.telephony \
-           com.android.phone \
-           com.android.systemui \
-           com.android.settings \
-           com.android.launcher3 \
-           com.android.inputmethod.latin \
-           com.android.providers.media \
-           com.android.providers.downloads \
-           com.android.providers.contacts \
-           com.android.providers.calendar \
-           com.cronch.gsiloader; do
-    mkdir -p "$STAGE/data/user_de/0/$pkg/databases" \
-             "$STAGE/data/user_de/0/$pkg/shared_prefs" \
-             "$STAGE/data/user_de/0/$pkg/files/datastore/education" \
-             "$STAGE/data/user/0/$pkg/databases" \
-             "$STAGE/data/user/0/$pkg/shared_prefs" \
-             "$STAGE/data/user/0/$pkg/files"
-done
 
 mkdir -p "$STAGE/data/resource-cache"
 chmod 771 "$STAGE/data/resource-cache"

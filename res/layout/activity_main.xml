@@ -1137,6 +1137,32 @@
                 android:text="LineageOS system-component list (otherwise the Samsung list is used)"
                 android:textColor="?attr/themeTextPrimary"
                 android:textSize="14sp" />
+
+            <CheckBox
+                android:id="@+id/cb_guest_isolation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Guest service isolation (own vold name + lock/secret guards — experimental, 23.2 only)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <CheckBox
+                android:id="@+id/cb_skip_guest_data_dirs"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Skip pre-creating guest data dirs (diagnostic: let vold create them)"
+                android:textColor="?attr/themeTextPrimary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Isolation options are never turned on automatically — check them only for an isolation test."
+                android:textColor="?attr/themeTextSecondary"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <!-- Slots -->

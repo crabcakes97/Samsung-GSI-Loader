@@ -49,6 +49,13 @@ cp "$PROJECT_DIR/make_dist.sh" "$SRC_DIR/"
 cp -r "$PROJECT_DIR/src" "$SRC_DIR/"
 cp -r "$PROJECT_DIR/res" "$SRC_DIR/"
 cp -r "$PROJECT_DIR/assets" "$SRC_DIR/"
+# 6.20: the DEX patcher + its report are the rebuild recipe for
+# services_isolated.jar (see PATCHES.md); they must ship with the source.
+if [ -d "$PROJECT_DIR/tools" ]; then
+    cp -r "$PROJECT_DIR/tools" "$SRC_DIR/"
+    # Bytecode caches are build droppings, not source.
+    rm -rf "$SRC_DIR/tools/__pycache__"
+fi
 for doc in ARCHITECTURE.md PATCHES.md TROUBLESHOOTING.md README.md; do
     if [ -f "$PROJECT_DIR/$doc" ]; then
         cp "$PROJECT_DIR/$doc" "$SRC_DIR/"

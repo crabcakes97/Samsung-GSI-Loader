@@ -142,6 +142,16 @@ case "$_VOLD_CHECK" in
     *) echo "[Pivoted Root] VOLD_MISSING: vold NOT owned in servicemanager (check said: $_VOLD_CHECK); process $_VOLD_ALIVE — guest vold may have died or never registered (diagnostic only, dive cause #5)" ;;
 esac
 
+# 6.20 (diagnostic only, positive-only): with guest service isolation
+# the guest vold registers "gvld", so `service check vold` above is
+# expected to miss. Log only when gvld IS owned, so normal boots gain
+# no noise: GVLD_OK present = isolation daemon registered; absent +
+# VOLD_OK = normal boot; absent + VOLD_MISSING = the 6.18 situation.
+_GVLD_CHECK="$(service check gvld 2>/dev/null || echo "service check failed")"
+case "$_GVLD_CHECK" in
+    *": found"*) echo "[Pivoted Root] GVLD_OK: gvld owned in servicemanager ($_GVLD_CHECK)" ;;
+esac
+
 # Wifi. switch_to_gsi.sh stops the host wificond; the guest's own registers
 # IWificond before WifiService initialises, and drives Samsung's wifi HAL (which
 # is still registered by host init) with matching AIDL.

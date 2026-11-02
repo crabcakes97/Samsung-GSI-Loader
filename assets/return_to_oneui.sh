@@ -58,8 +58,11 @@ kill_guest_procs() {
         fi
     done
     if [ "$_guest_mounted" = "1" ]; then
-        pkill -9 -f "system_server" 2>/dev/null || true
-        pkill -9 -x zygote64 2>/dev/null || true
+        # 6.19: PID-targeted fallbacks (were pkill -f/-x): pidof
+        # resolves the PIDs first, each kill is logged with
+        # caller + time, and only those PIDs are killed.
+        _fb_pids="$(pidof system_server 2>/dev/null)"; if [ -n "$_fb_pids" ]; then for _fb_pid in $_fb_pids; do echo "KILL_PID caller=return_to_oneui_fallback time=$(date +%s) pid=$_fb_pid comm=system_server"; kill -9 "$_fb_pid" 2>/dev/null || true; done; else echo "KILL_PID caller=return_to_oneui_fallback time=$(date +%s) matched=none comm=system_server"; fi
+        _fb_pids="$(pidof zygote64 2>/dev/null)"; if [ -n "$_fb_pids" ]; then for _fb_pid in $_fb_pids; do echo "KILL_PID caller=return_to_oneui_fallback time=$(date +%s) pid=$_fb_pid comm=zygote64"; kill -9 "$_fb_pid" 2>/dev/null || true; done; else echo "KILL_PID caller=return_to_oneui_fallback time=$(date +%s) matched=none comm=zygote64"; fi
         kill -9 $(pidof surfaceflinger) 2>/dev/null || true
         kill -9 $(pidof vold) 2>/dev/null || true
         kill -9 $(pidof wificond) 2>/dev/null || true
