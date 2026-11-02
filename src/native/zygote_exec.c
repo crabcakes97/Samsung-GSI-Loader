@@ -186,6 +186,23 @@
  *    same 137 it sees today). The outer script remains the
  *    supervisor; this log is the authoritative per-attempt
  *    record. Binds, sweep, stdio, FD handling: UNTOUCHED.
+ *  - 6.18: SUPERVISOR-OWNED DIAGNOSTICS (Claude's adjusted plan).
+ *    The 6.17 run reframed the wall: attempts 1-2 die by SIGKILL,
+ *    attempt 3 probably never died (no exit line; supervisor logs
+ *    only after waitpid returns) and the continuous-logcat capture
+ *    itself died ~2s into attempt 3. The supervisor therefore
+ *    owns the capture now (fork before the first zygote fork,
+ *    death + restart logged, throttled restarts, previous file
+ *    preserved as .restart<N>), keeps a heartbeat file with
+ *    system_server aliveness, enables a best-effort tracefs
+ *    signal tracer (signal_deliver/signal_generate), takes a
+ *    death snapshot (logcat -d + dmesg + trace tail, no shell,
+ *    25 s timeout) after every waitpid, and snapshots
+ *    system_server's thread stacks (wchan + stack, per-thread
+ *    fail-soft) at 60 s for the stuck-boot case. The wait is a
+ *    poll loop so diagnostics stay serviced while the zygote
+ *    runs and during backoffs. All 6.17 levers intact; every
+ *    new path is fail-soft and can never break the boot.
  *  - Four exec fallbacks in order: 64-bit with forced JIT zygote,
  *    64-bit without it, 32-bit with it, 32-bit without it. If all
  *    fail, the errno is logged and the process exits 1 so the
@@ -214,6 +231,7 @@
 #include <sys/prctl.h>
 #include <signal.h>
 #include <time.h>
+#include <stdarg.h>
 
 extern char **environ;
 
@@ -504,6 +522,25 @@ static void sanitize_classpath(const char *env_var, const char *default_val) {
 #endif
 #ifndef GSI_ZYGOTE_LOG_PATH
 #define GSI_ZYGOTE_LOG_PATH "/data/zygote_exec.log"
+#endif
+
+/* 6.18: supervisor-owned diagnostics. GSI_DIAG_DIR is the slot
+ * data dir as this launcher sees it (guest /data IS the slot
+ * data dir — see the 6.15 note above). All 6.18 diagnostic
+ * files live here so the Java bundle collects them with the
+ * same slot-data-first rule as zygote_exec.log. Overridable at
+ * compile time for the host harness only. */
+#ifndef GSI_DIAG_DIR
+#define GSI_DIAG_DIR "/data"
+#endif
+#ifndef GSI_SUP_LOG_PATH
+#define GSI_SUP_LOG_PATH "/data/zygote_exec.log"
+#endif
+#ifndef GSI_SNAP_LOGCAT_BIN
+#define GSI_SNAP_LOGCAT_BIN "/system/bin/logcat"
+#endif
+#ifndef GSI_SNAP_DMESG_BIN
+#define GSI_SNAP_DMESG_BIN "/system/bin/dmesg"
 #endif
 
 /* Cap on the list size the sweep will rewrite. The host list is
@@ -1594,6 +1631,604 @@ static int setup_socket(const char *path, int target_fd) {
     return target_fd;
 }
 
+/* 6.18: supervisor-owned diagnostics. The supervisor (see the
+ * loop in main) now owns the continuous logcat capture, a
+ * heartbeat with system_server aliveness, death snapshots, and
+ * a best-effort tracefs signal tracer. Everything here is
+ * fail-soft: any failure logs one line and the boot continues
+ * exactly as 6.17. Children are tracked by pid explicitly;
+ * nothing in 6.18 ever calls waitpid(-1), which would steal a
+ * capture/snapshot child's status. */
+static char gsi18_cap_path[1024];
+static char gsi18_hb_path[1024];
+static char gsi18_trace_root[1024];
+static int gsi18_trace_ok = 0;
+static pid_t gsi18_cap_pid = -1;
+static int gsi18_cap_restarts = 0;
+static int gsi18_cap_given_up = 0;
+static time_t gsi18_cap_last_try = 0;
+static time_t gsi18_t_first = 0;
+static time_t gsi18_last_beat = 0;
+static int gsi18_stuck_done = 0;
+
+static void gsi18_sup_log(const char *fmt, ...) {
+    FILE *lg = fopen(GSI_SUP_LOG_PATH, "a");
+    if (!lg) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(lg, fmt, ap);
+    va_end(ap);
+    fclose(lg);
+}
+
+static void gsi18_msleep(unsigned ms) {
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000);
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {
+    }
+}
+
+static unsigned gsi18_poll_ms(void) {
+#ifdef GSI_ZYGOTE_TEST_TARGET
+    const char *e = getenv("GSI_TEST_POLL_MS");
+    if (e) {
+        int v = atoi(e);
+        if (v >= 10 && v <= 1000) return (unsigned)v;
+    }
+#endif
+    return 250;
+}
+
+static unsigned gsi18_heartbeat_secs(void) {
+#ifdef GSI_ZYGOTE_TEST_TARGET
+    const char *e = getenv("GSI_TEST_HEARTBEAT_SECS");
+    if (e) {
+        int v = atoi(e);
+        if (v >= 1 && v <= 60) return (unsigned)v;
+    }
+#endif
+    return 5;
+}
+
+static long gsi18_stuck_delay_secs(void) {
+#ifdef GSI_ZYGOTE_TEST_TARGET
+    const char *e = getenv("GSI_TEST_STUCK_DELAY");
+    if (e) {
+        int v = atoi(e);
+        if (v >= 1 && v <= 600) return (long)v;
+    }
+#endif
+    return 60;
+}
+
+static int gsi18_write_small_file(const char *path, const char *content) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    size_t n = strlen(content);
+    ssize_t w = write(fd, content, n);
+    close(fd);
+    return (w == (ssize_t)n) ? 0 : -1;
+}
+
+/* Enable signal trace events best-effort. Returns 1 when the
+ * signal_deliver event is enabled (the killer-naming channel:
+ * it records sender pid/comm + signal). Logs nothing itself;
+ * the caller logs the outcome. */
+static int gsi18_enable_tracefs(void) {
+    const char *roots[3];
+    int nroots = 0;
+    int i;
+#ifdef GSI_ZYGOTE_TEST_TARGET
+    {
+        const char *tr = getenv("GSI_TEST_TRACEFS_ROOT");
+        if (tr && *tr) roots[nroots++] = tr;
+    }
+#endif
+    roots[nroots++] = "/sys/kernel/debug/tracing";
+    roots[nroots++] = "/sys/kernel/tracing";
+    for (i = 0; i < nroots; i++) {
+        char p[1120];
+        int ok = 0;
+        snprintf(p, sizeof(p), "%s/events/signal/signal_deliver/enable", roots[i]);
+        if (access(p, W_OK) != 0) continue;
+        if (gsi18_write_small_file(p, "1") == 0) ok = 1;
+        snprintf(p, sizeof(p), "%s/events/signal/signal_generate/enable", roots[i]);
+        (void)gsi18_write_small_file(p, "1");
+        snprintf(p, sizeof(p), "%s/tracing_on", roots[i]);
+        (void)gsi18_write_small_file(p, "1");
+        if (ok) {
+            snprintf(gsi18_trace_root, sizeof(gsi18_trace_root), "%s", roots[i]);
+            gsi18_trace_ok = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Copy the last keep_lines lines of <root>/trace into out.
+ * Bounded: only the tail is kept, the whole buffer is never
+ * copied. Missing/unreadable trace is one line, never fatal. */
+static void gsi18_dump_trace_tail(FILE *out) {
+    char p[1120];
+    FILE *f;
+    char **ring;
+    char buf[1024];
+    int keep = 100, idx = 0, total = 0, i;
+    if (!gsi18_trace_ok) {
+        fprintf(out, "(tracer not enabled)\n");
+        return;
+    }
+    snprintf(p, sizeof(p), "%s/trace", gsi18_trace_root);
+    f = fopen(p, "r");
+    if (!f) {
+        fprintf(out, "(trace unreadable: %s)\n", strerror(errno));
+        return;
+    }
+    ring = (char **)calloc((size_t)keep, sizeof(char *));
+    if (!ring) {
+        fclose(f);
+        fprintf(out, "(out of memory)\n");
+        return;
+    }
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        char *copy = (char *)malloc(len + 1);
+        if (!copy) break;
+        memcpy(copy, buf, len + 1);
+        free(ring[idx % keep]);
+        ring[idx % keep] = copy;
+        idx++;
+        total++;
+    }
+    fclose(f);
+    {
+        int start = total > keep ? total - keep : 0;
+        for (i = start; i < total; i++) {
+            if (ring[i % keep]) fputs(ring[i % keep], out);
+        }
+    }
+    for (i = 0; i < keep; i++) free(ring[i]);
+    free(ring);
+}
+
+/* Find system_server by scanning /proc: cmdline first token,
+ * /proc/<pid>/stat comm as fallback. Skips this process.
+ * Returns the pid, or -1. Never fails the boot. */
+static pid_t gsi18_find_system_server(void) {
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+    pid_t self = getpid();
+    if (!d) return -1;
+    while ((de = readdir(d)) != NULL) {
+        pid_t pid;
+        char path[128];
+        FILE *f;
+        char buf[512];
+        size_t n;
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+        pid = (pid_t)atoi(de->d_name);
+        if (pid <= 0 || pid == self) continue;
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+        f = fopen(path, "r");
+        if (f) {
+            n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            if (n > 0) {
+                buf[n] = '\0';
+                if (strcmp(buf, "system_server") == 0) {
+                    closedir(d);
+                    return pid;
+                }
+            }
+        }
+        snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+        f = fopen(path, "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                if (strstr(buf, "(system_server)") != NULL) {
+                    fclose(f);
+                    closedir(d);
+                    return pid;
+                }
+            }
+            fclose(f);
+        }
+    }
+    closedir(d);
+    return -1;
+}
+
+/* Stuck-boot snapshot: per-thread wchan + kernel stack for
+ * system_server. Each thread is independent: a denial on one
+ * is logged for that thread and the rest still snapshot. */
+static void gsi18_snapshot_stacks(pid_t ss_pid, const char *out_path) {
+    FILE *out = fopen(out_path, "w");
+    char taskdir[128];
+    DIR *d;
+    struct dirent *de;
+    int nthreads = 0;
+    if (!out) return;
+    fprintf(out, "GSI_STUCK_SNAPSHOT system_server=%d at=%lld\n",
+            (int)ss_pid, (long long)time(NULL));
+    snprintf(taskdir, sizeof(taskdir), "/proc/%d/task", (int)ss_pid);
+    d = opendir(taskdir);
+    if (!d) {
+        fprintf(out, "task dir unreadable: %s\n", strerror(errno));
+        fclose(out);
+        return;
+    }
+    while ((de = readdir(d)) != NULL && nthreads < 128) {
+        char p[192];
+        FILE *f;
+        char b[512];
+        int nl;
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+        nthreads++;
+        fprintf(out, "--- thread %s ---\n", de->d_name);
+        snprintf(p, sizeof(p), "/proc/%d/task/%s/wchan", (int)ss_pid, de->d_name);
+        f = fopen(p, "r");
+        if (f) {
+            if (fgets(b, sizeof(b), f)) {
+                size_t L = strlen(b);
+                while (L > 0 && (b[L - 1] == '\n' || b[L - 1] == '\r')) b[--L] = '\0';
+                fprintf(out, "wchan: %s\n", b[0] ? b : "(empty)");
+            } else {
+                fprintf(out, "wchan: (empty)\n");
+            }
+            fclose(f);
+        } else {
+            fprintf(out, "wchan: (denied: %s)\n", strerror(errno));
+        }
+        snprintf(p, sizeof(p), "/proc/%d/task/%s/stack", (int)ss_pid, de->d_name);
+        f = fopen(p, "r");
+        if (f) {
+            nl = 0;
+            while (nl < 24 && fgets(b, sizeof(b), f)) {
+                fputs(b, out);
+                nl++;
+            }
+            if (nl == 0) fprintf(out, "(empty stack)\n");
+            fclose(f);
+        } else {
+            fprintf(out, "stack: (denied: %s)\n", strerror(errno));
+        }
+    }
+    closedir(d);
+    fprintf(out, "threads: %d\n", nthreads);
+    fclose(out);
+}
+
+/* Wait for pid up to timeout_ms; on expiry SIGKILL it and
+ * reap it. Returns 1 reaped normally, 0 killed on timeout,
+ * -1 on wait error. */
+static int gsi18_wait_timeout(pid_t pid, int *status, unsigned timeout_ms) {
+    unsigned waited = 0;
+    for (;;) {
+        pid_t w = waitpid(pid, status, WNOHANG);
+        if (w == pid) return 1;
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (waited >= timeout_ms) {
+            (void)kill(pid, SIGKILL);
+            {
+                pid_t w2;
+                do {
+                    w2 = waitpid(pid, status, 0);
+                } while (w2 < 0 && errno == EINTR);
+            }
+            return 0;
+        }
+        gsi18_msleep(100);
+        waited += 100;
+    }
+}
+
+/* Copy the last keep lines of path into out. */
+static void gsi18_copy_tail(FILE *out, const char *path, int keep) {
+    FILE *f = fopen(path, "r");
+    char **ring;
+    char buf[1024];
+    int idx = 0, total = 0, i;
+    if (!f) return;
+    ring = (char **)calloc((size_t)keep, sizeof(char *));
+    if (!ring) {
+        fclose(f);
+        return;
+    }
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        char *copy = (char *)malloc(len + 1);
+        if (!copy) break;
+        memcpy(copy, buf, len + 1);
+        free(ring[idx % keep]);
+        ring[idx % keep] = copy;
+        idx++;
+        total++;
+    }
+    fclose(f);
+    {
+        int start = total > keep ? total - keep : 0;
+        for (i = start; i < total; i++) {
+            if (ring[i % keep]) fputs(ring[i % keep], out);
+        }
+    }
+    for (i = 0; i < keep; i++) free(ring[i]);
+    free(ring);
+}
+
+/* Run one dump tool (logcat/dmesg) into a temp file, then copy
+ * its tail into the snapshot. No shell, no pipes: the tool
+ * cannot block on a full pipe, and a timeout kills it cleanly. */
+static void gsi18_run_tool_to_file(FILE *out, const char *bin,
+                                   char *const argv[], const char *tmp_path,
+                                   unsigned timeout_ms, int keep_lines) {
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    pid_t c;
+    int status = 0;
+    int r;
+    if (fd < 0) {
+        fprintf(out, "(tmp open failed for %s: %s)\n", bin, strerror(errno));
+        return;
+    }
+    c = fork();
+    if (c == 0) {
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) {
+            (void)dup2(dn, 0);
+            if (dn > 2) close(dn);
+        }
+        (void)dup2(fd, 1);
+        (void)dup2(fd, 2);
+        if (fd > 2) close(fd);
+        {
+            int fdi;
+            for (fdi = 3; fdi < 64; fdi++) close(fdi);
+        }
+        execv(bin, argv);
+        _exit(127);
+    }
+    close(fd);
+    if (c < 0) {
+        fprintf(out, "(fork failed for %s: %s)\n", bin, strerror(errno));
+        unlink(tmp_path);
+        return;
+    }
+    r = gsi18_wait_timeout(c, &status, timeout_ms);
+    if (r == 0) {
+        fprintf(out, "(tool timed out, killed: %s)\n", bin);
+    } else if (r < 0) {
+        fprintf(out, "(tool wait failed: %s)\n", bin);
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        fprintf(out, "(tool exec failed: %s)\n", bin);
+    }
+    gsi18_copy_tail(out, tmp_path, keep_lines);
+    unlink(tmp_path);
+}
+
+/* Snapshot child: dumps logcat -d, dmesg, and the tracefs tail
+ * into snap_path, then exits. Runs in its own fork so a stuck
+ * tool can never stall the supervisor. */
+static void gsi18_snapshot_child(const char *snap_path) {
+    FILE *out;
+    char tmp[1120];
+    int dn = open("/dev/null", O_RDWR);
+    if (dn >= 0) {
+        (void)dup2(dn, 0);
+        (void)dup2(dn, 1);
+        (void)dup2(dn, 2);
+        if (dn > 2) close(dn);
+    }
+    {
+        int fdi;
+        for (fdi = 3; fdi < 64; fdi++) close(fdi);
+    }
+    out = fopen(snap_path, "w");
+    if (!out) _exit(2);
+    fprintf(out, "GSI_DEATH_SNAPSHOT at=%lld\n", (long long)time(NULL));
+    fprintf(out, "=== logcat -d -b all (last 500) ===\n");
+    fflush(out);
+    {
+        char *args[] = {"logcat", "-d", "-b", "all", "-t", "500", NULL};
+        snprintf(tmp, sizeof(tmp), "%s/.gsi_snap_logcat.tmp", GSI_DIAG_DIR);
+        gsi18_run_tool_to_file(out, GSI_SNAP_LOGCAT_BIN, args, tmp, 8000, 500);
+    }
+    fprintf(out, "=== dmesg (last 300) ===\n");
+    fflush(out);
+    {
+        char *args[] = {"dmesg", NULL};
+        snprintf(tmp, sizeof(tmp), "%s/.gsi_snap_dmesg.tmp", GSI_DIAG_DIR);
+        gsi18_run_tool_to_file(out, GSI_SNAP_DMESG_BIN, args, tmp, 8000, 300);
+    }
+    fprintf(out, "=== tracefs trace (last 100) ===\n");
+    fflush(out);
+    gsi18_dump_trace_tail(out);
+    fclose(out);
+    _exit(0);
+}
+
+/* Death snapshot: fork the snapshot child, wait up to 25 s,
+ * log the outcome + byte size. Fail-soft, always. */
+static void gsi18_take_death_snapshot(int attempt, long long epoch) {
+    char path[1120];
+    pid_t c;
+    int status = 0;
+    int r;
+    struct stat st;
+    long sz = -1;
+    snprintf(path, sizeof(path), "%s/gsi_death_%d_%lld.log",
+             GSI_DIAG_DIR, attempt, epoch);
+    c = fork();
+    if (c == 0) {
+        gsi18_snapshot_child(path);
+        _exit(0);
+    }
+    if (c < 0) {
+        gsi18_sup_log("[gsi_zygote_exec] SNAPSHOT_FORK_FAILED: attempt=%d (%s)\n",
+                      attempt, strerror(errno));
+        return;
+    }
+    r = gsi18_wait_timeout(c, &status, 25000);
+    if (stat(path, &st) == 0) sz = (long)st.st_size;
+    if (r == 1) {
+        gsi18_sup_log("[gsi_zygote_exec] SNAPSHOT_OK: attempt=%d path=%s bytes=%ld\n",
+                      attempt, path, sz);
+    } else if (r == 0) {
+        gsi18_sup_log("[gsi_zygote_exec] SNAPSHOT_TIMEOUT: attempt=%d path=%s bytes=%ld (helper killed)\n",
+                      attempt, path, sz);
+    } else {
+        gsi18_sup_log("[gsi_zygote_exec] SNAPSHOT_WAIT_FAILED: attempt=%d path=%s bytes=%ld\n",
+                      attempt, path, sz);
+    }
+}
+
+/* Start the supervisor-owned logcat capture. On a restart the
+ * previous file is preserved as .restart<N> (latest 2 kept)
+ * so a restart can never truncate the evidence the bundle
+ * needs. Returns the child pid, or -1. */
+static pid_t gsi18_start_capture(void) {
+    pid_t c;
+    if (gsi18_cap_restarts > 0) {
+        char prev[1120];
+        char old[1120];
+        snprintf(prev, sizeof(prev), "%s.restart%d", gsi18_cap_path, gsi18_cap_restarts);
+        (void)rename(gsi18_cap_path, prev);
+        if (gsi18_cap_restarts > 2) {
+            snprintf(old, sizeof(old), "%s.restart%d", gsi18_cap_path, gsi18_cap_restarts - 2);
+            unlink(old);
+        }
+    }
+    c = fork();
+    if (c == 0) {
+        int dn;
+        (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() == 1) _exit(127);
+        (void)setsid();
+        dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) {
+            (void)dup2(dn, 0);
+            (void)dup2(dn, 1);
+            (void)dup2(dn, 2);
+            if (dn > 2) close(dn);
+        }
+        {
+            int fdi;
+            for (fdi = 3; fdi < 64; fdi++) close(fdi);
+        }
+        {
+            char *args[] = {"logcat", "-b", "main", "-b", "system", "-b", "crash",
+                            "-b", "events", "-v", "threadtime", "-f", gsi18_cap_path,
+                            "-r", "1024", "-n", "4", NULL};
+            execv(GSI_SNAP_LOGCAT_BIN, args);
+        }
+        _exit(127);
+    }
+    if (c < 0) return -1;
+    gsi18_cap_last_try = time(NULL);
+    return c;
+}
+
+/* Per-tick service: capture supervision (death + throttled
+ * restart), heartbeat beats with system_server aliveness, and
+ * the one-shot 60 s stuck-boot snapshot. Called from the
+ * zygote wait poll loop (zygote_alive=1) and from backoff
+ * sleeps (zygote_alive=0: no stuck snapshot while no zygote
+ * is running). Never blocks, never fails the boot. */
+static void gsi18_service(int zygote_alive) {
+    time_t now = time(NULL);
+    if (gsi18_cap_pid > 0) {
+        int st = 0;
+        pid_t w = waitpid(gsi18_cap_pid, &st, WNOHANG);
+        if (w == gsi18_cap_pid) {
+            if (WIFEXITED(st)) {
+                gsi18_sup_log("[gsi_zygote_exec] CAPTURE_DIED: exit=%d restarts=%d\n",
+                              WEXITSTATUS(st), gsi18_cap_restarts);
+            } else if (WIFSIGNALED(st)) {
+                gsi18_sup_log("[gsi_zygote_exec] CAPTURE_DIED: signal=%d restarts=%d\n",
+                              WTERMSIG(st), gsi18_cap_restarts);
+            } else {
+                gsi18_sup_log("[gsi_zygote_exec] CAPTURE_DIED: status=%d restarts=%d\n",
+                              st, gsi18_cap_restarts);
+            }
+            gsi18_cap_pid = -1;
+        } else if (w < 0 && errno == ECHILD) {
+            gsi18_sup_log("[gsi_zygote_exec] CAPTURE_DIED: unknown (already reaped) restarts=%d\n",
+                          gsi18_cap_restarts);
+            gsi18_cap_pid = -1;
+        }
+    }
+    if (gsi18_cap_pid < 0 && !gsi18_cap_given_up) {
+        if (gsi18_cap_restarts >= 10) {
+            gsi18_cap_given_up = 1;
+            gsi18_sup_log("[gsi_zygote_exec] CAPTURE_GIVE_UP: 10 restarts exhausted — capture stays down, boot continues\n");
+        } else if (now - gsi18_cap_last_try >= 2) {
+            pid_t np;
+            gsi18_cap_restarts++;
+            np = gsi18_start_capture();
+            if (np > 0) {
+                gsi18_cap_pid = np;
+                gsi18_sup_log("[gsi_zygote_exec] CAPTURE_RESTARTED: pid=%d restarts=%d path=%s\n",
+                              (int)np, gsi18_cap_restarts, gsi18_cap_path);
+            } else {
+                gsi18_cap_last_try = now;
+                gsi18_sup_log("[gsi_zygote_exec] CAPTURE_START_FAILED: path=%s (%s) — retrying, boot continues\n",
+                              gsi18_cap_path, strerror(errno));
+            }
+        }
+    }
+    if (gsi18_last_beat == 0 || now - gsi18_last_beat >= (time_t)gsi18_heartbeat_secs()) {
+        pid_t ss = gsi18_find_system_server();
+        FILE *hb = fopen(gsi18_hb_path, "a");
+        gsi18_last_beat = now;
+        if (hb) {
+            if (ss > 0) {
+                fprintf(hb, "BEAT t=%lld up=%lld system_server=%d capture=%d\n",
+                        (long long)now,
+                        gsi18_t_first ? (long long)(now - gsi18_t_first) : 0LL,
+                        (int)ss, (int)gsi18_cap_pid);
+            } else {
+                fprintf(hb, "BEAT t=%lld up=%lld system_server=none capture=%d\n",
+                        (long long)now,
+                        gsi18_t_first ? (long long)(now - gsi18_t_first) : 0LL,
+                        (int)gsi18_cap_pid);
+            }
+            fclose(hb);
+        }
+    }
+    if (zygote_alive && !gsi18_stuck_done && gsi18_t_first != 0 &&
+        now - gsi18_t_first >= gsi18_stuck_delay_secs()) {
+        pid_t ss;
+        gsi18_stuck_done = 1;
+        ss = gsi18_find_system_server();
+        if (ss > 0) {
+            char p[1120];
+            snprintf(p, sizeof(p), "%s/gsi_stuck_%lld.log", GSI_DIAG_DIR, (long long)now);
+            gsi18_snapshot_stacks(ss, p);
+            gsi18_sup_log("[gsi_zygote_exec] STUCK_SNAPSHOT: system_server=%d path=%s\n",
+                          (int)ss, p);
+        } else {
+            gsi18_sup_log("[gsi_zygote_exec] STUCK_SNAPSHOT_NONE: no system_server at %lds — boot may be stuck before system_server\n",
+                          (long)gsi18_stuck_delay_secs());
+        }
+    }
+}
+
+/* Backoff / settle sleep that keeps diagnostics serviced:
+ * the capture, heartbeat, and stuck logic keep running while
+ * the supervisor waits between attempts. */
+static void gsi18_poll_sleep(unsigned seconds, int zygote_alive) {
+    unsigned total_ms = seconds * 1000;
+    unsigned step = gsi18_poll_ms();
+    unsigned waited = 0;
+    while (waited < total_ms) {
+        gsi18_msleep(step);
+        waited += step;
+        gsi18_service(zygote_alive);
+    }
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -1887,8 +2522,43 @@ int main(int argc, char **argv) {
     }
 #endif
     int last_status = 1;
+    /* 6.18: supervisor-owned diagnostics start BEFORE the first
+     * fork: heartbeat file, tracefs signal tracer, and the
+     * continuous logcat capture the supervisor itself watches.
+     * All fail-soft; see the helpers above main(). */
+    snprintf(gsi18_cap_path, sizeof(gsi18_cap_path), "%s/logcat_continuous.txt", GSI_DIAG_DIR);
+    snprintf(gsi18_hb_path, sizeof(gsi18_hb_path), "%s/gsi_heartbeat.log", GSI_DIAG_DIR);
+    /* The slot data dir normally exists by staging time; make
+     * sure regardless so a missing dir can never silently drop
+     * every 6.18 diagnostic file. */
+    (void)mkdir(GSI_DIAG_DIR, 0755);
+    {
+        FILE *hb = fopen(gsi18_hb_path, "a");
+        if (hb) {
+            fprintf(hb, "HEARTBEAT_START at=%lld\n", (long long)time(NULL));
+            fclose(hb);
+        }
+    }
+    if (gsi18_enable_tracefs()) {
+        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_OK: root=%s (signal_deliver/signal_generate enabled)\n",
+                      gsi18_trace_root);
+    } else {
+        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_UNAVAILABLE: no writable tracing root — signal tracer off, boot continues\n");
+    }
+    {
+        pid_t cp = gsi18_start_capture();
+        if (cp > 0) {
+            gsi18_cap_pid = cp;
+            gsi18_sup_log("[gsi_zygote_exec] CAPTURE_STARTED: pid=%d path=%s\n",
+                          (int)cp, gsi18_cap_path);
+        } else {
+            gsi18_sup_log("[gsi_zygote_exec] CAPTURE_START_FAILED: path=%s — supervisor will retry, boot continues\n",
+                          gsi18_cap_path);
+        }
+    }
     for (int attempt = 1; attempt <= sup_max_attempts; attempt++) {
         time_t t0 = time(NULL);
+        if (attempt == 1) gsi18_t_first = t0;
         pid_t zpid = fork();
         if (zpid == 0) {
             /* Child: die with the parent, then exec exactly as
@@ -1951,19 +2621,36 @@ int main(int argc, char **argv) {
             }
             if (attempt < sup_max_attempts) {
                 unsigned backoff = (unsigned)sup_backoff0 << (attempt - 1);
-                if (backoff > 0) sleep(backoff);
+                if (backoff > 0) gsi18_poll_sleep(backoff, 0);
             }
             continue;
         }
         int status = 0;
-        pid_t w;
-        do {
-            w = waitpid(zpid, &status, 0);
-        } while (w < 0 && errno == EINTR);
+        pid_t w = -1;
+        int wait_failed = 0;
+        /* 6.18: poll-wait so diagnostics stay serviced while the
+         * zygote runs: capture supervision, heartbeat, and the
+         * stuck-boot snapshot all happen in gsi18_service().
+         * No waitpid(-1) anywhere: children are tracked by pid,
+         * and a stray reap would steal a capture/snapshot
+         * child's status (the 6.17 stray reap is deleted for
+         * exactly that reason; a pipe-mode writer zombie is
+         * reaped when this process exits). */
+        for (;;) {
+            w = waitpid(zpid, &status, WNOHANG);
+            if (w == zpid) break;
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                wait_failed = 1;
+                break;
+            }
+            gsi18_msleep(gsi18_poll_ms());
+            gsi18_service(1);
+        }
         time_t t1 = time(NULL);
         long after = (long)(t1 - t0);
         if (after < 0) after = 0;
-        if (w < 0) {
+        if (wait_failed) {
             FILE *lg = fopen("/data/zygote_exec.log", "a");
             if (lg) {
                 fprintf(lg, "[gsi_zygote_exec] ZYGOTE_WAIT_FAILED: attempt=%d pid=%d (%s) — boot continues, child reaped by init\n",
@@ -1972,13 +2659,6 @@ int main(int argc, char **argv) {
             }
             last_status = 1;
             break;
-        }
-        /* Reap a stray already-exited child (pipe-mode writer) so
-         * no zombie lingers; the zygote child above is already
-         * reaped, so this can only collect an exited sibling. */
-        {
-            int dummy = 0;
-            (void)waitpid(-1, &dummy, WNOHANG);
         }
         last_status = status;
         {
@@ -1997,9 +2677,35 @@ int main(int argc, char **argv) {
                 fclose(lg);
             }
         }
+        /* 6.18: death snapshot while the evidence is fresh —
+         * logcat -d + dmesg + tracefs tail, no shell, 25 s cap.
+         * Runs for every death, including signal 9. */
+        gsi18_take_death_snapshot(attempt, (long long)t1);
         if (attempt < sup_max_attempts) {
             unsigned backoff = (unsigned)sup_backoff0 << (attempt - 1);
-            if (backoff > 0) sleep(backoff);
+            if (backoff > 0) gsi18_poll_sleep(backoff, 0);
+        }
+    }
+    /* 6.18: stop the supervisor-owned capture at supervisor exit
+     * (PR_SET_PDEATHSIG also kills it if this process dies
+     * first, so a dead supervisor can never leave a capture
+     * writing forever). The capture file stays on disk for the
+     * Java bundle, which collects it after the return. */
+    if (gsi18_cap_pid > 0) {
+        (void)kill(gsi18_cap_pid, SIGKILL);
+        {
+            int dummy = 0;
+            (void)waitpid(gsi18_cap_pid, &dummy, WNOHANG);
+        }
+        gsi18_sup_log("[gsi_zygote_exec] CAPTURE_STOPPED: pid=%d (supervisor exit)\n",
+                      (int)gsi18_cap_pid);
+        gsi18_cap_pid = -1;
+    }
+    {
+        FILE *hb = fopen(gsi18_hb_path, "a");
+        if (hb) {
+            fprintf(hb, "HEARTBEAT_END at=%lld\n", (long long)time(NULL));
+            fclose(hb);
         }
     }
     /* Exit with the last status, shell-style: the outer script

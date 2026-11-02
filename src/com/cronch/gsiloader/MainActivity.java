@@ -499,6 +499,11 @@ public class MainActivity extends Activity {
         // the (possibly just-cleared) operation log, so every paste
         // self-identifies its build.
         appendLog("=== GSI Loader Samsung " + appVersionStamp() + " — session started " + new java.util.Date().toString() + " ===");
+        // 6.18: boot-id + uptime header — stamps every session
+        // (and every bundle, via the app log) with the boot the
+        // evidence belongs to, so a post-restart export can never
+        // be mistaken for same-boot evidence.
+        appendBootIdHeader();
         if (pendingLogClearNotice != null) appendLog(pendingLogClearNotice);
         applyTheme();
         setContentView(R.layout.activity_main);
@@ -3569,6 +3574,83 @@ public class MainActivity extends Activity {
     // -100 per file) and deliberately does NOT run pstore_check.sh
     // — that script is report-once, and exporting must never
     // consume the one verdict the launch sweep would surface.
+    // 6.18: windowed logcat extract. Reads the death epochs
+    // the C supervisor recorded (ZYGOTE_EXIT ... at=<epoch>),
+    // then returns the ±60 s window around each death from the
+    // continuous capture + rotations + supervisor restart files,
+    // oldest chunk first. Logcat timestamps carry no year, so
+    // the current year is assumed (with a New-Year rollover
+    // guard); lines without a parseable timestamp are skipped.
+    // Fail-soft: any missing file or parse failure yields an
+    // explanatory line, never an exception to the caller.
+    private String windowedLogcatExtract(String slotDir) {
+        StringBuilder out = new StringBuilder();
+        try {
+            List<String> logLines = new ArrayList<>();
+            runRootCmdCaptured("if [ -f \"" + slotDir + "/data/zygote_exec.log\" ]; then cat \"" + slotDir + "/data/zygote_exec.log\"; elif [ -f /data/zygote_exec.log ]; then cat /data/zygote_exec.log; fi 2>/dev/null", logLines);
+            java.util.regex.Pattern deathPat = java.util.regex.Pattern.compile("ZYGOTE_EXIT: attempt=(\\d+) .*?(?:signal=(\\d+)|exit=(\\d+)).*?at=(\\d+)");
+            java.util.ArrayList<Long> epochs = new java.util.ArrayList<>();
+            java.util.ArrayList<String> descs = new java.util.ArrayList<>();
+            for (String l : logLines) {
+                java.util.regex.Matcher m = deathPat.matcher(l);
+                if (m.find()) {
+                    try {
+                        epochs.add(Long.parseLong(m.group(4)));
+                        descs.add("attempt=" + m.group(1) + " " + (m.group(2) != null ? "signal=" + m.group(2) : "exit=" + m.group(3)) + " at=" + m.group(4));
+                    } catch (Exception ignored) {}
+                }
+            }
+            if (epochs.isEmpty()) return "(no ZYGOTE_EXIT lines — supervisor log missing or no attempts recorded)\n";
+            List<String> probe = new ArrayList<>();
+            runRootCmdCaptured("if [ -f \"" + slotDir + "/data/logcat_continuous.txt\" ]; then echo SLOT; elif [ -f /data/logcat_continuous.txt ]; then echo DATA; fi 2>/dev/null", probe);
+            String base = null;
+            if (probe.contains("SLOT")) base = slotDir + "/data";
+            else if (probe.contains("DATA")) base = "/data";
+            if (base == null) return "(logcat_continuous.txt NOT FOUND in slot data or /data)\n";
+            StringBuilder cmd = new StringBuilder("for f in ");
+            for (int i = 4; i >= 1; i--) cmd.append("\"").append(base).append("/logcat_continuous.txt.").append(i).append("\" ");
+            cmd.append("\"").append(base).append("/logcat_continuous.txt.restart1\" ");
+            cmd.append("\"").append(base).append("/logcat_continuous.txt.restart2\" ");
+            cmd.append("\"").append(base).append("/logcat_continuous.txt\"; do [ -f \"$f\" ] && cat \"$f\"; done 2>/dev/null");
+            List<String> cap = new ArrayList<>();
+            runRootCmdCaptured(cmd.toString(), cap);
+            if (cap.isEmpty()) return "(capture files exist but read back empty)\n";
+            java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US);
+            fmt.setLenient(false);
+            java.util.regex.Pattern tsPat = java.util.regex.Pattern.compile("^(\\d\\d)-(\\d\\d) (\\d\\d):(\\d\\d):(\\d\\d)\\.(\\d\\d\\d)\\s");
+            int year = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
+            long nowSec = System.currentTimeMillis() / 1000L;
+            for (int d = 0; d < epochs.size(); d++) {
+                long epoch = epochs.get(d);
+                out.append("--- window ").append(descs.get(d)).append(" ±60s ---\n");
+                java.util.ArrayList<String> matches = new java.util.ArrayList<>();
+                for (String line : cap) {
+                    java.util.regex.Matcher tm = tsPat.matcher(line);
+                    if (!tm.find()) continue;
+                    try {
+                        String stamp = year + "-" + tm.group(1) + "-" + tm.group(2) + " "
+                                + tm.group(3) + ":" + tm.group(4) + ":" + tm.group(5) + "." + tm.group(6);
+                        long t = fmt.parse(stamp).getTime() / 1000L;
+                        if (t > nowSec + 86400L) t -= 31536000L;
+                        if (Math.abs(t - epoch) <= 60) matches.add(line);
+                    } catch (Exception ignored) {}
+                }
+                if (matches.isEmpty()) {
+                    out.append("(no capture lines in this window — capture may have died before the death or rotated past it)\n");
+                } else if (matches.size() <= 300) {
+                    for (String line : matches) out.append(line).append("\n");
+                } else {
+                    for (int i = 0; i < 150; i++) out.append(matches.get(i)).append("\n");
+                    out.append("[... ").append(matches.size() - 300).append(" lines skipped ...]\n");
+                    for (int i = matches.size() - 150; i < matches.size(); i++) out.append(matches.get(i)).append("\n");
+                }
+            }
+            return out.toString();
+        } catch (Exception e) {
+            return "(windowed extract failed: " + e.getMessage() + ")\n";
+        }
+    }
+
     private void exportDiagnosticsBundle() {
         executor.execute(() -> {
             try {
@@ -3582,6 +3664,14 @@ public class MainActivity extends Activity {
                 sb.append("Android: ").append(android.os.Build.VERSION.RELEASE)
                     .append(" (SDK ").append(android.os.Build.VERSION.SDK_INT).append(")\n");
                 sb.append("Current slot: ").append(selectedSlot).append("\n");
+                // 6.18: boot-id + uptime in the bundle header too, so
+                // a post-restart export can never be mistaken for
+                // same-boot evidence (the 6.17 dmesg harvest was
+                // from the next boot).
+                String bundleBootId = readSmallProcFile("/proc/sys/kernel/random/boot_id");
+                String bundleUptime = readSmallProcFile("/proc/uptime");
+                sb.append("Boot id: ").append(bundleBootId != null ? bundleBootId : "(unavailable)").append("\n");
+                sb.append("Uptime: ").append(bundleUptime != null ? bundleUptime : "(unavailable)").append("\n");
                 sb.append("Root status: ").append(isRootGranted ? "temp root active" : "no root right now").append("\n");
                 try {
                     Process p = new ProcessBuilder("sh", "-c", "uname -r").start();
@@ -3618,16 +3708,39 @@ public class MainActivity extends Activity {
                         {"cap-time logcat snapshot (logcat_cap.txt — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/logcat_cap.txt\" ]; then echo \"(found: " + dir + "/data/logcat_cap.txt)\"; tail -200 \"" + dir + "/data/logcat_cap.txt\"; elif [ -f /data/logcat_cap.txt ]; then echo \"(found: /data/logcat_cap.txt)\"; tail -200 /data/logcat_cap.txt; else echo \"(logcat_cap.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         {"fd-trace log (gsi_fdtrace.log — slot data first, /data fallback; last 200 lines)", "if [ -f \"" + dir + "/data/gsi_fdtrace.log\" ]; then echo \"(found: " + dir + "/data/gsi_fdtrace.log)\"; tail -200 \"" + dir + "/data/gsi_fdtrace.log\"; elif [ -f /data/gsi_fdtrace.log ]; then echo \"(found: /data/gsi_fdtrace.log)\"; tail -200 /data/gsi_fdtrace.log; else echo \"(gsi_fdtrace.log NOT FOUND in slot data or /data — trace toggle was OFF)\"; fi 2>/dev/null"},
                         // 6.17: continuous logcat capture — current file
-                        // (last 500) + rotations (last 100 each), slot
-                        // data first, /data fallback. This is the
-                        // primary SIGKILL-killer channel: it runs from
-                        // before the boot script launches and does not
-                        // depend on the restart cap.
-                        {"continuous logcat capture (logcat_continuous.txt + rotations — slot data first, /data fallback)", "if [ -f \"" + dir + "/data/logcat_continuous.txt\" ]; then echo \"(found: " + dir + "/data/logcat_continuous.txt)\"; echo \"--- current (last 500) ---\"; tail -500 \"" + dir + "/data/logcat_continuous.txt\"; for i in 1 2 3 4; do [ -f \"" + dir + "/data/logcat_continuous.txt.$i\" ] && { echo \"--- rotation .$i (last 100) ---\"; tail -100 \"" + dir + "/data/logcat_continuous.txt.$i\"; }; done; elif [ -f /data/logcat_continuous.txt ]; then echo \"(found: /data/logcat_continuous.txt)\"; echo \"--- current (last 500) ---\"; tail -500 /data/logcat_continuous.txt; for i in 1 2 3 4; do [ -f \"/data/logcat_continuous.txt.$i\" ] && { echo \"--- rotation .$i (last 100) ---\"; tail -100 \"/data/logcat_continuous.txt.$i\"; }; done; else echo \"(logcat_continuous.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        // (last 2000 since 6.18: "the logs should be
+                        // longer") + rotations (last 500 each) +
+                        // supervisor restart files, slot data first,
+                        // /data fallback. This is the primary
+                        // SIGKILL-killer channel: the supervisor owns
+                        // it (6.18) and it does not depend on the
+                        // restart cap.
+                        {"continuous logcat capture (logcat_continuous.txt + rotations + restart files — slot data first, /data fallback)", "if [ -f \"" + dir + "/data/logcat_continuous.txt\" ]; then echo \"(found: " + dir + "/data/logcat_continuous.txt)\"; echo \"--- current (last 2000) ---\"; tail -2000 \"" + dir + "/data/logcat_continuous.txt\"; for i in 1 2 3 4; do [ -f \"" + dir + "/data/logcat_continuous.txt.$i\" ] && { echo \"--- rotation .$i (last 500) ---\"; tail -500 \"" + dir + "/data/logcat_continuous.txt.$i\"; }; done; for r in 1 2; do [ -f \"" + dir + "/data/logcat_continuous.txt.restart$r\" ] && { echo \"--- restart file .$r (last 500) ---\"; tail -500 \"" + dir + "/data/logcat_continuous.txt.restart$r\"; }; done; elif [ -f /data/logcat_continuous.txt ]; then echo \"(found: /data/logcat_continuous.txt)\"; echo \"--- current (last 2000) ---\"; tail -2000 /data/logcat_continuous.txt; for i in 1 2 3 4; do [ -f \"/data/logcat_continuous.txt.$i\" ] && { echo \"--- rotation .$i (last 500) ---\"; tail -500 \"/data/logcat_continuous.txt.$i\"; }; done; for r in 1 2; do [ -f \"/data/logcat_continuous.txt.restart$r\" ] && { echo \"--- restart file .$r (last 500) ---\"; tail -500 \"/data/logcat_continuous.txt.restart$r\"; }; done; else echo \"(logcat_continuous.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
                         // 6.17: second, independent cap-time artifact
                         // (written on the return path before the
                         // capture stops).
                         {"cap-time logcat dump (logcat_cap2.txt — 6.17 second artifact; slot data first, /data fallback; last 500 lines)", "if [ -f \"" + dir + "/data/logcat_cap2.txt\" ]; then echo \"(found: " + dir + "/data/logcat_cap2.txt)\"; tail -500 \"" + dir + "/data/logcat_cap2.txt\"; elif [ -f /data/logcat_cap2.txt ]; then echo \"(found: /data/logcat_cap2.txt)\"; tail -500 /data/logcat_cap2.txt; else echo \"(logcat_cap2.txt NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        // 6.18: boot-id + uptime in the bundle itself
+                        // (the session header carries the same pair).
+                        {"6.18 boot-id + uptime header (same boot as the evidence?)", "echo \"boot_id: $(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"; echo \"uptime: $(cat /proc/uptime 2>/dev/null)\"; true"},
+                        // 6.18: slot data dir listing with FULL mtimes —
+                        // the automatic equivalent of the ls -l
+                        // --time-style=full-iso check: it shows
+                        // whether the capture file died mid-run
+                        // without anyone running a shell command.
+                        {"6.18 slot data dir listing with full mtimes (did the capture die mid-run?)", "ls -l --time-style=full-iso \"" + dir + "/data\" 2>/dev/null; echo \"--- /data 6.18 files ---\"; ls -l --time-style=full-iso /data/gsi_heartbeat.log /data/gsi_death_*.log /data/gsi_stuck_*.log /data/zygote_exec.log 2>/dev/null; true"},
+                        // 6.18: death snapshots — logcat -d + dmesg +
+                        // trace tail taken by the supervisor right
+                        // after each waitpid. Newest 2, capped.
+                        {"6.18 death snapshots (logcat -d + dmesg + trace tail, newest 2, head 20000 bytes each)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_death_*.log /data/gsi_death_*.log 2>/dev/null | head -2); do n=1; echo \"== $f\"; head -c 20000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no death snapshots)\"; true"},
+                        // 6.18: heartbeat log — supervisor beats with
+                        // system_server aliveness, so a stuck boot
+                        // (alive, never finishing) is visible.
+                        {"6.18 heartbeat log (supervisor beats + system_server aliveness; last 100 lines)", "if [ -f \"" + dir + "/data/gsi_heartbeat.log\" ]; then echo \"(found: " + dir + "/data/gsi_heartbeat.log)\"; tail -100 \"" + dir + "/data/gsi_heartbeat.log\"; elif [ -f /data/gsi_heartbeat.log ]; then echo \"(found: /data/gsi_heartbeat.log)\"; tail -100 /data/gsi_heartbeat.log; else echo \"(gsi_heartbeat.log NOT FOUND in slot data or /data)\"; fi 2>/dev/null"},
+                        // 6.18: stuck-boot stack snapshot — newest one,
+                        // capped. Empty when the run never reached 60 s
+                        // or system_server never appeared.
+                        {"6.18 stuck-boot stack snapshot (newest, head 12000 bytes)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_stuck_*.log /data/gsi_stuck_*.log 2>/dev/null | head -1); do n=1; echo \"== $f\"; head -c 12000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no stuck snapshot — run never reached 60s or no system_server)\"; true"},
                         // 6.17: kernel log + memory-killer harvest. The
                         // full dmesg tail is kept (capped), not just
                         // matches — the killer's lines may sit outside
@@ -3649,6 +3762,14 @@ public class MainActivity extends Activity {
                         if (lines.isEmpty()) sb.append("(empty / not present)\n");
                         else for (String l : lines) sb.append(l).append("\n");
                     }
+                    // 6.18: windowed logcat extract — Java-filtered
+                    // ±60 s windows around each supervisor-recorded
+                    // death, over the capture + rotations + restart
+                    // files. Computed here (not shell) so the window
+                    // math stays in one place and the bundle never
+                    // runs a second logcat over the capture file.
+                    sb.append("\n===== 6.18 windowed logcat extract (±60s around each ZYGOTE_EXIT death; capture + rotations + restarts) =====\n");
+                    sb.append(windowedLogcatExtract(dir));
                 } else {
                     sb.append("\n===== root sections skipped (no temp root) =====\n");
                     sb.append("Takeover log, inner log, boot diagnostics, zygote logs and pstore excerpt need temp root — re-apply temp root and export again for the full bundle.\n");
@@ -3666,10 +3787,13 @@ public class MainActivity extends Activity {
                 final String path = out.getAbsolutePath();
                 final int bytes = sb.length();
                 final String bundleText = sb.toString();
-                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + continuous logcat + cap-time dump + kernel/OOM harvest + tombstones + pmsg probe + pstore excerpt + device info). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
+                // 6.18: the capture stops only NOW — after the
+                // bundle file is written. See stopContinuousLogcat.
+                stopContinuousLogcatAfterExport();
+                appendLog("Diagnostics bundle exported: " + path + " (" + bytes + " chars: app log + takeover log + inner log + boot diagnostics + zygote launcher logs + zygote stdio capture + cap-time logcat snapshot + fd-trace log + continuous logcat + cap-time dump + kernel/OOM harvest + tombstones + pmsg probe + pstore excerpt + device info + 6.18 windowed extract + boot-id/uptime + mtime listing + death snapshots + heartbeat + stuck snapshot). Downloads copy: " + (dlUri != null ? "Download/GSI Loader/" + dlName : "(Downloads export failed — app-private copy only)") + ". Share this file when reporting a failed boot.");
                 mainHandler.post(() -> new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Diagnostics bundle exported")
-                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, continuous logcat, cap-time dump, kernel/OOM harvest, tombstones, pmsg probe, pstore excerpt and device info in one file — share it when reporting a failed boot.")
+                        .setMessage("Saved to Downloads:\nDownload/GSI Loader/" + dlName + "\n\n(Also kept at:\n" + path + ")\n\nIt holds the app log, takeover log, inner log, boot diagnostics, zygote launcher logs, zygote stdio capture, cap-time logcat snapshot, fd-trace log, continuous logcat, cap-time dump, kernel/OOM harvest, tombstones, pmsg probe, pstore excerpt and device info in one file, plus 6.18 extras (windowed extract, death snapshots, heartbeat, stuck snapshot) — share it when reporting a failed boot.")
                         .setPositiveButton("OK", null)
                         .setNeutralButton("Share", (d, w) -> shareDownloadedText(dlUri, "GSI Loader diagnostics bundle", bundleText)).show());
             } catch (Exception e) {
@@ -5607,6 +5731,8 @@ public class MainActivity extends Activity {
     // outside the zygote, so its fds never enter the fd-table
     // check. Rotation bounds it (-r 1024 -n 4: ~5 MB max).
     // Never fails the boot: any failure logs one line.
+    // 6.18: the launcher (C supervisor) owns start/restart/stop;
+    // Java only hands off — see startContinuousLogcat.
     private static final String LOGCAT_CONTINUOUS_NAME = "logcat_continuous.txt";
     private static final String LOGCAT_CAP2_NAME = "logcat_cap2.txt";
     // Kill pattern for the capture process. The bracket trick
@@ -5617,6 +5743,44 @@ public class MainActivity extends Activity {
     // match anything but the capture.
     private static final String LOGCAT_CAPTURE_KILL_PATTERN = "/system/bin/logcat.*logcat_continuous[.]txt";
 
+    // 6.18: boot-id + uptime, read straight from /proc
+    // (world-readable, no root needed). Never fails the launch.
+    private void appendBootIdHeader() {
+        try {
+            String bootId = readSmallProcFile("/proc/sys/kernel/random/boot_id");
+            String uptime = readSmallProcFile("/proc/uptime");
+            appendLog("BOOT_ID: " + (bootId != null ? bootId : "(unavailable)")
+                    + " UPTIME: " + (uptime != null ? uptime : "(unavailable)"));
+        } catch (Exception e) {
+            appendLog("BOOT_ID: (unavailable: " + e.getMessage() + ")");
+        }
+    }
+
+    private String readSmallProcFile(String path) {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(path));
+            try {
+                String line = r.readLine();
+                return line != null ? line.trim() : null;
+            } finally {
+                try { r.close(); } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    // 6.18: HANDOFF — the C supervisor owns the continuous
+    // capture now (starts it before the first zygote fork,
+    // watches it, restarts it, logs every death/restart in
+    // zygote_exec.log). Java must NOT spawn its own logcat:
+    // two writers to one rotating file would corrupt the
+    // evidence, and the Java-spawned capture was the one that
+    // died silently in the 6.17 run. This method keeps only
+    // the pre-boot hygiene: kill a straggler from a previous
+    // session, make the data dir, and say where the capture
+    // file lives. The capture runs until AFTER the bundle is
+    // built (see stopContinuousLogcat / AfterExport).
     private void startContinuousLogcat(String slotDir) {
         try {
             // Stop any straggler from a previous session first
@@ -5626,17 +5790,12 @@ public class MainActivity extends Activity {
             stopContinuousLogcatQuiet();
             String dataDir = slotDir + "/data";
             String outPath = dataDir + "/" + LOGCAT_CONTINUOUS_NAME;
-            String cmd = "mkdir -p \"" + dataDir + "\"; "
-                    + "if [ -x /system/bin/logcat ]; then "
-                    + "setsid /system/bin/logcat -b main -b system -b crash -b events -v threadtime -f \"" + outPath + "\" -r 1024 -n 4 </dev/null >/dev/null 2>&1 & "
-                    + "echo \"LOGCAT_CONTINUOUS: capture started -> " + outPath + "\"; "
-                    + "else echo \"LOGCAT_CONTINUOUS: WARNING /system/bin/logcat missing — capture unavailable, boot continues\"; fi";
             List<String> out = new ArrayList<>();
-            int rc = runRootCmdCaptured(cmd, out);
-            for (String line : out) appendLog(line);
-            if (rc != 0) appendLog("LOGCAT_CONTINUOUS: start shell exited " + rc + " — cap-time snapshot is the fallback, boot continues");
+            runRootCmdCaptured("mkdir -p \"" + dataDir + "\"", out);
+            appendLog("LOGCAT_CONTINUOUS: supervisor-owned capture (6.18) — launcher starts/restarts it, Java spawns no logcat");
+            appendLog("LOGCAT_CONTINUOUS: capture file -> " + outPath);
         } catch (Exception e) {
-            appendLog("LOGCAT_CONTINUOUS: start error (" + e.getMessage() + ") — boot continues without the capture");
+            appendLog("LOGCAT_CONTINUOUS: handoff error (" + e.getMessage() + ") — boot continues, supervisor still starts the capture");
         }
     }
 
@@ -5654,12 +5813,26 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
+    // 6.18: DEFERRED — stopping here would kill the
+    // supervisor-owned capture before the bundle is built, and
+    // the 6.17 run proved the death window is exactly what gets
+    // lost that way. The capture dies with the supervisor (its
+    // pdeathsig) or at the after-export stop below. Callers on
+    // the return/reboot paths need no change: this no-op IS the
+    // correct behavior there. The real stop runs only after a
+    // bundle export completes.
     private void stopContinuousLogcat() {
+        appendLog("LOGCAT_CONTINUOUS: stop deferred until after bundle export (supervisor owns the capture since 6.18)");
+    }
+
+    // 6.18: the real stop, called only after
+    // exportDiagnosticsBundle has written the bundle file.
+    private void stopContinuousLogcatAfterExport() {
         try {
             stopContinuousLogcatQuiet();
-            appendLog("LOGCAT_CONTINUOUS: capture stopped");
+            appendLog("LOGCAT_CONTINUOUS: capture stopped (after bundle export)");
         } catch (Exception e) {
-            appendLog("LOGCAT_CONTINUOUS: stop error (" + e.getMessage() + ") — return continues");
+            appendLog("LOGCAT_CONTINUOUS: stop error (" + e.getMessage() + ") — export already done");
         }
     }
 
@@ -5782,9 +5955,9 @@ public class MainActivity extends Activity {
                 // never-fail rule (see syncFdTraceForBoot).
                 syncFdTraceForBoot(slotDir);
 
-                // 6.17: continuous logcat capture — same position,
-                // same never-fail rule (see startContinuousLogcat).
-                // Starts BEFORE the switch script spawns.
+                // 6.18: capture handoff — same position, same
+                // never-fail rule (see startContinuousLogcat).
+                // The launcher starts the capture itself.
                 startContinuousLogcat(slotDir);
 
                 String stageScript = slotDir + "/switch_to_gsi.sh";
