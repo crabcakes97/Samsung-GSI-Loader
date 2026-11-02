@@ -1057,8 +1057,26 @@ public class MainActivity extends Activity {
 
     private void writeGsiFlagsFileSync() {
         try {
+            // 6.22: fresh synchronous detection BEFORE composing flags,
+            // so the file can never carry a stale "unknown" from a
+            // detection that had not finished (or had not run) yet.
+            // Runs on the executor thread; 10s cap inside the helper.
+            // Isolation implies its framework half on a confirmed
+            // 23.2 guest — the script still aborts on any other
+            // guest, so this cannot silently patch a non-23.2 image.
+            // When detection reads nothing, the previous value stands
+            // (never clobber a known-good version with "unknown").
+            if (isRootGranted) {
+                String[] dv = detectFrameworkNow(currentRootfs());
+                if (!dv[2].isEmpty() || !dv[1].isEmpty()) {
+                    detectedFrameworkVersion = !dv[2].isEmpty() ? dv[2] : dv[1];
+                    detectedIs232 = !dv[2].isEmpty() && dv[2].contains("23.2");
+                }
+            }
+            boolean effectivePatchFramework = patchFramework || (guestIsolation && detectedIs232);
+            if (effectivePatchFramework && !patchFramework) appendLog("Framework half engaged by guest isolation on confirmed LineageOS 23.2 (PATCH_FRAMEWORK=1).");
             // 5.9.5-APP-START: boot env vars, mirrored in bootGsi() command env.
-            String content = "PATCH_FRAMEWORK=" + (patchFramework ? "1" : "0") + "\n"
+            String content = "PATCH_FRAMEWORK=" + (effectivePatchFramework ? "1" : "0") + "\n"
                     + "PATCH_PERMISSION_CONTROLLER=" + (patchPermissionController ? "1" : "0") + "\n"
                     + "USE_LINEAGE_APEX_LIST=" + (patchApexList ? "1" : "0") + "\n"
                     // 6.20: GUEST_OWN_VOLD mirrors GUEST_ISOLATION — the
@@ -7189,6 +7207,49 @@ public class MainActivity extends Activity {
 
     private String lastGatedFramework = null;
     private String lastFitWarnedFor = null;
+    // 6.22: is the guest's framework in the 23.2 patched set, from the
+    // freshest detection available. Written by both detection paths.
+    private boolean detectedIs232 = false;
+    private String lastDetectLoggedFor = "";
+
+    // 6.22: runs the build.prop detection SYNCHRONOUSLY on the calling
+    // thread and returns {sdk, release, lineage, sourcePath} (empty
+    // strings when unreadable). Single source of truth: both the async
+    // UI detection and the flags writer use it, so the flags file can
+    // never carry a stale "unknown" from a detection that had not
+    // finished (or had not run) yet. Checks every build.prop location
+    // a GSI may carry its keys in; first non-empty value per key wins.
+    // Tagged output (SDK:/REL:/LIN:/BP:) so a missing key can never
+    // shift another field (5.9.16 lesson, kept). 10s cap so a stuck
+    // su can never hang a flags write.
+    private String[] detectFrameworkNow(String rootfs) {
+        String sdk = "", rel = "", lineage = "", src = "";
+        try {
+            String cmd = "SDK=\"\"; REL=\"\"; LIN=\"\"; LINBP=\"\"; "
+                + "for BP in \"" + rootfs + "/system/build.prop\" \"" + rootfs + "/system/etc/build.prop\" \"" + rootfs + "/product/etc/build.prop\" \"" + rootfs + "/vendor/build.prop\" \"" + rootfs + "/build.prop\" \"" + rootfs + "/etc/build.prop\" \"" + rootfs + "/system/product/etc/build.prop\"; do "
+                + "[ -f \"$BP\" ] || continue; "
+                + "[ -z \"$SDK\" ] && SDK=$(grep -m1 '^ro.build.version.sdk=' \"$BP\" 2>/dev/null | cut -d= -f2- | tr -d '\\r'); "
+                + "[ -z \"$REL\" ] && REL=$(grep -m1 '^ro.build.version.release=' \"$BP\" 2>/dev/null | cut -d= -f2- | tr -d '\\r'); "
+                + "[ -z \"$REL\" ] && REL=$(grep -m1 '^ro.build.version.release_or_codename=' \"$BP\" 2>/dev/null | cut -d= -f2- | tr -d '\\r'); "
+                + "[ -z \"$LIN\" ] && LIN=$(grep -m1 '^ro.lineage.version=' \"$BP\" 2>/dev/null | cut -d= -f2- | tr -d '\\r'); "
+                + "[ -z \"$LIN\" ] && LIN=$(grep -m1 '^ro.lineage.build.version=' \"$BP\" 2>/dev/null | cut -d= -f2- | tr -d '\\r'); "
+                + "[ -n \"$LIN\" ] && [ -z \"$LINBP\" ] && LINBP=\"$BP\"; "
+                + "done; echo \"SDK:$SDK\"; echo \"REL:$REL\"; echo \"LIN:$LIN\"; echo \"BP:$LINBP\"";
+            Process p = Runtime.getRuntime().exec(new String[]{suBinary, "-c", cmd});
+            if (!p.waitFor(10, TimeUnit.SECONDS)) { p.destroyForcibly(); return new String[]{"", "", "", ""}; }
+            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith("SDK:")) sdk = line.substring(4);
+                else if (line.startsWith("REL:")) rel = line.substring(4);
+                else if (line.startsWith("LIN:")) lineage = line.substring(4);
+                else if (line.startsWith("BP:")) src = line.substring(3);
+            }
+        } catch (Exception ignored) {}
+        return new String[]{sdk.trim(), rel.trim(), lineage.trim(), src.trim()};
+    }
+
     private void detectFrameworkVersion() {
         if (!isRootGranted) {
             mainHandler.post(() -> { if (tvFrameworkVersion != null) tvFrameworkVersion.setText("Framework: unknown (root required to read guest build.prop)"); });
@@ -7196,44 +7257,23 @@ public class MainActivity extends Activity {
         }
         final String rootfs = currentRootfs();
         executor.execute(() -> {
-            String sdk = null, rel = null, lineage = null;
-            try {
-                // 5.9.16: KEYED grep, not positional. The old code
-                // ran three greps and assigned their outputs by line
-                // index (sdk/rel/lineage) — but a grep that matches
-                // nothing prints nothing, so one missing key shifted
-                // every later field into the wrong slot (a guest with
-                // no ro.lineage.version read its release as its
-                // lineage version). Now the shell emits a TAGGED
-                // line for every key even when the value is empty
-                // (SDK:/REL:/LIN:), and Java assigns by tag, so a
-                // missing key can never shift another field. Total
-                // failure (no build.prop at all) still yields three
-                // empty tags, which fall through to "unknown" below
-                // exactly as before. Equivalents: release falls back
-                // to release_or_codename, lineage to
-                // ro.lineage.build.version, only when the primary
-                // key is empty.
-                Process p = Runtime.getRuntime().exec(new String[]{suBinary, "-c",
-                    "BP=\"" + rootfs + "/system/build.prop\"; "
-                    + "SDK=$(grep -m1 '^ro.build.version.sdk=' \"$BP\" 2>/dev/null | cut -d= -f2-); echo \"SDK:$SDK\"; "
-                    + "REL=$(grep -m1 '^ro.build.version.release=' \"$BP\" 2>/dev/null | cut -d= -f2-); [ -z \"$REL\" ] && REL=$(grep -m1 '^ro.build.version.release_or_codename=' \"$BP\" 2>/dev/null | cut -d= -f2-); echo \"REL:$REL\"; "
-                    + "LIN=$(grep -m1 '^ro.lineage.version=' \"$BP\" 2>/dev/null | cut -d= -f2-); [ -z \"$LIN\" ] && LIN=$(grep -m1 '^ro.lineage.build.version=' \"$BP\" 2>/dev/null | cut -d= -f2-); echo \"LIN:$LIN\""});
-                BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                while ((line = r.readLine()) != null) {
-                    line = line.trim();
-                    if (line.startsWith("SDK:")) sdk = line.substring(4);
-                    else if (line.startsWith("REL:")) rel = line.substring(4);
-                    else if (line.startsWith("LIN:")) lineage = line.substring(4);
-                }
-                p.waitFor();
-            } catch (Exception ignored) {}
-            final String fSdk = sdk, fRel = rel, fLineage = lineage;
+            // 6.22: shared synchronous detection (multi-path build.prop,
+            // fresh every run — no stale "unknown").
+            String[] v = detectFrameworkNow(rootfs);
+            final String fSdk = v[0].isEmpty() ? null : v[0];
+            final String fRel = v[1].isEmpty() ? null : v[1];
+            final String fLineage = v[2].isEmpty() ? null : v[2];
+            final String fSrc = v[3];
             final boolean known = (fLineage != null && !fLineage.isEmpty()) || (fRel != null && !fRel.isEmpty());
             final boolean patched = fLineage != null && fLineage.contains("23.2");
             if (known) detectedFrameworkVersion = (fLineage != null && !fLineage.isEmpty()) ? fLineage : fRel;
             else detectedFrameworkVersion = "unknown";
+            detectedIs232 = patched;
+            String detectKey = fSdk + "|" + fRel + "|" + fLineage + "|" + fSrc;
+            if (!detectKey.equals(lastDetectLoggedFor)) {
+                lastDetectLoggedFor = detectKey;
+                appendLog("Framework detect: sdk=" + (fSdk == null ? "-" : fSdk) + " rel=" + (fRel == null ? "-" : fRel) + " lineage=" + (fLineage == null ? "-" : fLineage) + " via " + (fSrc.isEmpty() ? "no build.prop" : fSrc));
+            }
             final String label;
             if (fLineage != null && !fLineage.isEmpty()) {
                 label = "Framework: LineageOS " + fLineage + ((fRel != null && !fRel.isEmpty()) ? " / Android " + fRel : "");

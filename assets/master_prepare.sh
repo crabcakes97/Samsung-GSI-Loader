@@ -337,6 +337,9 @@ mount | grep -q "$ROOTFS/mnt " || $BB mount --rbind /mnt "$ROOTFS/mnt"
 if [ -z "$FRAMEWORK_VERSION" ] && [ -f "$STAGE/framework_version" ]; then
     FRAMEWORK_VERSION="$(head -n 1 "$STAGE/framework_version" 2>/dev/null | tr -d ' \r\n')"
 fi
+# 6.22: remember what was REQUESTED before gating below may force it off;
+# the post-mount re-detection restores the request on a confirmed 23.2 guest.
+REQ_PATCH_FRAMEWORK="$PATCH_FRAMEWORK"
 if [ -n "$FRAMEWORK_VERSION" ]; then
     case "$FRAMEWORK_VERSION" in
         *23.2*)
@@ -366,6 +369,32 @@ if [ -n "$GUEST_SDK" ]; then
 else
     echo "GUEST_SDK_DETECTED: sdk=unknown (no build.prop sdk found)"
 fi
+# 6.22: authoritative re-detection from the MOUNTED image. Java's
+# FRAMEWORK_VERSION can be stale ("unknown") when detection raced the
+# flags write or ran before the image was mounted; the mounted
+# build.prop is readable here. On a confirmed LineageOS 23.2 guest the
+# requested flags are restored and isolation implies its framework
+# half. On any other guest the Java gating above stands and the
+# isolation abort below still fires — never patch a non-23.2 guest.
+REDETECT_LIN=""
+REDETECT_BP=""
+for _bp in "$ROOTFS/system/build.prop" "$ROOTFS/system/etc/build.prop" "$ROOTFS/product/etc/build.prop" "$ROOTFS/vendor/build.prop" "$ROOTFS/build.prop" "$ROOTFS/etc/build.prop" "$ROOTFS/system/product/etc/build.prop"; do
+    if [ -f "$_bp" ]; then
+        _lin="$(grep -m1 '^ro.lineage.version=' "$_bp" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+        [ -z "$_lin" ] && _lin="$(grep -m1 '^ro.lineage.build.version=' "$_bp" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+        if [ -n "$_lin" ]; then REDETECT_LIN="$_lin"; REDETECT_BP="$_bp"; break; fi
+    fi
+done
+case "$REDETECT_LIN" in
+    *23.2*)
+        echo "REDETECT_232: $REDETECT_BP says LineageOS $REDETECT_LIN — restoring requested flags (Java FRAMEWORK_VERSION was ${FRAMEWORK_VERSION:-unset})"
+        PATCH_FRAMEWORK="$REQ_PATCH_FRAMEWORK"
+        if [ "$GUEST_OWN_VOLD" = "1" ]; then PATCH_FRAMEWORK=1; echo "REDETECT_232: isolation implies framework half (PATCH_FRAMEWORK=1)"; fi
+        ;;
+    *)
+        echo "REDETECT_232: no LineageOS 23.2 version in mounted build.prop (lineage='${REDETECT_LIN:-none}') — Java gating stands"
+        ;;
+esac
 # 5.9.5-SCRIPTS-END
 # 5.9.16: dead-flag cleanup. The old block only echoed three fix
 # flags and explicitly ignored the dev-options one ("no workaround
