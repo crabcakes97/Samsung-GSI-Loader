@@ -539,6 +539,14 @@ static void sanitize_classpath(const char *env_var, const char *default_val) {
 #ifndef GSI_APEX_INFO_LIST_PATH
 #define GSI_APEX_INFO_LIST_PATH "/apex/apex-info-list.xml"
 #endif
+/* 6.29: the host's own list, read through PID 1's root. The bind
+ * enumerates parent dirs from the staged list AND this host list
+ * (union): PMS reads its APEX set from host apexd over binder, so
+ * a host-only APEX dir (notably /product/apex) must be covered
+ * even when the staged list is the clean list, which omits it. */
+#ifndef GSI_APEX_HOST_LIST_PATH
+#define GSI_APEX_HOST_LIST_PATH "/proc/1/root/apex/apex-info-list.xml"
+#endif
 #ifndef GSI_APEX_SWEEP_SCRATCH_PATH
 #define GSI_APEX_SWEEP_SCRATCH_PATH "/data/.apex-info-list.sweep"
 #endif
@@ -1286,10 +1294,17 @@ static void apex_bind_one(const char *dir, FILE *log, int *bound, int *skipped, 
     }
 }
 
-/* 6.16 driver: read the host list, log the APEX_SWEEP_DIR /
+/* 6.16 driver: read the staged list, log the APEX_SWEEP_DIR /
  * APEX_DIRS diagnostics, and bind every distinct modulePath
  * parent dir the guest lacks. Runs before apex_sweep(). Any
- * failure logs loudly and leaves the boot running. */
+ * failure logs loudly and leaves the boot running. 6.29: the
+ * staged list may be the clean list, which omits host-only
+ * APEXes, so the host list (/proc/1/root/apex/apex-info-list.xml)
+ * is read too and its parent dirs are unioned in — PMS reads
+ * its APEX set from host apexd over binder, and a host-only dir
+ * such as /product/apex must be covered or the open fails ENOENT
+ * (the GAPPS 6.27 fatal). A missing/unreadable host list only
+ * logs; the staged dirs still bind. */
 static void apex_bind(void) {
     FILE *log = fopen(GSI_ZYGOTE_LOG_PATH, "a");
     int fd = open(GSI_APEX_INFO_LIST_PATH, O_RDONLY | O_CLOEXEC);
@@ -1395,6 +1410,101 @@ static void apex_bind(void) {
             }
         }
         cur += linelen;
+    }
+    /* 6.29: union the host list's parent dirs. Same parse, same
+     * dedup/cap, best-effort: any host-list failure only logs and
+     * the staged dirs still bind. No APEX_SWEEP_DIR diagnostics
+     * here (those belong to the staged list); newly added dirs
+     * are named so the bundle shows the union working. */
+    {
+        int hfd = open(GSI_APEX_HOST_LIST_PATH, O_RDONLY | O_CLOEXEC);
+        if (hfd < 0) {
+            if (log) {
+                fprintf(log, "[gsi_zygote_exec] APEX_BIND: host list at %s unreadable (%s) — staged list only\n",
+                        GSI_APEX_HOST_LIST_PATH, strerror(errno));
+            }
+        } else if (fstat(hfd, &st) != 0 || st.st_size <= 0 || st.st_size > GSI_APEX_LIST_MAX) {
+            if (log) {
+                fprintf(log, "[gsi_zygote_exec] APEX_BIND: host list at %s unreadable or out of range — staged list only\n",
+                        GSI_APEX_HOST_LIST_PATH);
+            }
+            close(hfd);
+        } else {
+            size_t hlen = (size_t)st.st_size;
+            char *hdata = malloc(hlen + 1);
+            if (!hdata) {
+                if (log) {
+                    fprintf(log, "[gsi_zygote_exec] APEX_BIND: out of memory reading host list — staged list only\n");
+                }
+                close(hfd);
+            } else {
+                size_t hgot = 0;
+                int hshort = 0;
+                while (hgot < hlen) {
+                    ssize_t hn = read(hfd, hdata + hgot, hlen - hgot);
+                    if (hn < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if (hn == 0) {
+                        break;
+                    }
+                    hgot += (size_t)hn;
+                }
+                close(hfd);
+                if (hgot != hlen) {
+                    hshort = 1;
+                }
+                if (hshort) {
+                    if (log) {
+                        fprintf(log, "[gsi_zygote_exec] APEX_BIND: short read on %s — staged list only\n",
+                                GSI_APEX_HOST_LIST_PATH);
+                    }
+                } else {
+                    char *hcur;
+                    hdata[hlen] = '\0';
+                    hcur = hdata;
+                    while (*hcur) {
+                        char *hnl = strchr(hcur, '\n');
+                        size_t hlinelen = hnl ? (size_t)(hnl - hcur) + 1 : strlen(hcur);
+                        if (hlinelen < GSI_APEX_LINE_MAX) {
+                            char hline[GSI_APEX_LINE_MAX];
+                            memcpy(hline, hcur, hlinelen);
+                            hline[hlinelen] = '\0';
+                            if (strstr(hline, "<apex-info") != NULL) {
+                                char hmodpath[1024];
+                                if (apex_attr_value(hline, "modulePath", hmodpath, sizeof(hmodpath))) {
+                                    char hdname[GSI_APEX_BIND_PATH_MAX];
+                                    int hseen = 0;
+                                    apex_dirname(hmodpath, hdname, sizeof(hdname));
+                                    for (i = 0; i < ndirs; i++) {
+                                        if (strcmp(dirs[i], hdname) == 0) {
+                                            hseen = 1;
+                                            break;
+                                        }
+                                    }
+                                    if (!hseen) {
+                                        if (ndirs < GSI_APEX_BIND_MAX_DIRS) {
+                                            snprintf(dirs[ndirs], sizeof(dirs[ndirs]), "%s", hdname);
+                                            ndirs++;
+                                            if (log) {
+                                                fprintf(log, "[gsi_zygote_exec] APEX_BIND_HOST: %s (from host list)\n", hdname);
+                                            }
+                                        } else {
+                                            truncated = 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        hcur += hlinelen;
+                    }
+                }
+                free(hdata);
+            }
+        }
     }
     if (log) {
         if (ndirs == 0) {

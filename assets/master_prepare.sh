@@ -76,7 +76,8 @@ PATCH_PERMISSION_CONTROLLER=0
 USE_LINEAGE_APEX_LIST=0
 # 6.20: guest service isolation + skip-data-dirs. Defaults 0 (off); the
 # flags file may set them. GUEST_OWN_VOLD mirrors GUEST_ISOLATION (the
-# app writes both); the script requires PATCH_FRAMEWORK=1 alongside.
+# app writes both). 6.28: with an unpatchable framework the script
+# downgrades to the shared vold name and boots (no abort) — see below.
 GUEST_ISOLATION=0
 GUEST_OWN_VOLD=0
 SKIP_GUEST_DATA_DIRS=0
@@ -480,11 +481,18 @@ fi
 # session on EVERY run; it is re-armed only by a successful patch
 # below, so a non-isolation boot can never inherit the gate.
 rm -f "$STAGE/data/gsi_require_gvld" 2>/dev/null || true
+# 6.28: fail SOFT, not fatal. An unpatchable framework (generic GSI
+# mode) with isolation requested downgrades to the shared vold name
+# and boots anyway — the old abort blocked every generic GSI
+# outright. Logged loudly (CE-collision risk stands); the gate
+# marker stays cleared (cleared above, armed only by a successful
+# patch below), so nothing downstream expects gvld.
+if [ "$GUEST_OWN_VOLD" = "1" ] && [ "$PATCH_FRAMEWORK" != "1" ]; then
+    echo "!!! GUEST_OWN_VOLD_DOWNGRADE: framework unpatched (generic GSI mode) — isolation OFF, guest shares the host vold name (CE-collision risk stands); booting anyway"
+    GUEST_OWN_VOLD=0
+    GUEST_ISOLATION=0
+fi
 if [ "$GUEST_OWN_VOLD" = "1" ]; then
-    if [ "$PATCH_FRAMEWORK" != "1" ]; then
-        echo "!!! GUEST_OWN_VOLD requires PATCH_FRAMEWORK=1 (the gvld framework half); aborting"
-        exit 1
-    fi
     if [ ! -x "$STAGE/gvld_patch" ]; then
         echo "!!! GVLD_PATCH_MISSING: GUEST_OWN_VOLD=1 but $STAGE/gvld_patch is absent; aborting"
         exit 1

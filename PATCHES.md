@@ -351,6 +351,69 @@ Do NOT hand-edit the jar; re-run the patcher.
   byte-identical to 6.26. Guest lock credentials do not persist
   across boots in this build (by design for the test).
 
+## 6.28 delta (isolation downgrade, 2026-11-03; staging script only)
+
+- The 6.27 run on RestlessOS (framework unknown, generic GSI mode)
+  aborted staging at the `GUEST_OWN_VOLD requires PATCH_FRAMEWORK=1`
+  guard: isolation was requested (checkbox state carried over from
+  the Lineage run) but the framework half cannot be bound for an
+  unpatched guest. The guard blocked the whole boot instead of
+  booting without isolation. 6.28 fails SOFT: when the framework is
+  unpatched, isolation downgrades to the shared vold name
+  (`GUEST_OWN_VOLD=0`, `GUEST_ISOLATION=0`) with a loud
+  `GUEST_OWN_VOLD_DOWNGRADE` log line, and staging continues. The
+  daemon patch loop never runs on the downgrade path, so no guest
+  binary is renamed without the framework half asking for it; the
+  gvld gate marker stays cleared (armed only by a successful
+  patch), so nothing downstream expects `gvld`. CE-collision risk
+  stands on the downgrade path (shared vold, unpatched framework —
+  the 6.18 wall) and is stated in the log line. The
+  `GVLD_PATCH_MISSING` and `GVLD_UNPINNED` aborts are unchanged:
+  when isolation IS engaged, a missing or unpinnable patcher still
+  refuses to boot half-isolated. No native, DEX, or framework
+  change: zygote_exec, all jars, and gvld_patch are byte-identical
+  to 6.27. The 6.27 lock-state wipe is unchanged.
+
+## 6.29 delta (APEX bind host-list union, 2026-11-03; zygote_exec only)
+
+- Root cause of the GAPPS 6.27 fatal, proven from the bundle:
+  PackageManager died on `Unable to parse:
+  /product/apex/com.google.android.gmssystem.prodvic.apex`,
+  innermost cause `Failed to load asset path` / ziparchive
+  `No such file or directory`. PMS reads its APEX set from host
+  apexd over binder, so it opens the host-reported gmssystem
+  path in the guest namespace. The 6.16 APEX bind exists to
+  make such host-only dirs exist, but it enumerated parent
+  dirs ONLY from the staged `/apex/apex-info-list.xml` — which,
+  with `USE_LINEAGE_APEX_LIST=1`, is the clean list, omitting
+  gmssystem. The GAPPS bundle shows the result: `APEX_BIND:
+  done bound=0 skipped=3 failed=0 dirs=3` — `/vendor/apex`,
+  `/system/apex`, `/system_ext/apex` only; `/product/apex`
+  never enumerated, never bound, open ENOENT, 9/9 attempts
+  dead before BOOT_COMPLETED. Vanilla never tripped it: no
+  guest-side gmssystem activation.
+- Fix, generic (no gmssystem pin): `apex_bind()` in
+  `src/native/zygote_exec.c` now ALSO reads the host list at
+  `/proc/1/root/apex/apex-info-list.xml` and unions its
+  distinct modulePath parent dirs into the same dedup/cap set
+  before binding. A missing/unreadable host list only logs
+  (`APEX_BIND: host list ... unreadable — staged list only`)
+  and the staged dirs still bind; newly added dirs log as
+  `APEX_BIND_HOST: <dir> (from host list)`. The sweep is
+  untouched (it reads the staged list after the bind).
+  Discriminator on-device: `APEX_BIND` shows `dirs=4+` with
+  `/product/apex BOUND`, and the GAPPS guest reaches
+  BOOT_COMPLETED.
+- Binary: rebuilt from source (NDK 29, same 6.26 recipe:
+  `-Os -Wall -ffunction-sections -fdata-sections
+  -Wl,--gc-sections -static`, `llvm-strip --strip-all`),
+  336,072 B, SHA-256
+  `11f1cfe14592df042c60697c3a622c8e42949f7c46acd981ad019a7e5b488f7d`;
+  all 6.26–6.28 markers verified present plus the new
+  `APEX_BIND_HOST` string and host-list path. No staging
+  script, DEX, or framework change: master_prepare.sh, all
+  jars, and gvld_patch are byte-identical to 6.28.
+
 ## gvld_patch (6.25 — guest vold binary patcher; rewritten from the 6.20 UTF-16 design in 6.23, classifier rewritten in 6.24, writes_reg widened in 6.25)
 
 - File: `assets/gvld_patch`
