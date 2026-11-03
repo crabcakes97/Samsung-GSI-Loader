@@ -2,15 +2,20 @@
 
 Hot-switch between stock **One UI** and a **GSI of your choice** on a rooted Samsung phone, with no reflashing and no second partition. The GSI lives as a file under `/data/local/tmp`, boots as a container with its own zygote and system_server, and hands the screen back to One UI when you're done. Nothing is flashed, nothing touches the host system, and rebooting always lands you back on working One UI.
 
-Current version: **6.27**.
+Current version: **6.29**.
 
-> **Status note:** 6.27 is **tested on-device** (Samsung Galaxy S26 FE,
-> SM-S741U1, LineageOS 23.2 guest): it boots to the home screen. The
+> **Status note:** 6.29 is **tested on-device** (Samsung Galaxy S26 FE,
+> SM-S741U1, LineageOS 23.2 guest): vanilla and GAPPS both boot to
+> the home screen. 6.28 stops an unpatchable framework from aborting
+> staging — it downgrades to shared vold instead — and 6.29 covers
+> host-only APEX dirs (the GAPPS guest's Google APEX now binds). The
 > 6.26 run named the wall — `LockSettingsService` failing to unwrap
 > the synthetic password for user 0, killing system_server — and 6.27
 > clears it by wiping the guest's saved lock state at staging so it
-> is recreated fresh. Known open issue: cellular shows signal/5G
-> but no working data connection yet. Nothing below claims more
+> is recreated fresh. Known open issues: the GAPPS guest loops
+> crashing at setup; RestlessOS gets past staging and dies on a
+> verity-device APEX scan (`/dev/block/dm-90`); cellular shows
+> signal/5G but no working data connection yet. Nothing below claims more
 > than that — the changes are listed as shipped in the build, and
 > the on-device verdict comes from testing, not from this file.
 
