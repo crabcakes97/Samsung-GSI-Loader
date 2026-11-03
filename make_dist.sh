@@ -56,7 +56,7 @@ if [ -d "$PROJECT_DIR/tools" ]; then
     # Bytecode caches are build droppings, not source.
     rm -rf "$SRC_DIR/tools/__pycache__"
 fi
-for doc in ARCHITECTURE.md PATCHES.md TROUBLESHOOTING.md README.md; do
+for doc in ARCHITECTURE.md PATCHES.md TROUBLESHOOTING.md README.md CREDITS; do
     if [ -f "$PROJECT_DIR/$doc" ]; then
         cp "$PROJECT_DIR/$doc" "$SRC_DIR/"
     else

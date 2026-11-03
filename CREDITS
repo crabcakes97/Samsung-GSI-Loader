@@ -1,0 +1,9 @@
+CREDITS
+
+Upstream authors and projects this fork builds on. Real credits only.
+
+- WeWaffles — OneLineage, the original app this fork builds on.
+- MisterZtr — LineageOS GSI builds shipped as the app's presets.
+- fahadalijaved — OneOS; several mechanisms in this tree are
+  re-implementations of OneOS mechanisms, credited in PATCHES.md.
+- crabcakes97 — fork maintainer: https://github.com/crabcakes97

@@ -461,13 +461,25 @@ fi
 # 6.20: guest own-vold-name (GUEST_OWN_VOLD, mirrors GUEST_ISOLATION).
 # The image is mounted read-only, so patch a COPY of the guest vold
 # binary and bind-mount it over the original; the image is never
-# modified. gvld_patch (src/native/gvld_patch.c) is fail-closed: with
-# no SHA-pinned offsets it patches only a uniquely-identified UTF-16
-# "vold" service-name string, and anything else aborts staging with a
-# learn log — never boot half-isolated (framework asking for "gvld"
-# that nothing owns). The AIDL registration is NOT patched (no pins;
-# see PATCHES.md). Candidates in order: the vold binary, then libvold
+# modified. gvld_patch (src/native/gvld_patch.c) is fail-closed: it
+# finds the NARROW "vold" service-name literal from the code and
+# classifies every adrp+add/adr reference by following its register
+# forward to the consuming call (6.24: first-bl matching dropped — it
+# misread hoisted registers and branch-joined log blocks). It patches
+# only when exactly one standalone literal exists, at least one
+# reference is a proven SERVICE use (String16 ctor, literal in x1,
+# stack-derived x0, counted ctor only with length 4), and every other
+# reference is a proven LOGTAG use (same local log helper, w0 small
+# constant, x2 format string, body corroborated). Anything else
+# aborts staging with a learn log — never boot half-isolated
+# (framework asking for "gvld" that nothing owns). The AIDL
+# registration is NOT patched (measured, not modified; see
+# PATCHES.md). Candidates in order: the vold binary, then libvold
 # (VoldNativeService may live in either file depending on the build).
+# 6.23: clear any stale gvld runtime-gate marker from a previous
+# session on EVERY run; it is re-armed only by a successful patch
+# below, so a non-isolation boot can never inherit the gate.
+rm -f "$STAGE/data/gsi_require_gvld" 2>/dev/null || true
 if [ "$GUEST_OWN_VOLD" = "1" ]; then
     if [ "$PATCH_FRAMEWORK" != "1" ]; then
         echo "!!! GUEST_OWN_VOLD requires PATCH_FRAMEWORK=1 (the gvld framework half); aborting"
@@ -498,9 +510,28 @@ if [ "$GUEST_OWN_VOLD" = "1" ]; then
         fi
     done
     if [ -z "$_GVLD_PATCHED" ]; then
-        echo "!!! GVLD_UNPINNED: no candidate vold binary could be patched (learn mode above; no SHA pins exist for this GSI's vold). Aborting rather than booting half-isolated. Send the staging log: it carries the learn offsets for a future pin table."
+        echo "!!! GVLD_UNPINNED: no candidate vold binary could be patched (LEARN mode above lists every reference + callee). Aborting rather than booting half-isolated."
+        # 6.23 Option A: export the guest vold binary + incremental lib
+        # for offline analysis of the real binary. Best-effort only;
+        # the abort happens regardless of whether the copies land.
+        mkdir -p /sdcard/Download 2>/dev/null || true
+        if [ -f "$ROOTFS/system/bin/vold" ]; then
+            cp "$ROOTFS/system/bin/vold" /sdcard/Download/guest_vold.bin 2>/dev/null && chmod 644 /sdcard/Download/guest_vold.bin 2>/dev/null && echo "GVLD_EXPORT: guest vold -> /sdcard/Download/guest_vold.bin (attach for analysis)" || echo "GVLD_EXPORT_WARN: could not copy guest vold"
+        fi
+        for _INC_EXP in "$ROOTFS/system/lib64/service.incremental.so" "$ROOTFS/system/lib/service.incremental.so"; do
+            if [ -f "$_INC_EXP" ]; then
+                cp "$_INC_EXP" /sdcard/Download/guest_incremental.so 2>/dev/null && chmod 644 /sdcard/Download/guest_incremental.so 2>/dev/null && echo "GVLD_EXPORT: incremental lib -> /sdcard/Download/guest_incremental.so" || echo "GVLD_EXPORT_WARN: could not copy incremental lib"
+                break
+            fi
+        done
         exit 1
     fi
+    # 6.23: the daemon half patched — arm the zygote_exec runtime gate
+    # (it polls `service check gvld` before the first fork; the marker
+    # lives in the slot data dir, which becomes guest /data). A failed
+    # write only warns: the static analysis already passed, the gate
+    # is the backstop, not the primary protection.
+    touch "$STAGE/data/gsi_require_gvld" 2>/dev/null && echo "GVLD_GATE_ARMED: gate marker written" || echo "GVLD_GATE_WARN: could not write gate marker (runtime gate inactive)"
     # Best-effort only: service.incremental.so carries the same string in
     # OneOS's account; if present and patchable, bind it too, but never
     # abort on it (auxiliary; the load-bearing patch is the vold binary).

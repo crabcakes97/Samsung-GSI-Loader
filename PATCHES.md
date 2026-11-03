@@ -219,11 +219,16 @@ Do NOT hand-edit the jar; re-run the patcher.
    offsets that do not exist on the build VM — no GSI image here).
    The legacy `vold` name (the crash path) IS closed; the AIDL name is
    a residual collision surface until pins exist.
-2. The binary-side patch is UNPINNED: `gvld_patch` patches only a
-   uniquely-identified UTF-16 `vold` string and otherwise aborts
-   staging in learn mode. If the real Lineage vold has 0 or 2+
-   occurrences, isolation cannot boot until a pin table is built from
-   the learn log. This is fail-closed by design, not a bug.
+2. The binary-side patch is GENERIC, not pinned (6.24): `gvld_patch`
+   parses the ELF, finds every adrp+add/adr reference to the single
+   standalone narrow `vold` literal, and classifies each by following
+   its register forward to the consuming call (SERVICE = String16
+   ctor; LOGTAG = the one shared local log helper, body-corroborated).
+   It patches only when at least one SERVICE reference exists and
+   every other reference is a proven LOGTAG; anything else aborts
+   staging in LEARN mode with a per-reference trace. No pin table is
+   needed for a new GSI unless its vold uses a shape the classifier
+   has never seen — then it LEARNs and the trace says what to add.
 3. `framework_patched.jar` is untouched: the 6.20 isolation covers
    services.jar only. If the framework jar also resolves `vold`
    anywhere, that is an open item for the stock-vs-patched diff.
@@ -231,19 +236,24 @@ Do NOT hand-edit the jar; re-run the patcher.
    ownership + vold.log) run: this jar assumes the two-vold hypothesis
    but does not prove it.
 
-## gvld_patch (6.20 — guest vold binary patcher)
+## gvld_patch (6.24 — guest vold binary patcher; rewritten from the 6.20 UTF-16 design in 6.23, classifier rewritten in 6.24)
 
 - File: `assets/gvld_patch`
-- Size: 419,936 bytes
-- SHA-256: `3848e946da04371ef4550852030db21ed24f6e93ec5495f07e3faf8310720b07`
+- Size: 433,760 bytes
+- SHA-256: `66962927e1673d19a9a9c419d4d4bd9d7c8d021f38294de7e85c26a16a1ecafd`
 - Format: ARM aarch64 static ELF executable, stripped. Source:
   `src/native/gvld_patch.c` (plain C, libc only).
 - Build (NDK 29, API 21, static):
   `aarch64-linux-android21-clang -O2 -Wall -static -o assets/gvld_patch
   src/native/gvld_patch.c && llvm-strip assets/gvld_patch`
-  (Host test build: same source with `cc`; 5/5 fixture tests pass:
-  unique pattern patches with exactly 2 bytes changed; zero/ambiguous/
-  non-ELF/wrong-arch all exit LEARN with no output written.)
+  (Host test build: same source with `cc`; 20/20 synthetic-ELF
+  harness cases pass — service-only, service+logs, hoisted-register
+  loop, tail-branch, counted-ctor length 4/5/non-constant,
+  non-log third use, suffix-only, two literals, zero literals,
+  gap adrp+add, adr form, two log callees, helper without __errno,
+  UTF-16-only, non-stack x0, non-constant w0, frame-pointer x0 —
+  and both exported real binaries classify exactly as prescribed:
+  guest vold 1 SERVICE + 9 LOGTAG, service.incremental.so 2 SERVICE.)
 - Use site: `master_prepare.sh`, `GUEST_OWN_VOLD=1` block (after the
   framework binds). Tries `$ROOTFS/system/bin/vold`, then
   `$ROOTFS/system/lib64/libvold.so` (VoldNativeService may live in
@@ -253,11 +263,15 @@ Do NOT hand-edit the jar; re-run the patcher.
   → FATAL abort with the learn log in the staging output. Exit 1 =
   I/O error, also fatal. `service.incremental.so` is best-effort only
   (patched + bound if possible, never fatal).
-- What it patches: the UTF-16LE String16 `vold` → `gvld` (2 bytes
-  change). It verifies ELF64 LE + AArch64 + a vold-identifying string,
-  requires EXACTLY ONE occurrence, and self-checks the output
-  (byte-identical except the 2 bytes; `gvld` present once, `vold`
-  pattern gone). No code bytes are touched; the tbz patch is NOT
+- What it patches: the single standalone NARROW `vold\0` literal →
+  `gvld\0` (2 bytes change: `v`→`g`, `o`→`v`; `l`, `d` unchanged).
+  It verifies ELF64 LE + AArch64, requires EXACTLY ONE standalone
+  literal, classifies every code reference by register-following
+  (see `src/native/gvld_patch.c` header for the full design), and
+  self-checks the output (byte-identical except the 2 bytes; full
+  re-classification of the patched buffer finds zero `vold`
+  references and the same reference count on `gvld`; no standalone
+  `vold` remains). No code bytes are touched; the tbz patch is NOT
   attempted (see gap 1 above).
 - Failure mode: FATAL abort of staging (fail closed). The helper never
   modifies its input; output goes to `$STAGE/vold_gvld_*`.

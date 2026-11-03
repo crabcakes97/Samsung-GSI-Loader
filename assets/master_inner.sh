@@ -125,6 +125,11 @@ ANIM_PID=$!
 echo "[Pivoted Root] BootAnimation PID: $ANIM_PID"
 sleep 1
 
+# 6.23 (diagnostic only): AIDL vold-name ownership BEFORE the guest
+# vold starts — the host vold's registration, if any. Compared with
+# the post-start snapshot below; log-only, never fatal.
+_AIDL_BEFORE="$(service check "android.system.vold.IVold/default" 2>/dev/null || echo "service check failed")"
+echo "[Pivoted Root] AIDL_VOLD_BEFORE: $_AIDL_BEFORE"
 echo "[Pivoted Root] Starting guest Vold..."
 /system/bin/vold --blkid_context=u:r:blkid:s0 --blkid_untrusted_context=u:r:blkid_untrusted:s0 --fsck_context=u:r:fsck:s0 --fsck_untrusted_context=u:r:fsck_untrusted:s0 > /data/vold.log 2>&1 &
 VOLD_PID=$!
@@ -151,6 +156,14 @@ _GVLD_CHECK="$(service check gvld 2>/dev/null || echo "service check failed")"
 case "$_GVLD_CHECK" in
     *": found"*) echo "[Pivoted Root] GVLD_OK: gvld owned in servicemanager ($_GVLD_CHECK)" ;;
 esac
+
+# 6.23 (diagnostic only): AIDL vold-name ownership AFTER the guest
+# vold started. If the name vanished or changed hands, that is the
+# residual surface OneOS patches; measure first, patch later.
+# Log-only, never fatal.
+_AIDL_AFTER="$(service check "android.system.vold.IVold/default" 2>/dev/null || echo "service check failed")"
+echo "[Pivoted Root] AIDL_VOLD_AFTER: $_AIDL_AFTER"
+service list 2>/dev/null | grep -i "vold" | while read -r _l; do echo "[Pivoted Root] AIDL_VOLD_LIST: $_l"; done || true
 
 # Wifi. switch_to_gsi.sh stops the host wificond; the guest's own registers
 # IWificond before WifiService initialises, and drives Samsung's wifi HAL (which
@@ -528,6 +541,15 @@ while true; do
         echo "[Pivoted Root] zygote_exec KILLED by signal $((_ZYGOTE_RET - 128)) after ${_ZYGOTE_RUN}s at $(date) (shell status $_ZYGOTE_RET)"
     else
         echo "[Pivoted Root] zygote_exec exited with code $_ZYGOTE_RET after ${_ZYGOTE_RUN}s at $(date)"
+    fi
+    # 6.23: gvld runtime gate — zygote_exec exits 42 when the patched
+    # guest vold never owned "gvld". Do NOT retry: the daemon half is
+    # wrong, and retrying re-polls a name that will never appear.
+    # Break the loop so the session ends diagnosably, as the
+    # restart-cap path does below.
+    if [ "$_ZYGOTE_RET" = "42" ]; then
+        echo "[Pivoted Root] GVLD_GATE_ABORT: zygote_exec refused (code 42) — guest vold never owned gvld; ending session before system_server"
+        break
     fi
     if [ "$_ZYGOTE_RUN" -ge 120 ]; then
         _ZYGOTE_FAILS=0

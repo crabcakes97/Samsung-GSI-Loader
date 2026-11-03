@@ -2859,6 +2859,45 @@ static void gsi18_poll_sleep(unsigned seconds, int zygote_alive) {
     }
 }
 
+/* 6.23: gvld runtime gate (second-opinion design). When guest service
+ * isolation patched the guest vold binary, the guest vold must own the
+ * "gvld" name in the shared servicemanager before the guest's
+ * system_server starts; if the static analysis misjudged and the daemon
+ * still registers "vold", the framework half would ask for a "gvld"
+ * that nothing owns. The staging script touches
+ * /data/gsi_require_gvld in the slot data dir exactly when the patch
+ * succeeded. This check runs BEFORE the first fork in main(): poll
+ * `service check gvld` for up to ~10s. Absent marker = gate not
+ * required (normal boot, zero behavior change). Timeout = return 42;
+ * the outer script breaks its restart loop on 42 and aborts the
+ * takeover before system_server starts. */
+#define GVLD_GATE_EXIT 42
+#define GVLD_GATE_MARKER "/data/gsi_require_gvld"
+
+static int gvld_gate_check(void) {
+    int i;
+    if (access(GVLD_GATE_MARKER, F_OK) != 0) return 0;
+    gsi18_sup_log("[gsi_zygote_exec] GVLD_GATE_REQUIRED: polling `service check gvld` (10s)\n");
+    for (i = 0; i < 20; i++) {
+        FILE *p = popen("service check gvld 2>/dev/null", "r");
+        char line[256];
+        int found = 0;
+        if (p) {
+            while (fgets(line, sizeof(line), p)) {
+                if (strstr(line, ": found")) { found = 1; break; }
+            }
+            pclose(p);
+        }
+        if (found) {
+            gsi18_sup_log("[gsi_zygote_exec] GVLD_GATE_OK: gvld owned in servicemanager\n");
+            return 0;
+        }
+        gsi18_msleep(500);
+    }
+    gsi18_sup_log("[gsi_zygote_exec] GVLD_GATE_FAIL: gvld not owned after 10s — aborting before system_server (exit 42)\n");
+    return GVLD_GATE_EXIT;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -2911,6 +2950,13 @@ int main(int argc, char **argv) {
     if (!getenv("ANDROID_ASSETS")) setenv("ANDROID_ASSETS", "/system/app", 1);
     if (!getenv("EXTERNAL_STORAGE")) setenv("EXTERNAL_STORAGE", "/sdcard", 1);
     if (!getenv("ASEC_MOUNTPOINT")) setenv("ASEC_MOUNTPOINT", "/mnt/asec", 1);
+
+    /* 6.23: gvld runtime gate, before the first fork (see
+     * gvld_gate_check). No-op unless the staging script required it. */
+    {
+        int grc = gvld_gate_check();
+        if (grc != 0) return grc;
+    }
 
     sanitize_classpath("BOOTCLASSPATH", DEFAULT_BOOTCLASSPATH);
     sanitize_classpath("DEX2OATBOOTCLASSPATH", DEFAULT_DEX2OATBOOTCLASSPATH);
