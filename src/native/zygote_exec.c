@@ -210,7 +210,7 @@
  *    signal_generate (the sender-naming event) was best-effort
  *    and never verified, no filters were set, and the trace
  *    was read late without switching tracing off. 6.19 enables
- *    ONLY signal_generate with filter sig==9 (+ best-effort
+ *    ONLY signal_generate with the 6.26 fatal-signal filter (+ best-effort
  *    sched_process_exit), verifies every write by read-back,
  *    re-asserts events/filter/tracing_on every heartbeat tick,
  *    drains trace_pipe through a separate reader child into a
@@ -1819,7 +1819,9 @@ static int gsi18_write_small_file(const char *path, const char *content) {
  * signal_generate was best-effort and never verified, yet
  * logged TRACEFS_OK anyway. 6.19 verifies every write by
  * read-back: signal_generate enable == 1, filter contains
- * sig==9, tracing_on == 1. sched_process_exit is best-effort
+ * SIGABRT/SIGKILL/SIGSEGV/SIGTERM (6.26: sig==9-only was blind
+ * to the zygote's own SIGABRT death and to system_server's
+ * unknown death signal), tracing_on == 1. sched_process_exit is best-effort
  * (exit events for the order-of-death cross-check).
  * signal_deliver is explicitly DISABLED so a stale enable
  * from an earlier run cannot flood the buffer with
@@ -1855,14 +1857,31 @@ static int gsi18_enable_tracefs(void) {
         if (!gsi18_read_small_file(p, rb, sizeof(rb)) || strcmp(rb, "1") != 0) continue;
         gsi18_trace_generate_ok = 1;
         snprintf(p, sizeof(p), "%s/events/signal/signal_generate/filter", roots[i]);
-        /* Exact match (read-back is whitespace-trimmed): on real
-         * tracefs a filter write REPLACES the filter, so a stale
-         * tail would mean the write did not take. A substring
-         * check would pass "sig==9<stale>" — the harness fake
-         * (a regular file, no replace-on-write) caught this. */
-        if (gsi18_write_small_file(p, "sig==9") == 0 &&
-            gsi18_read_small_file(p, rb, sizeof(rb)) && strcmp(rb, "sig==9") == 0) {
-            gsi18_trace_filter_ok = 1;
+        /* 6.26: fatal-signal filter. sig==9-only was blind to the
+         * actual deaths: the zygote dies by SIGABRT (6), and
+         * system_server's death signal is unknown. Capture
+         * SIGABRT/SIGKILL/SIGSEGV/SIGTERM. Read-back must contain
+         * all four tokens (space-stripped, since tracefs may
+         * normalize spacing): on real tracefs a filter write
+         * REPLACES the filter, so a stale single-condition tail
+         * fails the all-four check instead of passing. */
+        rb[0] = '\0';
+        if (gsi18_write_small_file(p, "sig==6 || sig==9 || sig==11 || sig==15") == 0 &&
+            gsi18_read_small_file(p, rb, sizeof(rb))) {
+            char nosp[256];
+            size_t ni = 0, ri;
+            for (ri = 0; rb[ri] && ni + 1 < sizeof(nosp); ri++) {
+                if (rb[ri] != ' ' && rb[ri] != '\t') nosp[ni++] = rb[ri];
+            }
+            nosp[ni] = '\0';
+            if (strstr(nosp, "sig==6") && strstr(nosp, "sig==9") &&
+                strstr(nosp, "sig==11") && strstr(nosp, "sig==15")) {
+                gsi18_trace_filter_ok = 1;
+            } else {
+                gsi18_sup_log("[gsi_zygote_exec] TRACEFS_FILTER_MISMATCH readback='%s'\n", rb);
+            }
+        } else {
+            gsi18_sup_log("[gsi_zygote_exec] TRACEFS_FILTER_UNREADABLE readback='%s'\n", rb);
         }
         snprintf(p, sizeof(p), "%s/events/sched/sched_process_exit/enable", roots[i]);
         if (gsi18_write_small_file(p, "1") == 0 &&
@@ -1982,7 +2001,7 @@ static void gsi18_trace_off_first(void) {
  * without ever switching tracing off. Now: the trace header
  * line (entries-in-buffer/entries-written — proves whether
  * events recorded at all) + the tail of the trace_pipe
- * reader log (signal_generate sig==9 sender lines). The
+ * reader log (signal_generate fatal-signal sender lines). The
  * parent writes tracing_on=0 BEFORE forking the snapshot, so
  * the buffer cannot be overwritten between death and read. */
 static void gsi18_dump_trace_tail(FILE *out) {
@@ -2014,7 +2033,7 @@ static void gsi18_dump_trace_tail(FILE *out) {
     } else {
         fprintf(out, "(trace unreadable: %s)\n", strerror(errno));
     }
-    fprintf(out, "--- trace_pipe log (signal_generate sig==9, last 100) ---\n");
+    fprintf(out, "--- trace_pipe log (signal_generate fatal-signal, last 100) ---\n");
     if (gsi18_trace_pipe_path[0]) {
         gsi18_copy_tail(out, gsi18_trace_pipe_path, 100);
     } else {
@@ -3218,7 +3237,7 @@ int main(int argc, char **argv) {
     snprintf(gsi18_trace_pipe_path, sizeof(gsi18_trace_pipe_path), "%s/gsi_trace_pipe.log", GSI_DIAG_DIR);
     if (gsi18_enable_tracefs()) {
         pid_t tp;
-        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_OK: root=%s generate=%d filter=%d sched=%d tracing_on=%d (signal_generate sig==9 only)\n",
+        gsi18_sup_log("[gsi_zygote_exec] TRACEFS_OK: root=%s generate=%d filter=%d sched=%d tracing_on=%d (signal_generate 6/9/11/15)\n",
                       gsi18_trace_root, gsi18_trace_generate_ok, gsi18_trace_filter_ok,
                       gsi18_trace_sched_ok, gsi18_trace_tracing_on_ok);
         tp = gsi18_start_tracepipe();
@@ -3243,6 +3262,19 @@ int main(int argc, char **argv) {
     for (int attempt = 1; attempt <= sup_max_attempts; attempt++) {
         time_t t0 = time(NULL);
         if (attempt == 1) gsi18_t_first = t0;
+        /* 6.26: attempt marker in the trace file, written by the
+         * supervisor before the fork. The trace file is one
+         * append-only file across attempts and runs; without a
+         * marker the fresh tail cannot be told from stale lines.
+         * O_APPEND write, fail-soft, never touches tracefs. */
+        if (gsi18_trace_pipe_path[0]) {
+            int mfd = open(gsi18_trace_pipe_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (mfd >= 0) {
+                dprintf(mfd, "GSI_TRACE_ATTEMPT attempt=%d wall=%lld suppid=%d\n",
+                        attempt, (long long)t0, (int)getpid());
+                close(mfd);
+            }
+        }
         pid_t zpid = fork();
         if (zpid == 0) {
             /* Child: die with the parent, then exec exactly as
@@ -3405,6 +3437,24 @@ int main(int argc, char **argv) {
                     gsi18_sup_log("[gsi_zygote_exec] SS_FOUND attempt=%d system_server=%d cgroup=%s\n",
                                   attempt, (int)ss,
                                   gsi18_ss_cgroup[0] ? gsi18_ss_cgroup : "(none)");
+                    /* 6.26: system_server's own OOM shield read-back.
+                     * The zygote's adj is witnessed, but the OOM/LMK
+                     * verdict for system_server itself was unproven:
+                     * the witness lists zygote PIDs only. Read it
+                     * at discovery; adj does not move unless the
+                     * killer or the framework moves it. */
+                    {
+                        char op[128];
+                        char rb[64];
+                        snprintf(op, sizeof(op), "/proc/%d/oom_score_adj", (int)ss);
+                        if (gsi18_read_small_file(op, rb, sizeof(rb))) {
+                            gsi18_sup_log("[gsi_zygote_exec] SS_OOM_ADJ_READBACK attempt=%d pid=%d adj=%s\n",
+                                          attempt, (int)ss, rb);
+                        } else {
+                            gsi18_sup_log("[gsi_zygote_exec] SS_OOM_ADJ_READBACK attempt=%d pid=%d adj=(unreadable)\n",
+                                          attempt, (int)ss);
+                        }
+                    }
                 }
             }
             gsi18_poll_deaths_once();

@@ -3828,7 +3828,7 @@ public class MainActivity extends Activity {
                         // 6.18: death snapshots — logcat -d + dmesg +
                         // trace tail taken by the supervisor right
                         // after each waitpid. Newest 2, capped.
-                        {"6.18 death snapshots (logcat -d + dmesg + trace tail, newest 2, head 20000 bytes each)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_death_*.log /data/gsi_death_*.log 2>/dev/null | head -2); do n=1; echo \"== $f\"; head -c 20000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no death snapshots)\"; true"},
+                        {"6.18 death snapshots (logcat -d + dmesg + trace tail, newest 2, head 40000 bytes each)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_death_*.log /data/gsi_death_*.log 2>/dev/null | head -2); do n=1; echo \"== $f\"; head -c 40000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no death snapshots)\"; true"},
                         // 6.18: heartbeat log — supervisor beats with
                         // system_server aliveness, so a stuck boot
                         // (alive, never finishing) is visible.
@@ -3841,7 +3841,7 @@ public class MainActivity extends Activity {
                         // child's signal_generate output. Newest one,
                         // capped. Absent when the tracer never
                         // verified or the reader never started.
-                        {"6.19 trace_pipe log (signal_generate sig==9 reader output; newest, head 20000 bytes)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_trace_pipe.log /data/gsi_trace_pipe.log 2>/dev/null | head -1); do n=1; echo \"== $f\"; head -c 20000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no trace_pipe log — tracer never verified or reader never started)\"; true"},
+                        {"6.19 trace_pipe log (signal_generate fatal-signal reader output; newest, tail 20000 bytes)", "n=0; for f in $(ls -t \"" + dir + "/data\"/gsi_trace_pipe.log /data/gsi_trace_pipe.log 2>/dev/null | head -1); do n=1; echo \"== $f\"; tail -c 20000 \"$f\" 2>/dev/null; echo; done; [ \"$n\" = 0 ] && echo \"(no trace_pipe log — tracer never verified or reader never started)\"; true"},
                         // 6.19: oom_adj witness log — the child's
                         // oom_score_adj writes + the parent's
                         // read-backs. Proves whether the -1000 shield

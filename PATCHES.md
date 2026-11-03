@@ -85,17 +85,20 @@ SHA-256 hashes below were computed from the 5.9.16 tree's `assets/` on
   source; the merge keeps the 6.19 binary.)
 - All isolation flags default OFF, as in 6.20. No README change.
 
-## services_isolated.jar (6.20 — guest service isolation)
+## services_isolated.jar (6.20 — guest service isolation; T1 rebuilt 6.25)
 
 - File: `assets/services_isolated.jar`
-- Size: 15,219,068 bytes
-- SHA-256: `df915cbd2513bff5d95aa827d89d1a2839fa74dca6390c59ab60832ee4fd98b1`
-- Base: `assets/services_patched.jar` in THIS tree (same 3 dex files,
-  byte-identical sizes; every edit is same-size, so no dex grows).
-  Produced by `tools/dex_patch.py` (stdlib-only Python; no smali
-  round-trip). The input blob's own provenance is the OPEN item above;
-  this section documents ONLY the 6.20 delta, which is fully enumerated
-  below and machine-verified (see "Verification").
+- Size: 15,297,439 bytes
+- SHA-256: `e0d23cf2fa0e3e9c0f8fff7f741b95d25f64a6dc4cc6ec442adb03370fe2e081`
+- Base: `assets/services_patched.jar` in THIS tree (same 3 dex files).
+  Produced by `tools/dex_patch.py` + `tools/dex_resort.py`: T2–T7
+  are same-size DEX byte edits (stdlib-only Python); T1 (the
+  "vold"→"gvld" string rename) goes through a dexlib2 round-trip
+  (baksmali/smali 2.5.2, build host only) because an in-place rename
+  breaks string_ids ordering — see "6.25 delta" below. The input
+  blob's own provenance is the OPEN item above; this section
+  documents ONLY the 6.20 delta + the 6.25 T1 rebuild, which are
+  fully enumerated below and machine-verified (see "Verification").
 - Bind site: → guest `system/framework/services.jar`, INSTEAD of
   `services_patched.jar`, only when `GUEST_ISOLATION=1` (and
   `PATCH_FRAMEWORK=1`) in `gsi_flags.conf` (`master_prepare.sh`,
@@ -121,8 +124,10 @@ SHA-256 hashes below were computed from the 5.9.16 tree's `assets/` on
   `~/workspace/oneos-look/`. No OneOS code was copied, no OneOS patcher
   was run, no OneLineage-derived file was copied. Everything below is
   fresh code in this tree implementing the same mechanisms by different
-  means (same-size DEX byte edits instead of smali insertion, because
-  no smali assembler exists on the build VM).
+  means (T2–T7: same-size DEX byte edits instead of smali insertion,
+  because no smali assembler exists on the build VM; T1 since 6.25:
+  the smali round-trip, now that the toolchain is vendored for the
+  build host — see "6.25 delta").
 
 ### 6.20 delta, enumerated (all verified by tools/dex_patch.py + baksmali)
 
@@ -193,13 +198,25 @@ services.jar), where this neuter does not run.
 
 - `tools/dex_patch.py --selfcheck`: all 119,122 methods in the 3 dex
   files parse with boundary-validated branches/try ranges.
-- Patcher run: 62 edits, all global assertions pass (report in
-  `tools/dex_patch_report.txt`).
+- Patcher run: 60 same-size edits + 2 dexlib2 round-trips, all global
+  assertions pass (report in `tools/dex_patch_report.txt`).
 - `tools/dex_patch.py --verify` on the output: clean + all 4 entry
   guards present in exactly one dex each.
+- Round-trip checks, every run, per rebuilt dex: dexdump reports zero
+  "Out-of-order string_ids"; census shows zero `vold` / exactly one
+  `gvld` at the same call sites; smali-tree diff vs the pre-round-trip
+  disassembly shows ONLY the renamed const-string lines (the one
+  tolerated normalization: smali drops redundant zero static
+  initializers, e.g. `= false`, which is semantically identical).
+- Negative control: the 6.24 jar shows 1 "Out-of-order string_ids"
+  warning in each of classes.dex and classes2.dex under the same
+  dexdump; the 6.25 jar shows 0 in all 3 dexes.
 - Baksmali re-disassembly of the output: guards, `gvld` strings, and
-  dropped calls confirmed in smali form; both dex files parse fully.
-- Dex sizes byte-identical to the input (same-size invariant).
+  dropped calls confirmed in smali form; both rebuilt dex files parse
+  fully.
+- Size invariant (6.25): only the two rebuilt dexes change size
+  (dexlib2 rebuilds layout); classes3.dex is byte-identical to the
+  input, and every non-dex jar entry is copied byte-identical.
 
 ### Rebuild recipe
 
@@ -235,12 +252,110 @@ Do NOT hand-edit the jar; re-run the patcher.
 4. Ownership is UNPROVEN until the 6.19 diagnostics (dumpsys vold
    ownership + vold.log) run: this jar assumes the two-vold hypothesis
    but does not prove it.
+5. (6.25) The DEX-validity wall found on-device in 6.24
+   (`services_isolated.jar` DEX-invalid: out-of-order string_ids
+   from the in-place rename; guest system_server died with
+   "Missing class ... SystemServer") is fixed BY DESIGN in 6.25
+   (dexlib2 round-trip; dexdump-clean, negative-controlled) but
+   NOTHING is proven on-device until the 6.25 guest run shows
+   system_server launching past the point it died at.
 
-## gvld_patch (6.24 — guest vold binary patcher; rewritten from the 6.20 UTF-16 design in 6.23, classifier rewritten in 6.24)
+## 6.25 delta (second-opinion prescription, 2026-11-03)
+
+- DEX rebuild (the gating fix): T1 no longer renames the string in
+  place. `tools/dex_resort.py` (new, reusable
+  `dex_resort_patch(jar, old, new)`) disassembles each owning dex
+  with baksmali 2.5.2, edits the single const-string literal in the
+  identified method only, and reassembles with smali 2.5.2, which
+  rebuilds string_ids ordering + all references from the symbolic
+  model. Census is at the string-item level (exact equality);
+  classification is T1's existing ServiceManager-lookup check,
+  unchanged; verification is dexdump + census + smali-tree diff,
+  fail-closed every run. Audit: T2–T7 touch instruction bytes only
+  and never rename a string, so T1 was the ONLY transform sharing
+  the bug. Toolchain (host only, never on-device): smali 2.5.2 jars
+  + guava/jcommander/antlr/jsr305, SHA-pinned in dex_resort.py,
+  default `~/workspace/altbuild/tmp/smali303`.
+- Patcher rail (6.24 design, already present + widened): the
+  second-opinion rail — abort to UNKNOWN if anything along the
+  followed path writes the holder register other than a recognized
+  mov/branch — already existed in 6.24 as the generic `writes_reg`
+  backstop at the end of `walk_ref()`; 6.25 widens its decoder to
+  bitfield, EXTR, conditional-select/2-source, 3-source, and MRS
+  forms (masks verified against clang-assembled encodings).
+  Documented residual gap: load-acquire/exclusive forms are not
+  covered. The 6.24 verify step already required exactly-2-bytes
+  differ at the literal's first two positions; the "4 bytes
+  changed" wording in the prescription text described the literal
+  field, not the check — no code change was needed there.
+- Harness (6.25): the 6.24 20-case synthetic harness lived in /tmp
+  and is gone; 6.25 re-verified with the 2 exported real binaries
+  (EXACT: vold 1 SERVICE + 9 LOGTAG, incremental 2 SERVICE, both
+  patched) plus 4 new NDK-assembled synthetic ELFs: SBFM holder
+  clobber → UNKNOWN/LEARN with path `write-clobber` (the 6.24
+  binary PATCHES this same ELF — control proving the rail is the
+  difference), clean SERVICE → patched, suffix-only → LEARN,
+  callee-saved hoist across a call → SERVICE. All exit codes
+  as specified (0 patched / 2 LEARN).
+
+## 6.26 delta (session-socket discriminator, 2026-11-03; diagnostics only, no behavior change)
+
+- Killer-naming filter widened: `signal_generate` previously filtered
+  sig==9 only. The 6.25 run proved the zygote dies by SIGABRT (6)
+  and system_server's death signal is unknown, so a SIGKILL-only
+  filter is blind to the actual deaths. 6.26 filters SIGABRT /
+  SIGKILL / SIGSEGV / SIGTERM (6/9/11/15). Read-back verification
+  kept and hardened: the filter string must contain all four
+  tokens after space-stripping (tracefs may normalize spacing),
+  and a mismatch logs TRACEFS_FILTER_MISMATCH with the raw
+  read-back instead of silently disabling the tracer.
+- Attempt markers: the supervisor writes `GSI_TRACE_ATTEMPT` with
+  attempt number, wall time, and supervisor PID into the
+  append-only trace file before each fork, so the fresh tail can
+  be told from stale lines from earlier runs.
+- system_server OOM read-back: at SS_FOUND the supervisor now logs
+  SS_OOM_ADJ_READBACK for system_server itself. The 6.25 bundle
+  witnessed only the zygote's adj; system_server's shield state
+  was unproven.
+- Bundle exporter: the trace section previously read the HEAD of
+  the ever-growing append-only trace file (`head -c 20000`), so
+  once the file passed 20 KB the fresh tail never reached the
+  bundle — the 6.25 staleness mechanism. 6.26 reads the TAIL
+  (`tail -c 20000`). Death snapshots raised to `head -c 40000`
+  so the dmesg + trace tail at the end of each snapshot survive.
+- No framework/DEX/patcher change: services_isolated.jar,
+  services_patched.jar, framework_patched.jar, and the gvld_patch
+  device binary are byte-identical to 6.25. Run protocol: export
+  the bundle BEFORE rebooting — a reboot destroys the prior boot's
+  dmesg (pstore was empty in 6.25).
+
+## 6.27 delta (lock-state wipe test, 2026-11-03; staging script only)
+
+- Discriminator for the 6.26 synthetic-password fatal: at staging,
+  `assets/master_prepare.sh` removes the guest's saved lock state —
+  `$STAGE/data/system/locksettings.db*` (db/wal/shm/journal) and the
+  contents of `$STAGE/data/system_de/0/spblob/` — so
+  LockSettingsService recreates them fresh every boot. If the
+  `migrateUserToSpWithBoundKeysLocked` fatal clears, the cause was
+  stale saved state; if it persists, the cause is structural (the
+  guest's TEE/Gatekeeper path) and the next build is the framework
+  patch skipping the migration for the guest.
+- Safety: SLOT DATA ONLY. The wipe runs only when `$STAGE` matches
+  `/data/local/tmp/lineage_stage*`; any other value refuses loudly
+  and touches nothing, so the host's `/data/system/locksettings.db`
+  can never be hit. Keystore, `users/`, and gatekeeper state are NOT
+  touched. Env `GSI_WIPE_LOCKSTATE=0` skips the wipe (default: wipe).
+  Every removal is echoed to the takeover log. No native, DEX, or
+  framework change: zygote_exec, services_isolated.jar,
+  services_patched.jar, framework_patched.jar, and gvld_patch are
+  byte-identical to 6.26. Guest lock credentials do not persist
+  across boots in this build (by design for the test).
+
+## gvld_patch (6.25 — guest vold binary patcher; rewritten from the 6.20 UTF-16 design in 6.23, classifier rewritten in 6.24, writes_reg widened in 6.25)
 
 - File: `assets/gvld_patch`
-- Size: 433,760 bytes
-- SHA-256: `66962927e1673d19a9a9c419d4d4bd9d7c8d021f38294de7e85c26a16a1ecafd`
+- Size: 433,888 bytes
+- SHA-256: `d3f3df5c3ff5f89e69d1544857800ba4fb3fc0bf63cde60088185db96df113c0`
 - Format: ARM aarch64 static ELF executable, stripped. Source:
   `src/native/gvld_patch.c` (plain C, libc only).
 - Build (NDK 29, API 21, static):
@@ -253,7 +368,11 @@ Do NOT hand-edit the jar; re-run the patcher.
   gap adrp+add, adr form, two log callees, helper without __errno,
   UTF-16-only, non-stack x0, non-constant w0, frame-pointer x0 —
   and both exported real binaries classify exactly as prescribed:
-  guest vold 1 SERVICE + 9 LOGTAG, service.incremental.so 2 SERVICE.)
+  guest vold 1 SERVICE + 9 LOGTAG, service.incremental.so 2 SERVICE.
+  6.25 note: that 20-case harness lived in /tmp and is gone; 6.25
+  re-verified with the 2 real binaries (EXACT, unchanged) + 4 new
+  synthetic ELFs — see "6.25 delta" above. The 20/20 claim above is
+  the 6.24 result, not a 6.25 re-run.)
 - Use site: `master_prepare.sh`, `GUEST_OWN_VOLD=1` block (after the
   framework binds). Tries `$ROOTFS/system/bin/vold`, then
   `$ROOTFS/system/lib64/libvold.so` (VoldNativeService may live in
@@ -310,18 +429,27 @@ Do NOT hand-edit the jar; re-run the patcher.
 ## zygote_exec
 
 - File: `assets/zygote_exec`
-- Size: 6,400 bytes
-- SHA-256: `895b62e9057cd8c1350b24982cd3e340ede8edfd9bd917051a115eba6da73e29`
-- Format: ARM aarch64 static ELF, no section header. No source in tree —
-  **black box, and the single most critical binary in the tree**: it is
-  what `master_inner.sh` execs to start the guest zygote + system_server.
+- Size (6.26): 334,728 bytes
+- SHA-256 (6.26): `1cebcf7254ea13eca8851b49dc7c948da13fbe5d9af59eed642727acbcf7506b`
+- Format: ARM aarch64 static ELF, stripped (section headers present).
+  Source IS in tree: `src/native/zygote_exec.c` (the 6.17–6.19
+  supervisor/diagnostics + the 6.26 discriminator). The "black box,
+  no source" note below is STALE — kept only as history. Rebuild
+  (6.26, NDK 29): `aarch64-linux-android21-clang -Os -Wall
+  -ffunction-sections -fdata-sections -Wl,--gc-sections -static`,
+  then `llvm-strip --strip-all`. Prior binary (6.25): 465,088 bytes;
+  the size drop is the -Os/gc-sections build, same source lineage.
+  It is the single most critical binary in the tree: it is what
+  `master_inner.sh` execs to start the guest zygote + system_server.
 - Base: none — this is a fork/OneLineage-built helper, not a patched
   Lineage artifact. Its origin beyond that is NOT recorded in the tree.
 - Use site: copied by `switch_to_gsi.sh` into `$STAGE/data/` and exec'd by
   `master_inner.sh` as the last step of the pivot.
-- What changed / what it does internally: NOT ESTABLISHED — no source, no
-  symbols (no section header), cannot be audited or rebuilt from the tree.
-  Any claim about its internals is a guess. If it assumes 23.2-era zygote
+- What changed / what it does internally: auditable from source
+  since 6.17 (supervisor, restart loop, death snapshots, heartbeat,
+  tracefs signal tracer, OOM witness, stuck-boot stacks; 6.26 adds
+  the fatal-signal filter, attempt markers, and the system_server
+  OOM read-back — see "6.26 delta"). If it assumes 23.2-era zygote
   interfaces, a LOS 24 guest may need a replacement — unknowable without
   source or a test boot.
 - Related binaries (NOT patches, listed so they are not confused with the

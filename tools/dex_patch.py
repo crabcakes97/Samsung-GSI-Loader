@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Guest-service isolation patcher for LineageOS services.jar (CronchGSI 6.20).
 
-Re-implements, as verified same-size DEX byte edits, the isolation
+Re-implements, as verified DEX edits, the isolation
 mechanisms OneOS documents in switcher/patches/guest_own_vold.py,
 guest_no_vold_keys.py, guest_no_gatekeeper.py, guest_no_weaver.py,
 guest_no_wipe_secrets.py and guest_storage_guards.py (study only; this
 code is written fresh for this tree, credited to fahadalijaved/OneOS in
-PATCHES.md). No smali round-trip: every edit preserves instruction
-boundaries and code sizes, so branch targets, try ranges and debug info
-stay valid. The dex header checksum and SHA-1 signature are recomputed
-after patching.
+PATCHES.md). T2-T7 are same-size DEX byte edits: every edit preserves
+instruction boundaries and code sizes, so branch targets, try ranges
+and debug info stay valid. T1 is the exception: renaming a string
+in place breaks DEX string_ids ordering (the renamed string sorts
+earlier than its neighbour), which the runtime rejects, so T1 goes
+through a dexlib2 round-trip (tools/dex_resort.py: baksmali, edit
+the one const-string literal, smali reassemble) that rebuilds the
+dex with correct ordering. The dex header checksum and SHA-1
+signature are recomputed after patching.
 
 Transforms (all fail-closed: any missing/ambiguous site aborts the run):
   T1  own-vold name: the "vold" string used by the three ServiceManager
       lookups (StorageManagerService.connectVold,
       StorageManagerService$StorageManagerInternalImpl.prepareStorageDirs,
-      StatsPullAtomService.getIVoldService) becomes "gvld" (same length,
-      string-data bytes patched in place). Fails if any other const-string
+      StatsPullAtomService.getIVoldService) becomes "gvld" via a
+      dexlib2 round-trip (tools/dex_resort.py), which rebuilds the dex
+      with correctly sorted string_ids. Fails if any other const-string
       "vold" exists, or if a lookup does not immediately follow its string.
   T2  vold key calls dropped: every invoke-interface to IVold
       createUserStorageKeys/destroyUserStorageKeys/setCeStorageProtection/
@@ -65,6 +71,7 @@ Exit non-zero on any failed check. Only the Python standard library.
 """
 
 import hashlib
+import os
 import struct
 import sys
 import zipfile
@@ -333,6 +340,7 @@ class Patcher:
         self.edits = []  # (abs_off, old_bytes, new_bytes, note)
         self.report = []
         self.counts = {}  # aggregated globally by process()
+        self.rename = None  # T1: (sites, new_name) for the smali round-trip
 
     def log(self, msg):
         self.report.append(msg)
@@ -521,9 +529,15 @@ def transform_gvld(p, new_name=b"gvld"):
     _size, p0 = uleb(dex.data, off)
     if bytes(dex.data[p0:p0 + 4]) != b"vold" or dex.data[p0 + 4] != 0:
         raise DexError("T1: string data for 'vold' is not the expected MUTF-8 bytes")
-    p.edit(p0, new_name, "T1: string 'vold' -> 'gvld' (same length, in place)")
+    # The rename itself goes through the dexlib2 round-trip in
+    # tools/dex_resort.py (an in-place byte edit would break
+    # string_ids ordering). Record the spec; process() applies it
+    # after the same-size T2-T7 edits, then re-verifies.
+    p.rename = ([(desc, name, proto, pc0)
+                 for (desc, name, proto, pc0, _k, _insns) in sites], new_name)
     p.counts["gvld_patched"] = 1
-    p.log("T1: string data 'vold' -> 'gvld' at file offset %d" % p0)
+    p.log("T1: string 'vold' -> 'gvld' via dexlib2 round-trip (%d site(s))"
+          % len(sites))
 
 
 # ---------------------------------------------------------------- T2: vold keys
@@ -827,7 +841,8 @@ def assert_global_counts(counts):
             raise DexError("global: expected call %s not found (the run-25 damage path must be covered)" % key)
 
 
-def process(in_jar, out_jar, report_path, dryrun=False):
+def process(in_jar, out_jar, report_path, dryrun=False, toolchain=None,
+            work_base=None):
     entries = load_dexes(in_jar)
     # Phase 1: parse + record transforms (no bytes written yet).
     patchers = []
@@ -851,7 +866,7 @@ def process(in_jar, out_jar, report_path, dryrun=False):
             raise DexError("global: IVold.setCeStorageProtection has no call sites and the "
                            "StorageManagerInternalImpl intermediary is absent from every dex")
     assert_global_counts(counts)
-    # Phase 3: apply edits, re-verify, fix headers.
+    # Phase 3: apply edits, round-trip the T1 rename, re-verify, fix headers.
     report_lines = []
     new_dexes = {}
     for (fname, dex, p) in patchers:
@@ -859,13 +874,29 @@ def process(in_jar, out_jar, report_path, dryrun=False):
             if bytes(dex.data[off:off + len(new)]) != old:
                 raise DexError("%s: edit target changed under us at %d (%s)" % (fname, off, note))
             dex.data[off:off + len(new)] = new
-        dex2 = Dex(bytes(dex.data), fname + " (patched)")
+        data = bytes(dex.data)
+        rlines = []
+        if p.rename is not None:
+            if toolchain is None:
+                raise DexError("%s: T1 rename needs the smali toolchain "
+                               "(see tools/dex_resort.py)" % fname)
+            import dex_resort
+            sites, new_name = p.rename
+            data, rlines = dex_resort.rename_dex_bytes(
+                data, fname, "vold", new_name.decode("utf-8"), toolchain,
+                work_base, expect_sites=sites)
+            if data is None:
+                raise DexError("%s: T1 recorded a rename but the round-trip "
+                               "found no string to rename" % fname)
+        dex2 = Dex(data, fname + " (patched)")
         dex2.self_check()
         verify_clean(dex2)
         fix_header(dex2.data)
         new_dexes[fname] = bytes(dex2.data)
-        report_lines.append("== %s: %d edits" % (fname, len(p.edits)))
+        report_lines.append("== %s: %d edits%s" % (
+            fname, len(p.edits), " + dexlib2 round-trip" if p.rename else ""))
         report_lines.extend("  " + r for r in p.report)
+        report_lines.extend("  dex_resort: " + r for r in rlines)
         report_lines.append("  header signature/checksum recomputed")
     report_lines.append("global counts: %s" % ", ".join("%s=%s" % kv for kv in sorted(counts.items())))
     if dryrun:
@@ -973,7 +1004,14 @@ def main(argv):
     in_jar = argv[argv.index("--in") + 1]
     out_jar = argv[argv.index("--out") + 1]
     report_path = argv[argv.index("--report") + 1] if "--report" in argv else "/tmp/dex_patch_report.txt"
-    process(in_jar, out_jar, report_path, dryrun="--dryrun" in argv)
+    smali_dir = argv[argv.index("--smali-dir") + 1] if "--smali-dir" in argv else None
+    work_base = os.environ.get("DEXRESORT_TMP",
+                               os.path.expanduser("~/workspace/altbuild/tmp"))
+    os.makedirs(work_base, exist_ok=True)
+    from dex_resort import Toolchain
+    toolchain = Toolchain(smali_dir=smali_dir)
+    process(in_jar, out_jar, report_path, dryrun="--dryrun" in argv,
+            toolchain=toolchain, work_base=work_base)
     return 0
 
 

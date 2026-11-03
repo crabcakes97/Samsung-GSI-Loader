@@ -1,7 +1,7 @@
-== classes.dex: 18 edits
+== classes.dex: 17 edits + dexlib2 round-trip
   T1: Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;.prepareStorageDirs(ILjava/util/Set;Ljava/lang/String;)Z: 'vold' lookup -> ServiceManager.getServiceOrThrow
   T1: Lcom/android/server/StorageManagerService;.connectVold()V: 'vold' lookup -> ServiceManager.getService
-  T1: string data 'vold' -> 'gvld' at file offset 9798598
+  T1: string 'vold' -> 'gvld' via dexlib2 round-trip (2 site(s))
   T2: IVold key calls dropped: createUserStorageKeys x1, destroyUserStorageKeys x1, setCeStorageProtection x0, unlockCeStorage x1, lockCeStorage x1
   T3: Lcom/android/server/locksettings/LockSettingsService;.setLockCredentialInternal not in this dex, skipped
   T3: Lcom/android/server/locksettings/LockSettingsService;.setLockCredentialWithTokenInternalLocked not in this dex, skipped
@@ -15,10 +15,17 @@
   T7b: isCeStorageUnlocked(I)Z returns at entry, 2-unit overwrite, no interior branch targets
   T7c: Lcom/android/server/usage/StorageStatsService;.isQuotaSupported not in this dex, skipped
   T2: setCeStorageProtection: 0 client call sites; intermediary Lcom/android/server/StorageManagerService$StorageManagerInternalImpl; verified already neutered in the prebuilt blob (return-void at entry, no IVold call)
+  dex_resort: classes.dex: 2 site(s) for 'vold'
+  dex_resort:   site: Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;.prepareStorageDirs(ILjava/util/Set;Ljava/lang/String;)Z pc 56
+  dex_resort:   site: Lcom/android/server/StorageManagerService;.connectVold()V pc 0
+  dex_resort: classes.dex: smali edit changed 2 const-string line(s)
+  dex_resort: classes.dex: dexdump clean (string_ids sorted)
+  dex_resort: classes.dex: census clean (0x 'vold', 1x 'gvld', same 2 site(s))
+  dex_resort: classes.dex: smali-tree diff clean (2 literal line(s) only)
   header signature/checksum recomputed
-== classes2.dex: 44 edits
+== classes2.dex: 43 edits + dexlib2 round-trip
   T1: Lcom/android/server/stats/pull/StatsPullAtomService;.getIVoldService()Landroid/os/IVold;: 'vold' lookup -> ServiceManager.getService
-  T1: string data 'vold' -> 'gvld' at file offset 4035324
+  T1: string 'vold' -> 'gvld' via dexlib2 round-trip (1 site(s))
   T2: IVold key calls dropped: createUserStorageKeys x0, destroyUserStorageKeys x0, setCeStorageProtection x0, unlockCeStorage x0, lockCeStorage x0
   T3: setLockCredentialInternal(Lcom/android/internal/widget/LockscreenCredential;Lcom/android/internal/widget/LockscreenCredential;IZ)Z returns at entry, 3-unit overwrite, no interior branch targets
   T3: setLockCredentialWithTokenInternalLocked(Lcom/android/internal/widget/LockscreenCredential;J[BI)Z returns at entry, 3-unit overwrite, no interior branch targets
@@ -31,6 +38,12 @@
   T7: UserDataPreparer.destroyUserDataLI returns at entry; wipe call nopped (x1)
   T7b: Lcom/android/server/StorageManagerService;.isCeStorageUnlocked not in this dex, skipped
   T7c: isQuotaSupported(Ljava/lang/String;Ljava/lang/String;)Z returns at entry, 2-unit overwrite, no interior branch targets
+  dex_resort: classes2.dex: 1 site(s) for 'vold'
+  dex_resort:   site: Lcom/android/server/stats/pull/StatsPullAtomService;.getIVoldService()Landroid/os/IVold; pc 7
+  dex_resort: classes2.dex: smali edit changed 1 const-string line(s)
+  dex_resort: classes2.dex: dexdump clean (string_ids sorted)
+  dex_resort: classes2.dex: census clean (0x 'vold', 1x 'gvld', same 1 site(s))
+  dex_resort: classes2.dex: smali-tree diff clean (1 literal line(s) only)
   header signature/checksum recomputed
 == classes3.dex: 0 edits
   T1: no 'vold' string in this dex

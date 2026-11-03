@@ -700,6 +700,39 @@ chmod -R 777 "$STAGE/data/user" "$STAGE/data/user_de" "$STAGE/data/misc" "$STAGE
 chown -R 1000:1000 "$STAGE/data/system" "$STAGE/data/system_de" "$STAGE/data/system_ce" "$STAGE/data/user" "$STAGE/data/user_de" "$STAGE/data/misc" "$STAGE/data/misc_de" "$STAGE/data/misc_ce" 2>/dev/null || true
 chown -R 10109:10109 "$STAGE/data/user_de/0/com.android.inputmethod.latin" "$STAGE/data/user/0/com.android.inputmethod.latin" 2>/dev/null || true
 
+# 6.27: lock-state wipe (discriminator for the synthetic-password fatal).
+# LockSettingsService.migrateUserToSpWithBoundKeysLocked fails to unwrap
+# the synthetic password for unsecured user 0 and kills system_server
+# (6.26 bundle, deterministic, every attempt). The saved state —
+# locksettings.db and the spblob dir — persists in the slot data dir
+# across runs, so a stale blob/key binding can fail forever. Wipe both
+# so the guest recreates them fresh every boot. SLOT DATA ONLY: the
+# guard refuses any STAGE outside /data/local/tmp/lineage_stage*, so
+# the host's /data/system/locksettings.db can never be touched.
+# Keystore, users/, and gatekeeper state are NOT touched. Env
+# GSI_WIPE_LOCKSTATE=0 skips the wipe (default: wipe). Every removal
+# is logged so the takeover log proves the wipe ran.
+if [ "${GSI_WIPE_LOCKSTATE:-1}" = "1" ]; then
+    case "$STAGE" in
+        /data/local/tmp/lineage_stage*)
+            for f in "$STAGE/data/system/locksettings.db" "$STAGE/data/system/locksettings.db-wal" "$STAGE/data/system/locksettings.db-shm" "$STAGE/data/system/locksettings.db-journal"; do
+                if [ -e "$f" ]; then
+                    echo "[6.27 lock wipe] removing $f"
+                    rm -f "$f"
+                fi
+            done
+            if [ -d "$STAGE/data/system_de/0/spblob" ]; then
+                echo "[6.27 lock wipe] clearing $STAGE/data/system_de/0/spblob/"
+                rm -f "$STAGE/data/system_de/0/spblob/"* 2>/dev/null || true
+            fi
+            echo "[6.27 lock wipe] done (locksettings.db* + spblob/ cleared, fresh state on next guest boot)"
+            ;;
+        *)
+            echo "[6.27 lock wipe] REFUSED: STAGE='$STAGE' outside lineage_stage - host lock state untouched"
+            ;;
+    esac
+fi
+
 # Create the bluetooth stack's storage before the guest ever starts. The GSI's
 # GD stack asserts out of storage_module.cc if it cannot persist bt_config.conf,
 # and the staged tree never had this directory, so com.android.bluetooth

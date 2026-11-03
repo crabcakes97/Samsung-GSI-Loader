@@ -58,6 +58,27 @@
  *      harmless and arguably better (guest-vold logs tell apart from
  *      host-vold logs). No surgical retarget: it would need a cave or
  *      a donor literal, more machinery than the rename needs.
+ *   6. Verify. Re-run the full classification on the patched buffer
+ *      with target "gvld"; require identical counts, and require the
+ *      byte diff to be exactly 2 bytes, at the literal's first two
+ *      positions only (bytes 2-3, 'l' and 'd', are identical in
+ *      "vold" and "gvld"), with nothing else in the file changed.
+ *
+ * 6.25 DELTA — writes_reg() widened (second-opinion safety rail, step
+ * 2): the generic holder-write backstop at the end of walk_ref()
+ * already aborted on any other write to the holder register; its
+ * decoder now also covers bitfield (SBFM/BFM/UBFM), EXTR,
+ * conditional-select / 2-source (UDIV/SDIV/LSLV/ASRV/RORV/CRC32),
+ * 3-source (MADD/MSUB/SMULL/UMULL), and MRS forms, each mask
+ * verified against clang-assembled encodings. Residual documented
+ * gap: load-acquire/exclusive forms (LDAR/LDAXR/LDXR) are not
+ * covered; they do not occur on pointer-carrying paths in practice.
+ * No change to classification, census, or verification: the 6.24
+ * verify step already required exactly-2-bytes-differ (the
+ * "4 bytes changed" wording in the prescription text described the
+ * literal field, not the check). The DEX-side fix for the
+ * services_isolated.jar string_ids wall is in tools/dex_patch.py /
+ * tools/dex_resort.py (smali round-trip), not here.
  *   6. Cross-check. If .symtab symbols are present, confirm that the
  *      SERVICE site lies inside VoldNativeService::start. Logged, never
  *      gating: the symbols are usually stripped.
@@ -357,7 +378,9 @@ static int decode_adrp(const unsigned char *buf, size_t off, uint64_t pc,
 /* Does this instruction write GPR r? Approximate backstop for the
  * register walk: covers the forms that can carry a pointer value.
  * Stores, branches, compares (Rd==31) and FP/SIMD forms do not write
- * a GPR and return 0. */
+ * a GPR and return 0. 6.25: also bitfield, EXTR, conditional-select /
+ * 2-source, 3-source, and MRS. Known residual gap: load-acquire /
+ * exclusive forms (LDAR/LDAXR/LDXR) are not covered. */
 static int writes_reg(uint32_t i, int r) {
     int rd;
     uint64_t dummy;
@@ -418,6 +441,37 @@ static int writes_reg(uint32_t i, int r) {
         int rt = (int)(i & 31u);
         int rt2 = (int)((i >> 10) & 31u);
         return r == rt || r == rt2;
+    }
+    /* Bitfield: SBFM/BFM/UBFM. */
+    if (((i & 0x7F800000u) == 0x13000000u) ||
+        ((i & 0x7F800000u) == 0x33000000u) ||
+        ((i & 0x7F800000u) == 0x53000000u)) {
+        rd = (int)(i & 31u);
+        return rd == r && rd != 31;
+    }
+    /* EXTR: extract. */
+    if ((i & 0x7F800000u) == 0x13800000u) {
+        rd = (int)(i & 31u);
+        return rd == r && rd != 31;
+    }
+    /* Conditional select / 2-source (UDIV/SDIV/LSLV/ASRV/RORV/CRC32):
+     * all write Rd. */
+    if (((i & 0x7F800000u) == 0x1A800000u) ||
+        ((i & 0x7F800000u) == 0x5A800000u)) {
+        rd = (int)(i & 31u);
+        return rd == r && rd != 31;
+    }
+    /* 3-source: MADD/MSUB/SMULL/UMULL/SMADDL/UMADDL: write Rd. */
+    if (((i & 0x7F800000u) == 0x1B000000u) ||
+        ((i & 0x7F800000u) == 0x5B000000u)) {
+        rd = (int)(i & 31u);
+        return rd == r && rd != 31;
+    }
+    /* MRS: reads a system register into Rt. (MSR is a different
+     * encoding and writes no GPR.) */
+    if ((i & 0xFFF00000u) == 0xD5300000u) {
+        rd = (int)(i & 31u);
+        return rd == r;
     }
     return 0;
 }
